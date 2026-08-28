@@ -75,7 +75,7 @@ docker compose --env-file .env.docker ps
 
 ```bash
 # 健康检查接口 —— 它会告诉你采集是否真的在跑
-curl -s http://127.0.0.1:18120/api/health/
+curl -sS http://127.0.0.1:18120/api/health/
 ```
 
 `"status": "ok"` 才算真的好了。返回 `degraded` 时里面会写明是哪些线路停滞。
@@ -400,7 +400,7 @@ docker compose --env-file .env.docker ps
 docker compose --env-file .env.docker images
 
 # 3) 采集真的在跑 —— 这一条最关键
-curl -s http://127.0.0.1:18120/api/health/
+curl -sS http://127.0.0.1:18120/api/health/
 ```
 
 `"status": "ok"` 才算发布成功。返回 `degraded` 时里面会写明是哪些线路停滞。
@@ -493,6 +493,23 @@ docker compose --env-file .env.docker up -d --scale worker=3
 
 常见原因:渠道的**最低级别**设得比事件级别高;或者**静默窗口**内已经发过一条;
 或者只勾了「推送告警」没勾「推送恢复」。这三项都在渠道的「过滤」列里显示。
+
+### 命令跑完"没动静" / curl 什么都不输出
+
+`curl -s` 的 `-s` 会**连错误信息一起吞掉**。服务没起来时 curl 拿到
+"connection refused" 但一声不吭,看着像命令卡住了。
+
+```bash
+# 用 -sS:安静但保留错误
+curl -sS http://127.0.0.1:18120/api/health/; echo
+
+# 再看容器到底起没起
+docker compose --env-file .env.docker ps
+docker ps -a | head
+```
+
+`ps` 一行容器都没有,说明上一步的 `up` 根本没执行成功 —— 往回翻构建那一步的输出。
+最常见的是 `compose build requires buildx 0.17.0 or later`(见下一条)。
 
 ### 忘了密码 / 被锁在外面
 

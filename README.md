@@ -213,7 +213,9 @@ docker compose --env-file .env.docker up -d --no-build
 ```bash
 cd /data/netwok-leyc
 docker compose --env-file .env.docker ps
-curl -s http://127.0.0.1:18120/api/health/; echo
+# -sS 而不是 -s:-s 会把 "connection refused" 也一起吞掉,服务没起来时
+# 你只会看到一个空行,看着像"命令没反应",实际上是根本没连上
+curl -sS http://127.0.0.1:18120/api/health/; echo
 
 # 全站需要登录。第一个管理员是首次启动自动建的,密码只打印这一次:
 docker compose --env-file .env.docker logs backend | grep -A3 "管理员账号已创建"
@@ -232,7 +234,7 @@ cd /data/netwok-leyc
 git pull origin main
 docker compose --env-file .env.docker up -d --build
 docker compose --env-file .env.docker ps
-curl -s http://127.0.0.1:18120/api/health/; echo
+curl -sS http://127.0.0.1:18120/api/health/; echo
 ```
 
 同样,报 buildx 错误就换成:
