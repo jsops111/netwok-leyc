@@ -1,0 +1,459 @@
+/* ==========================================================================
+   赛博朋克视觉与动效。
+   
+   这个文件是"美术动感"的落点。几条自律,免得动效变成噪音:
+   
+   1. **动效要么表达状态,要么表达数据流,不做纯装饰的乱动。**
+      呼吸的状态灯 = 这条线还活着;脉冲的红边 = 有未恢复的严重事件;
+      扫过的扫描线 = 这块面板在自动刷新。每个动画都能回答"它在说什么"。
+   2. **数据区不动。**数字、表格行、图表线本身不加动画 —— 读数的时候
+      底下在动,人会看错。动的是边框、背景、状态灯这些"框"。
+   3. **一切动效都受 prefers-reduced-motion 约束**(见文件末尾),
+      而且大屏常年开着,所有动画都是 GPU 友好的 transform/opacity,
+      不碰 width/top/left 那些会触发重排的属性。
+   ========================================================================== */
+
+:root {
+  --cy-cyan: #22e0e8;
+  --cy-magenta: #ff3d8b;
+  --cy-violet: #b18aff;
+  --cy-up: #2ee6a8;
+  --cy-degraded: #ffb224;
+  --cy-down: #ff5470;
+  --cy-unknown: #7a8fa0;
+
+  --cy-body: #050710;
+  --cy-card: #0e1220;
+  --cy-raised: #141a2c;
+
+  --cy-line: rgba(34, 224, 232, 0.17);
+  --cy-line-soft: rgba(34, 224, 232, 0.09);
+  --cy-glow: rgba(34, 224, 232, 0.35);
+
+  --cy-ink: #e8f4f8;
+  --cy-ink-2: #a8bcc8;
+  --cy-ink-3: #7a8fa0;
+
+  /* 切角尺寸。整站统一,改这一个值就能整体调"锐利度" */
+  --cy-notch: 12px;
+}
+
+/* --------------------------------------------------------------- 背景 */
+
+/*
+ * 大屏底：网格 + 两团极慢移动的辉光。
+ * 网格用 background-image 的线性渐变画,不是几百个 div —— 后者在 4K 大屏上
+ * 会让滚动掉帧。
+ */
+.cy-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-color: var(--cy-body);
+  background-image:
+    linear-gradient(rgba(34, 224, 232, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 224, 232, 0.045) 1px, transparent 1px);
+  background-size: 44px 44px, 44px 44px;
+}
+
+/* 辉光团。50s 一个周期 —— 慢到人不会注意它在动,但画面不会是死的 */
+.cy-bg::before,
+.cy-bg::after {
+  content: '';
+  position: absolute;
+  width: 46vw;
+  height: 46vw;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.16;
+  will-change: transform;
+}
+.cy-bg::before {
+  background: radial-gradient(circle, #22e0e8 0%, transparent 68%);
+  top: -14vw;
+  left: -10vw;
+  animation: cy-drift-a 50s ease-in-out infinite alternate;
+}
+.cy-bg::after {
+  background: radial-gradient(circle, #ff3d8b 0%, transparent 68%);
+  bottom: -16vw;
+  right: -12vw;
+  animation: cy-drift-b 62s ease-in-out infinite alternate;
+}
+@keyframes cy-drift-a {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to   { transform: translate3d(8vw, 6vw, 0) scale(1.15); }
+}
+@keyframes cy-drift-b {
+  from { transform: translate3d(0, 0, 0) scale(1.1); }
+  to   { transform: translate3d(-7vw, -5vw, 0) scale(1); }
+}
+
+/* 全屏细扫描线叠层。opacity 很低 —— 这是"CRT 质感",不该看得清 */
+.cy-scanlines {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.22) 3px,
+    rgba(0, 0, 0, 0) 4px
+  );
+  opacity: 0.32;
+}
+
+/* --------------------------------------------------------------- 面板 */
+
+/*
+ * 切角面板。clip-path 切左上和右下两个角 —— 四角全切会显得像游戏 UI,
+ * 两角是"工业设备面板"的语汇。
+ */
+.cy-panel {
+  position: relative;
+  background:
+    linear-gradient(160deg, rgba(20, 26, 44, 0.92) 0%, rgba(14, 18, 32, 0.96) 100%);
+  border: 1px solid var(--cy-line);
+  clip-path: polygon(
+    var(--cy-notch) 0, 100% 0, 100% calc(100% - var(--cy-notch)),
+    calc(100% - var(--cy-notch)) 100%, 0 100%, 0 var(--cy-notch)
+  );
+  box-shadow:
+    0 0 0 1px rgba(34, 224, 232, 0.05),
+    0 8px 34px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(34, 224, 232, 0.08);
+}
+
+/* 顶部那道霓虹细线 —— 面板的"通电"标志 */
+.cy-panel::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: var(--cy-notch);
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg, transparent, var(--cy-cyan) 18%, var(--cy-cyan) 82%, transparent
+  );
+  opacity: 0.55;
+}
+
+/* 面板级状态:有严重事件时整块面板的边框脉冲 */
+.cy-panel.is-critical {
+  border-color: rgba(255, 84, 112, 0.5);
+  animation: cy-pulse-critical 2s ease-in-out infinite;
+}
+.cy-panel.is-warning {
+  border-color: rgba(255, 178, 36, 0.42);
+}
+@keyframes cy-pulse-critical {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(255, 84, 112, 0.18), 0 8px 34px rgba(0,0,0,.5); }
+  50%      { box-shadow: 0 0 22px 2px rgba(255, 84, 112, 0.3), 0 8px 34px rgba(0,0,0,.5); }
+}
+
+/* 面板标题:左侧竖条 + 字距 */
+.cy-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px 10px 16px;
+  border-bottom: 1px solid var(--cy-line-soft);
+}
+.cy-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-family: 'Orbitron', 'Rajdhani', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--cy-ink);
+  text-transform: uppercase;
+}
+.cy-panel-title::before {
+  content: '';
+  width: 3px;
+  height: 15px;
+  background: var(--cy-cyan);
+  box-shadow: 0 0 10px var(--cy-glow);
+}
+.cy-panel-sub {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--cy-ink-3);
+  letter-spacing: 0.04em;
+}
+.cy-panel-body { padding: 14px 16px 16px; }
+
+/*
+ * 面板扫描线:一道横线从上往下扫过。
+ * 只在 .is-live 上开 —— 它表示"这块面板在自动刷新",停止刷新时线就该停,
+ * 否则它就变成了纯装饰(违反本文件第 1 条)。
+ */
+.cy-panel.is-live > .cy-sweep {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 64px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom, transparent, rgba(34, 224, 232, 0.07) 55%, rgba(34, 224, 232, 0.13) 82%, transparent
+  );
+  animation: cy-sweep 5.5s linear infinite;
+  will-change: transform;
+}
+@keyframes cy-sweep {
+  from { transform: translateY(-70px); }
+  to   { transform: translateY(calc(100% + 70px)); }
+}
+
+/* --------------------------------------------------------------- 状态灯 */
+
+.cy-dot {
+  position: relative;
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--dot, var(--cy-unknown));
+  box-shadow: 0 0 8px var(--dot, var(--cy-unknown));
+  flex: none;
+}
+/* 呼吸:活着的东西才呼吸。unknown 不呼吸 —— 它表示"没数据",静止是对的 */
+.cy-dot.is-live::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 1px solid var(--dot, var(--cy-unknown));
+  opacity: 0.6;
+  animation: cy-breathe 2.4s ease-out infinite;
+}
+/* 中断状态呼吸得更急 —— 频率本身传递紧迫感 */
+.cy-dot.is-down::after { animation-duration: 1.1s; }
+@keyframes cy-breathe {
+  0%   { transform: scale(0.85); opacity: 0.75; }
+  70%  { transform: scale(2.1); opacity: 0; }
+  100% { transform: scale(2.1); opacity: 0; }
+}
+
+/* --------------------------------------------------------------- 文字 */
+
+.cy-mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.cy-display {
+  font-family: 'Orbitron', 'Rajdhani', sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.cy-glow-text { text-shadow: 0 0 14px currentColor; }
+
+/*
+ * Glitch:只给主标题用,而且只在挂载时抖一次(不循环)。
+ * 循环的 glitch 在墙上挂八小时会让人烦躁,而且它没有在表达任何状态。
+ */
+.cy-glitch {
+  position: relative;
+  animation: cy-glitch-in 0.5s steps(3, end) 1;
+}
+.cy-glitch::before,
+.cy-glitch::after {
+  content: attr(data-text);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+.cy-glitch::before {
+  color: var(--cy-magenta);
+  animation: cy-glitch-a 0.5s steps(2, end) 1;
+  clip-path: inset(0 0 55% 0);
+}
+.cy-glitch::after {
+  color: var(--cy-cyan);
+  animation: cy-glitch-b 0.5s steps(2, end) 1;
+  clip-path: inset(58% 0 0 0);
+}
+@keyframes cy-glitch-in { 0%,100% { opacity: 1 } 40% { opacity: .82 } }
+@keyframes cy-glitch-a {
+  0% { transform: translate(0,0); opacity: .9 } 30% { transform: translate(-3px,-1px) }
+  60% { transform: translate(2px,1px) } 100% { transform: translate(0,0); opacity: 0 }
+}
+@keyframes cy-glitch-b {
+  0% { transform: translate(0,0); opacity: .9 } 35% { transform: translate(3px,1px) }
+  65% { transform: translate(-2px,-1px) } 100% { transform: translate(0,0); opacity: 0 }
+}
+
+/* --------------------------------------------------------------- 统计格 */
+
+.cy-tile {
+  position: relative;
+  padding: 13px 15px 12px;
+  background: linear-gradient(155deg, rgba(20,26,44,.85), rgba(10,14,26,.92));
+  border: 1px solid var(--cy-line-soft);
+  border-left: 2px solid var(--tile, var(--cy-cyan));
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 9px), calc(100% - 9px) 100%, 0 100%);
+  transition: border-color .2s, transform .18s;
+  overflow: hidden;
+}
+.cy-tile:hover { transform: translateY(-2px); }
+/* 右上角那个小三角切口的高光 */
+.cy-tile::after {
+  content: '';
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  background: var(--tile, var(--cy-cyan));
+  opacity: 0.32;
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+}
+.cy-tile-label {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--cy-ink-3);
+  text-transform: uppercase;
+  margin-bottom: 5px;
+}
+.cy-tile-value {
+  /*
+   * 数字用 JetBrains Mono,**不用 Orbitron** —— Orbitron 的零是"方框加斜线"
+   * 的几何造型,单看很酷,但大屏上一排 0 会被当成缺字形的豆腐块。
+   * Orbitron 留给标题和品牌字(那里主要是字母)。
+   */
+  font-family: 'JetBrains Mono', 'Orbitron', monospace;
+  font-size: 27px;
+  font-weight: 700;
+  line-height: 1.05;
+  color: var(--tile, var(--cy-ink));
+  font-variant-numeric: tabular-nums;
+}
+.cy-tile-unit { font-size: 12px; margin-left: 3px; opacity: .65; letter-spacing: 0; }
+.cy-tile-foot {
+  margin-top: 5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--cy-ink-3);
+}
+
+/*
+ * 数字变化时闪一下。
+ * 这条是**数据区唯一允许的动画**(第 2 条的例外):大屏上人不会盯着看,
+ * 一次短暗示能让人知道"这个数刚刚变了"。150ms,不干扰读数。
+ */
+.cy-flash { animation: cy-flash .45s ease-out 1; }
+@keyframes cy-flash {
+  0%   { background-color: rgba(34, 224, 232, 0.22); }
+  100% { background-color: transparent; }
+}
+
+/* --------------------------------------------------------------- 仪表条 */
+
+.cy-meter {
+  position: relative;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.cy-meter-fill {
+  height: 100%;
+  background: var(--fill, var(--cy-cyan));
+  box-shadow: 0 0 10px var(--fill, var(--cy-cyan));
+  transition: width .45s cubic-bezier(.22,.61,.36,1);
+}
+/* 阈值刻线 */
+.cy-meter-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+/* --------------------------------------------------------------- 表格 */
+
+/* 事件表的级别色条:靠左侧那道竖线区分,不靠整行背景色(整行染色会盖掉文字) */
+.cy-row-sev {
+  display: inline-block;
+  width: 3px;
+  height: 16px;
+  vertical-align: middle;
+  margin-right: 8px;
+  background: var(--sev, var(--cy-unknown));
+  box-shadow: 0 0 8px var(--sev, var(--cy-unknown));
+}
+
+/* --------------------------------------------------------------- 杂项 */
+
+.cy-divider {
+  height: 1px;
+  background: linear-gradient(90deg, var(--cy-line), transparent);
+}
+
+/* 顶部导航的当前项:下方霓虹条 */
+.cy-nav-item {
+  position: relative;
+  padding: 6px 2px;
+  font-family: 'Rajdhani', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--cy-ink-2);
+  cursor: pointer;
+  transition: color .18s;
+  text-decoration: none;
+}
+.cy-nav-item:hover { color: var(--cy-ink); }
+.cy-nav-item.is-active { color: var(--cy-cyan); }
+.cy-nav-item.is-active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 2px;
+  background: var(--cy-cyan);
+  box-shadow: 0 0 12px var(--cy-glow);
+}
+
+/* 空状态 */
+.cy-empty {
+  padding: 34px 16px;
+  text-align: center;
+  color: var(--cy-ink-3);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+
+/* --------------------------------------------------------------- 无障碍 */
+
+/*
+ * 用户在系统里关了动效就全部停掉。大屏上的动效是锦上添花,
+ * 而对前庭功能敏感的人它是真实的不适来源。
+ * 注意:这里停的是 animation,不停 transition —— 后者是交互反馈,
+ * 全停掉会让界面显得没响应。
+ */
+@media (prefers-reduced-motion: reduce) {
+  .cy-bg::before,
+  .cy-bg::after,
+  .cy-panel.is-live > .cy-sweep,
+  .cy-panel.is-critical,
+  .cy-dot.is-live::after,
+  .cy-glitch,
+  .cy-glitch::before,
+  .cy-glitch::after,
+  .cy-flash {
+    animation: none !important;
+  }
+  .cy-panel.is-live > .cy-sweep { display: none; }
+}

@@ -1,0 +1,142 @@
+# ===========================================================================
+# network-check 完整部署栈。
+#
+#   docker compose --env-file .env.docker up -d --build
+#
+# 六个服务:postgres / redis / backend(web) / worker / beat / frontend
+#
+# 三点部署上必须知道的:
+#
+# 1. **worker 容器需要 ICMP 权限。**拨测走系统 ping,而容器里以非 root 跑
+#    ping 需要授权。这里用 sysctls net.ipv4.ping_group_range(比 NET_RAW
+#    更小的权限面)。某些内核/运行时不支持它,那就把 cap_add 那两行注释放开。
+#    症状很明确:所有 ICMP 线路报 "Operation not permitted"。
+#
+# 2. **beat 只能有一个实例。**它是定时器,起两个就是所有采集都跑两遍。
+#    要扛更多线路请加 worker 的 replicas,不是 beat。
+#
+# 3. **db 和 redis 的数据在命名卷里。**`docker compose down -v` 会连带删掉
+#    历史数据和事件记录 —— 想清空重来才用 -v。
+# ===========================================================================
+
+x-backend-common: &backend-common
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  image: netcheck-backend:latest
+  restart: unless-stopped
+  env_file: [.env.docker]
+  environment:
+    POSTGRES_HOST: db
+    REDIS_HOST: redis
+    DJANGO_SETTINGS_MODULE: config.settings
+  volumes:
+    - backend_static:/app/staticfiles
+    - backend_logs:/app/logs
+  depends_on:
+    db: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-network_check}
+      POSTGRES_USER: ${POSTGRES_USER:-netcheck}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?必须在 .env.docker 里设 POSTGRES_PASSWORD}
+      TZ: Asia/Shanghai
+      # 时序表写入频繁,这两个参数比默认值更适合这个负载
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netcheck} -d ${POSTGRES_DB:-network_check}"]
+      interval: 8s
+      timeout: 5s
+      retries: 12
+    # 不对外暴露端口 —— 只有 compose 网络内的服务需要连它。
+    # 要用外部工具连库,临时加 ports: ["127.0.0.1:15432:5432"]
+    expose: ["5432"]
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?必须在 .env.docker 里设 REDIS_PASSWORD}
+      --appendonly yes
+      --maxmemory-policy noeviction
+    # noeviction 是刻意的:Celery 的队列在 Redis 里,内存满了宁可写失败
+    # 也不能让它悄悄淘汰掉待执行的任务
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 8s
+      timeout: 5s
+      retries: 12
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    expose: ["6379"]
+
+  backend:
+    <<: *backend-common
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 40s
+    expose: ["8000"]
+
+  worker:
+    <<: *backend-common
+    # -Ofair:任务分发不预取。拨测任务耗时差异很大(ICMP 5 个包 vs HTTP 一次
+    # 请求),默认的预取会让一个 worker 抱着一堆任务而别的 worker 空着
+    command: >
+      celery -A config worker
+      --loglevel=info --concurrency=8 -Ofair
+      --max-tasks-per-child=500
+      -n worker@%h
+    # ---- ICMP 权限:下面这一条是拨测能不通的关键 ----
+    sysctls:
+      net.ipv4.ping_group_range: "0 2147483647"
+    # 上面那条不生效时(某些内核/容器运行时),改用这个:
+    # cap_add:
+    #   - NET_RAW
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      backend: { condition: service_started }
+
+  beat:
+    <<: *backend-common
+    # **只能一个实例** —— 它是定时器,不是工作进程
+    command: celery -A config beat --loglevel=info
+    depends_on:
+      redis: { condition: service_healthy }
+      backend: { condition: service_started }
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: netcheck-frontend:latest
+    restart: unless-stopped
+    ports:
+      # 宿主 18120 → 容器 80。改这个数字就是改访问端口。
+      - "${WEB_PORT:-18120}:80"
+    depends_on:
+      backend: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
+  backend_static:
+  backend_logs:

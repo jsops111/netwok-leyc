@@ -1,0 +1,53 @@
+[project]
+name = "network-check"
+version = "0.1.0"
+description = "网络线路检测与展示平台 —— 线路拨测 / 交换机防火墙采集 / 事件追踪 / 告警推送"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Web
+    "django>=6.0.7",
+    "djangorestframework>=3.17.1",
+    "django-filter>=26.1",
+    "django-cors-headers>=4.9.0",
+    "python-dotenv>=1.2.2",
+    # DB —— 与 ops-ai-cmdb 同一台 PG 17,不同库
+    "psycopg[binary]>=3.3.4",
+    # 调度:秒级拨测靠 beat 每秒 tick + Redis 到期队列,见 netcheck/scheduler.py
+    "celery>=5.6.3",
+    "redis>=8.1.0",
+    # 设备采集三条通道
+    #   SNMP  —— 交换机/防火墙的主通道。pysnmp 7 是 asyncio 版,
+    #            v3arch.asyncio 那套 API 才支持 SNMPv3 认证加密
+    "pysnmp>=7.1.0",
+    #   SSH   —— Cisco IOS-XE / FortiOS 的 CLI 兜底通道
+    "paramiko>=5.0.0",
+    #   HTTP  —— FortiGate REST API、Webhook 推送、Telegram sendMessage
+    "requests>=2.32",
+    # DNS 拨测。**这是有意新增的依赖**:需求要求"配置检测的 IP",也就是
+    # 要能指向**指定的那台 DNS 服务器**发查询,而 socket.getaddrinfo 只会走
+    # 系统 resolver,拨测目标填了也没用。自己拼 DNS 报文则要处理压缩指针、
+    # CNAME 链、TC 截断这些细节,那是 bug 的产地。dnspython 是纯 Python、
+    # 无编译依赖。
+    "dnspython>=2.7",
+    # 凭据字段加密(SNMP community / SSH 口令 / API token / Bot token)
+    "cryptography>=50.0.0",
+    # 常驻进程与 WSGI
+    "supervisor>=4.3.0",
+    "gunicorn>=26.0.0",
+    "whitenoise>=6.0",
+]
+
+[tool.uv]
+package = false
+
+# 与 ops-ai-cmdb 同样的坑:backend/ 下平铺多个顶层包,setuptools 自动发现会
+# 直接拒绝("Multiple top-level packages discovered in a flat-layout")。
+# **新增 Django app 要在下面补一行**,否则新环境上装不进去,
+# 而报错是 ModuleNotFoundError,指不到这个文件。
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["config*", "core*", "netcheck*"]

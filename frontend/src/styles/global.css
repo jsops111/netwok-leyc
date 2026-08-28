@@ -1,0 +1,54 @@
+@import '@fontsource/rajdhani/400.css';
+@import '@fontsource/rajdhani/500.css';
+@import '@fontsource/rajdhani/600.css';
+@import '@fontsource/rajdhani/700.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/orbitron/600.css';
+@import '@fontsource/orbitron/700.css';
+@import './cyber.css';
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #050710;
+  color: #e8f4f8;
+  font-family: 'Rajdhani', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* 滚动条:细的、青色的 —— 默认那条灰色滚动条在这套配色里很突兀 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.03); }
+::-webkit-scrollbar-thumb {
+  background: rgba(34, 224, 232, 0.24);
+  border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(34, 224, 232, 0.42); }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* 内容层要盖在背景和扫描线上面 */
+.app-shell {
+  position: relative;
+  z-index: 2;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 表格里的等宽数字 —— 延迟、丢包这些列不对齐的话很难比较 */
+.n-data-table td.num,
+.n-data-table th.num {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}

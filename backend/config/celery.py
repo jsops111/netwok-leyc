@@ -1,0 +1,96 @@
+"""
+Celery 入口。
+
+拨测的调度不走 beat 的 crontab —— 每条线路频率不同(可低到 1 秒),
+beat 只负责每 NETCHECK_TICK_SECONDS 秒敲一次 `netcheck.tick`,
+由派发器查 Redis 里的到期表决定这一拍要打哪些目标。见 netcheck/scheduler.py。
+"""
+
+from __future__ import annotations
+
+import os
+
+from celery import Celery
+from celery.schedules import crontab
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+
+app = Celery("netcheck")
+app.config_from_object("django.conf:settings", namespace="CELERY")
+app.autodiscover_tasks()
+
+
+@app.on_after_finalize.connect
+def setup_periodic_tasks(sender, **kwargs):
+    from django.conf import settings
+
+    tick = max(1, int(settings.NETCHECK_TICK_SECONDS))
+
+    # 拨测派发器:每 tick 秒一次
+    sender.add_periodic_task(
+        float(tick), dispatch_due.s(), name="拨测派发(每 %ds)" % tick, expires=tick
+    )
+    # 设备采集派发器:设备采集最快也是 10s 级,单独一拍省得和拨测抢 worker
+    sender.add_periodic_task(
+        10.0, dispatch_devices.s(), name="设备采集派发(每 10s)", expires=10
+    )
+    # 分钟级降采样:每分钟把上一分钟的原始点压成 1m 桶
+    sender.add_periodic_task(
+        crontab(minute="*"), rollup_minute.s(), name="1m 降采样", expires=55
+    )
+    # 5m / 1h 桶由 1m 桶再聚合,错开整分钟触发避免和上面撞车
+    sender.add_periodic_task(
+        crontab(minute="*/5"), rollup_coarse.s(), name="5m/1h 降采样", expires=280
+    )
+    # 过期原始样本清理
+    sender.add_periodic_task(
+        crontab(minute="17"), purge_raw.s(), name="清理过期原始样本"
+    )
+    # 卡住的事件复核:探测停了或线路被删,事件不能永远挂着
+    sender.add_periodic_task(
+        crontab(minute="*/5"), reap_events.s(), name="事件超时复核"
+    )
+
+
+# 这些 shim 只为让 add_periodic_task 拿到签名;真正实现在 netcheck.tasks,
+# 在这里 import 会在 Django app 就绪前触发模型加载,所以延迟到调用时。
+@app.task(name="netcheck.dispatch_due")
+def dispatch_due():
+    from netcheck.tasks import dispatch_due_probes
+
+    return dispatch_due_probes()
+
+
+@app.task(name="netcheck.dispatch_devices")
+def dispatch_devices():
+    from netcheck.tasks import dispatch_due_devices
+
+    return dispatch_due_devices()
+
+
+@app.task(name="netcheck.rollup_minute")
+def rollup_minute():
+    from netcheck.tasks import rollup_1m
+
+    return rollup_1m()
+
+
+@app.task(name="netcheck.rollup_coarse")
+def rollup_coarse():
+    from netcheck.tasks import rollup_5m_1h
+
+    return rollup_5m_1h()
+
+
+@app.task(name="netcheck.purge_raw")
+def purge_raw():
+    from netcheck.tasks import purge_raw_samples
+
+    return purge_raw_samples()
+
+
+@app.task(name="netcheck.reap_events")
+def reap_events():
+    from netcheck.tasks import reap_stale_events
+
+    return reap_stale_events()
