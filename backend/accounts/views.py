@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 
 from django.conf import settings
 from django.contrib.auth import authenticate, login as django_login, logout as django_logout
@@ -34,6 +35,7 @@ from accounts import lockout, totp as totp_lib
 from accounts.models import LoginAudit, LoginResult, RecoveryCode, TotpDevice
 from accounts.serializers import (
     LoginAuditSerializer,
+    RetentionPolicySerializer,
     LoginSerializer,
     MeSerializer,
     OtpConfirmSerializer,
@@ -383,20 +385,41 @@ def system_info(request):
     """
     系统信息。把 DEPLOY.md 排查一节里那几条命令搬到页面上 ——
     不然每次都要 `docker compose exec` 进容器敲 SQL。
+
+    这一页的重点是**磁盘**:这是个数据采集平台,涨起来的就是磁盘,
+    而"还能撑多久"这个问题在磁盘真的满了之后才问就晚了。
     """
 
     from netcheck import scheduler
-    from netcheck.models import Device, Event, Notifier, ProbeSample, ProbeTarget
+    from netcheck.models import Device, Event, Notifier, ProbeTarget, RetentionPolicy
 
+    policy = RetentionPolicy.load()
     info: dict = {
         "version": settings.NETCHECK_VERSION,
         "time": timezone.now(),
         "timezone": settings.TIME_ZONE,
         "debug": settings.DEBUG,
         "tick_seconds": settings.NETCHECK_TICK_SECONDS,
-        "raw_retention_hours": settings.NETCHECK_RAW_RETENTION_HOURS,
+        "raw_retention_hours": policy.raw_hours,
         "session_days": settings.SESSION_COOKIE_AGE // 86400,
+        "retention": RetentionPolicySerializer(policy).data,
     }
+
+    # ---- 磁盘 ----
+    # 容器里 `/` 是 overlay 挂载,statvfs 返回的是承载 /var/lib/docker 的那块
+    # **宿主机磁盘** —— 正是数据会撑爆的那一块,所以不用把宿主机根目录挂进来
+    try:
+        usage = shutil.disk_usage(settings.NETCHECK_DISK_PATH)
+        info["disk"] = {
+            "ok": True,
+            "path": settings.NETCHECK_DISK_PATH,
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+            "percent": round(usage.used / usage.total * 100, 1) if usage.total else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        info["disk"] = {"ok": False, "error": str(exc)[:200]}
 
     # 三个依赖各自独立 try —— 一个挂了要能看出是哪一个挂了,
     # 而不是整个接口 500(那时候正是最需要这一页的时候)
@@ -415,16 +438,41 @@ def system_info(request):
     try:
         info["counts"] = {
             "probes": ProbeTarget.objects.count(),
+            "probes_enabled": ProbeTarget.objects.filter(enabled=True).count(),
             "devices": Device.objects.count(),
             "notifiers": Notifier.objects.count(),
             "events": Event.objects.count(),
-            "samples": ProbeSample.objects.count(),
+            # **样本表不做 count(\*)。**Postgres 的精确计数要全表扫描,
+            # 这张表上千万行时一次几秒钟,而这一页恰恰是磁盘告急时才会打开的
+            "samples": _estimated_rows("netcheck_probesample"),
+            "samples_estimated": True,
             "users": User.objects.count(),
             "users_active": User.objects.filter(is_active=True).count(),
             "users_2fa": TotpDevice.objects.filter(confirmed_at__isnull=False).count(),
         }
     except Exception as exc:  # noqa: BLE001
         info["counts"] = {"error": str(exc)[:200]}
+
+    # ---- 增长估算 ----
+    # 不去查表算增速(那要扫大表),直接从**线路配置**推:每条线路每天写
+    # 86400/间隔 行,这是确定的。单行字节数用"表大小 ÷ 估算行数"反推。
+    try:
+        per_day = sum(
+            86400 / max(1, iv) for iv in
+            ProbeTarget.objects.filter(enabled=True).values_list("interval_seconds", flat=True)
+        )
+        rows = _estimated_rows("netcheck_probesample")
+        size = _table_bytes("netcheck_probesample")
+        per_row = (size / rows) if rows and size else None
+        info["growth"] = {
+            "rows_per_day": int(per_day),
+            "bytes_per_row": round(per_row, 1) if per_row else None,
+            "bytes_per_day": int(per_day * per_row) if per_row else None,
+            # 保留期内的稳态占用 —— 清理跑起来之后原始表会稳定在这个量级
+            "steady_bytes": int(per_day * policy.raw_hours / 24 * per_row) if per_row else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        info["growth"] = {"error": str(exc)[:200]}
 
     # 表占用。原始秒级样本是磁盘的主要消费者 —— "磁盘涨得快"的第一现场
     try:
@@ -450,3 +498,55 @@ def _bad(message: str):
     from rest_framework.exceptions import ValidationError
 
     return ValidationError({"detail": message})
+
+
+def _estimated_rows(table: str) -> int | None:
+    """
+    行数估算,取自 pg_class.reltuples(ANALYZE 维护的统计值)。
+
+    **不用 count(*)**:精确计数要全表扫描,而这张表可能上千万行 ——
+    这一页正是磁盘告急时打开的,那时候不能再压一次全表扫描上去。
+    估算值在 autovacuum 跑过之后误差通常在百分之几,对"还能撑多久"够用了。
+    """
+
+    try:
+        with connection.cursor() as cur:
+            cur.execute("SELECT reltuples::bigint FROM pg_class WHERE relname = %s", [table])
+            row = cur.fetchone()
+        return max(0, int(row[0])) if row and row[0] is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _table_bytes(table: str) -> int | None:
+    try:
+        with connection.cursor() as cur:
+            cur.execute("SELECT pg_total_relation_size(to_regclass(%s))", [table])
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAdminUser])
+def retention(request):
+    """
+    数据保留策略的读写。
+
+    改这个的典型场景是**磁盘快满了的半夜** —— 所以它必须是页面上点几下就能改的,
+    而不是改环境变量 + 重启容器。改完下一次清理任务(每小时)就按新值执行,
+    不用重启任何进程。
+    """
+
+    from netcheck.models import RetentionPolicy
+
+    policy = RetentionPolicy.load()
+    if request.method == "GET":
+        return Response(RetentionPolicySerializer(policy).data)
+
+    serializer = RetentionPolicySerializer(policy, data=request.data, partial=True)
+    serializer.is_valid(raise_exception=True)
+    serializer.save(updated_by=request.user.username[:64])
+    log.info("保留策略被 %s 修改为 %s", request.user.username, serializer.data)
+    return Response(serializer.data)

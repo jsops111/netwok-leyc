@@ -187,3 +187,41 @@ class ResetPasswordSerializer(serializers.Serializer):
 
     def validate_password(self, value: str) -> str:
         return _check_password_strength(value, None)
+
+
+class RetentionPolicySerializer(serializers.ModelSerializer):
+    """
+    数据保留策略。
+
+    **跨字段校验是 `RetentionPolicy.clean()` 的镜像** —— DRF 从不调用
+    `full_clean()`,只写在模型里等于死代码,而页面上所有写入都走这里。
+    改一边要改另一边(见 CLAUDE.md)。
+
+    这里直接复用模型的 `clean()`:字段少、规则完全一致,抄第二遍反而会漂。
+    做法是把待存的值套到实例上再 clean —— PATCH 只带部分字段,
+    不合并现值的话「5m 要不短于 1m」这种规则会拿 None 去比。
+    """
+
+    class Meta:
+        from netcheck.models import RetentionPolicy as _RP
+
+        model = _RP
+        fields = [
+            "raw_hours", "rollup_1m_days", "rollup_5m_days", "rollup_1h_days",
+            "event_days", "notify_log_days", "login_audit_days",
+            "updated_at", "updated_by",
+        ]
+        read_only_fields = ["updated_at", "updated_by"]
+
+    def validate(self, attrs: dict) -> dict:
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from netcheck.models import RetentionPolicy
+
+        merged = RetentionPolicy.load()
+        for key, value in attrs.items():
+            setattr(merged, key, value)
+        try:
+            merged.clean()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict) from exc
+        return attrs

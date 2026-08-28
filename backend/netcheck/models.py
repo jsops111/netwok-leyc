@@ -902,3 +902,112 @@ class NotifyLog(models.Model):
         verbose_name = verbose_name_plural = "推送记录"
         ordering = ["-ts"]
         indexes = [models.Index(fields=["notifier", "-ts"], name="idx_notifylog_ts")]
+
+
+# ============================================================================
+# 保留策略
+# ============================================================================
+
+
+class RetentionPolicy(models.Model):
+    """
+    数据保留策略。**单例**(pk 恒为 1),在管理后台的「系统信息」里改。
+
+    为什么要落库而不是继续用环境变量:这是个**数据采集平台,磁盘是会满的**,
+    而"快满了要缩短保留期"这个动作发生在半夜、发生在人只能开个页面的时候。
+    改环境变量要改文件、重启容器、还得有 SSH —— 那时候这三样通常都不方便。
+
+    四条粒度是一条链(原始 → 1m → 5m → 1h),**粗粒度的保留必须不短于细粒度的**。
+    反过来的话图上会出现"最近没有数据、更早反而有"的怪现象:图表按跨度选粒度
+    (≤2h 原始 / ≤2d 1m / ≤14d 5m / 更长 1h),细桶比粗桶留得久时,
+    查粗桶的那个跨度就是空的。这条约束在 clean() 和序列化器里各写了一份 ——
+    **DRF 不调用 full_clean(),两边都要有。**
+
+    `0` 一律表示"永久保留",只对 1h 桶和事件开放:
+    前面几档不允许永久,那等于关掉清理,而这张表每天涨几十万行。
+    """
+
+    SINGLETON_PK = 1
+
+    raw_hours = models.PositiveIntegerField(
+        "原始秒级样本保留(小时)", default=48,
+        help_text="磁盘的主要消费者。一条 1 秒频率的线路一天约 86400 行",
+    )
+    rollup_1m_days = models.PositiveIntegerField("1 分钟桶保留(天)", default=7)
+    rollup_5m_days = models.PositiveIntegerField("5 分钟桶保留(天)", default=30)
+    rollup_1h_days = models.PositiveIntegerField(
+        "1 小时桶保留(天)", default=0,
+        help_text="0 = 永久。一条线路一年才 8760 行,是唯一能回答「去年这条线怎么样」的数据",
+    )
+    event_days = models.PositiveIntegerField(
+        "事件保留(天)", default=0, help_text="0 = 永久。事件是故障复盘的材料,建议别删",
+    )
+    notify_log_days = models.PositiveIntegerField("推送记录保留(天)", default=30)
+    login_audit_days = models.PositiveIntegerField("登录审计保留(天)", default=180)
+
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+    updated_by = models.CharField("最后修改人", max_length=64, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "数据保留策略"
+
+    def __str__(self) -> str:
+        return f"保留策略(原始 {self.raw_hours}h / 1m {self.rollup_1m_days}d)"
+
+    def save(self, *args, **kwargs):
+        self.pk = self.SINGLETON_PK      # 永远只有一行
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        # 删掉它等于让清理任务失去依据。要恢复默认值就改字段,不是删行
+        raise RuntimeError("保留策略是单例,不能删除")
+
+    @classmethod
+    def load(cls) -> RetentionPolicy:
+        """
+        取当前策略,没有就用环境变量里的值建一行。
+
+        环境变量在这里只是**首次建行时的默认值**,建完之后以库里的为准 ——
+        否则页面上改完,下次重启又被环境变量盖回去。
+        """
+
+        from django.conf import settings
+
+        obj, created = cls.objects.get_or_create(
+            pk=cls.SINGLETON_PK,
+            defaults={
+                "raw_hours": getattr(settings, "NETCHECK_RAW_RETENTION_HOURS", 48),
+                "login_audit_days": getattr(settings, "NETCHECK_LOGIN_AUDIT_DAYS", 180),
+            },
+        )
+        return obj
+
+    def clean(self):
+        """
+        跨字段校验。**序列化器里有一份镜像,改这里要一起改**
+        (见 CLAUDE.md「模型的跨字段校验必须在序列化器里写第二遍」)。
+        """
+
+        from django.core.exceptions import ValidationError
+
+        errors = {}
+        if self.raw_hours < 1:
+            errors["raw_hours"] = "原始样本至少保留 1 小时,填 0 等于关掉采集的意义"
+        if self.rollup_1m_days < 1:
+            errors["rollup_1m_days"] = "1 分钟桶不允许永久保留,它每天每条线路 1440 行"
+        if self.rollup_5m_days < self.rollup_1m_days:
+            errors["rollup_5m_days"] = (
+                f"5 分钟桶要不短于 1 分钟桶({self.rollup_1m_days} 天)—— "
+                "粗桶比细桶先删,图上会出现「最近有数据、更早反而没有」"
+            )
+        if self.rollup_1h_days and self.rollup_1h_days < self.rollup_5m_days:
+            errors["rollup_1h_days"] = (
+                f"1 小时桶要不短于 5 分钟桶({self.rollup_5m_days} 天),或填 0 表示永久"
+            )
+        if self.raw_hours > self.rollup_1m_days * 24:
+            errors["raw_hours"] = (
+                f"原始样本不能比 1 分钟桶({self.rollup_1m_days} 天)留得久 —— "
+                "图表按跨度选粒度,超过 2 小时就查 1m 桶了,那段时间会是空白"
+            )
+        if errors:
+            raise ValidationError(errors)

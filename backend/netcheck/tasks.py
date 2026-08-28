@@ -372,10 +372,12 @@ def purge_raw_samples() -> dict:
     它是审计材料而不是时序数据。
     """
 
-    from netcheck.models import DeviceSample, InterfaceSample, NotifyLog
+    from netcheck.models import DeviceSample, Event, InterfaceSample, NotifyLog, RetentionPolicy
 
-    hours = settings.NETCHECK_RAW_RETENTION_HOURS
-    cutoff = timezone.now() - timedelta(hours=hours)
+    # 保留期以**库里的策略**为准,不是环境变量 —— 环境变量只在首次建行时当默认值。
+    # 磁盘快满时改保留期这件事发生在半夜,那时候人只能开个页面(见 models.py)
+    policy = RetentionPolicy.load()
+    cutoff = timezone.now() - timedelta(hours=policy.raw_hours)
     deleted = {}
 
     for model, label in (
@@ -394,26 +396,41 @@ def purge_raw_samples() -> dict:
                 break
         deleted[label] = total
 
-    log_cutoff = timezone.now() - timedelta(days=30)
-    deleted["notify_logs"] = NotifyLog.objects.filter(ts__lt=log_cutoff).delete()[0]
+    now = timezone.now()
+    deleted["notify_logs"] = NotifyLog.objects.filter(
+        ts__lt=now - timedelta(days=policy.notify_log_days)
+    ).delete()[0]
 
     # 登录审计留得比时序数据久得多(默认 180 天)—— 它回答的是"上个季度
     # 是谁登过这台机器",而那种问题从来不在事发当周问出口
     from accounts.models import LoginAudit
 
-    audit_cutoff = timezone.now() - timedelta(days=settings.NETCHECK_LOGIN_AUDIT_DAYS)
-    deleted["login_audit"] = LoginAudit.objects.filter(created_at__lt=audit_cutoff).delete()[0]
+    deleted["login_audit"] = LoginAudit.objects.filter(
+        created_at__lt=now - timedelta(days=policy.login_audit_days)
+    ).delete()[0]
 
-    # 1m 桶留 7 天,5m 留 30 天,1h 永久 —— 1h 桶一条线路一年才 8760 行,
+    # 降采样桶。**1h 桶默认永久**(policy 里 0 = 永久)—— 一条线路一年才 8760 行,
     # 不值得清理,而它是唯一能回答"去年这条线怎么样"的东西
-    ProbeRollup.objects.filter(
-        bucket=RollupBucket.M1, ts__lt=timezone.now() - timedelta(days=7)
-    ).delete()
-    ProbeRollup.objects.filter(
-        bucket=RollupBucket.M5, ts__lt=timezone.now() - timedelta(days=30)
-    ).delete()
+    for bucket, days in (
+        (RollupBucket.M1, policy.rollup_1m_days),
+        (RollupBucket.M5, policy.rollup_5m_days),
+        (RollupBucket.H1, policy.rollup_1h_days),
+    ):
+        if not days:                      # 0 = 永久
+            continue
+        deleted[f"rollup_{bucket}"] = ProbeRollup.objects.filter(
+            bucket=bucket, ts__lt=now - timedelta(days=days)
+        ).delete()[0]
 
-    return {"cutoff": cutoff.isoformat(), **deleted}
+    # 事件默认永久(0)。它是故障复盘的材料,一条事件几百字节,
+    # 不是磁盘的矛盾所在 —— 真要删也**只删已恢复的**,未恢复的事件还在用
+    if policy.event_days:
+        deleted["events"] = Event.objects.filter(
+            resolved_at__isnull=False,
+            resolved_at__lt=now - timedelta(days=policy.event_days),
+        ).delete()[0]
+
+    return {"cutoff": cutoff.isoformat(), "policy_raw_hours": policy.raw_hours, **deleted}
 
 
 @shared_task(name="netcheck.reap_stale_events")

@@ -181,7 +181,14 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # 页面上「系统信息」那一栏显示的版本号
-NETCHECK_VERSION = env("NETCHECK_VERSION", "0.2.0")
+NETCHECK_VERSION = env("NETCHECK_VERSION", "0.3.0")
+
+# 「系统信息」里磁盘用量看哪个路径。默认 `/` —— 在容器里它是 overlay 挂载,
+# statvfs 返回的是**承载 /var/lib/docker 的那块宿主机磁盘**的大小,
+# 而那正是数据涨起来会撑爆的那一块。
+# 宿主机把 /var/lib/docker 单独挂在别的盘上时这个值仍然是对的。
+# 要看别的路径(比如把宿主机根目录只读挂进来)就改这里。
+NETCHECK_DISK_PATH = env("NETCHECK_DISK_PATH", "/")
 
 # ---------------------------------------------------------------- Redis / Celery
 

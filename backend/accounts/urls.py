@@ -30,6 +30,7 @@ auth_patterns = [
 manage_patterns = [
     path("", include(router.urls)),
     path("system/", views.system_info, name="manage-system"),
+    path("retention/", views.retention, name="manage-retention"),
 ]
 
 urlpatterns = [

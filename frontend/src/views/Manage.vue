@@ -6,12 +6,13 @@ import {
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
+import MeterBar from '@/components/cyber/MeterBar.vue'
 import SchemaForm from '@/components/SchemaForm.vue'
 import type { FieldSpec } from '@/components/SchemaForm.vue'
 import { api, errText } from '@/api'
-import type { LoginAuditRow, SystemInfo, UserRow } from '@/api'
+import type { LoginAuditRow, RetentionPolicy, SystemInfo, UserRow } from '@/api'
 import { useAuthStore } from '@/stores/auth'
-import { ago, dateTimeOf, int } from '@/composables/useFormat'
+import { ago, bytes, dateTimeOf, int } from '@/composables/useFormat'
 import { STATE } from '@/theme'
 
 /**
@@ -384,9 +385,76 @@ async function loadSystem() {
   }
 }
 
+// ---- 数据保留策略 ----
+// 改这个的典型场景是磁盘快满了的半夜,所以它必须是页面上点几下就能改的。
+// 改完下一次清理任务(每小时)按新值执行,不用重启任何进程。
+const retention = ref<RetentionPolicy | null>(null)
+const retentionErrors = ref<Record<string, string>>({})
+const savingRetention = ref(false)
+
+interface RetentionField {
+  key: keyof RetentionPolicy
+  label: string
+  unit: string
+  hint?: string
+  /** 允许填 0 表示永久 */
+  forever?: boolean
+}
+
+const RETENTION_FIELDS: RetentionField[] = [
+  { key: 'raw_hours', label: '原始秒级样本', unit: '小时',
+    hint: '磁盘的主要消费者。一条 1 秒频率的线路一天约 86400 行' },
+  { key: 'rollup_1m_days', label: '1 分钟桶', unit: '天', hint: '≤2 天跨度的图查它' },
+  { key: 'rollup_5m_days', label: '5 分钟桶', unit: '天', hint: '≤14 天跨度的图查它' },
+  { key: 'rollup_1h_days', label: '1 小时桶', unit: '天', forever: true,
+    hint: '0 = 永久。一条线路一年才 8760 行,是唯一能回答「去年这条线怎么样」的数据' },
+  { key: 'event_days', label: '事件', unit: '天', forever: true,
+    hint: '0 = 永久。只删已恢复的;事件是复盘材料,不是磁盘的矛盾所在' },
+  { key: 'notify_log_days', label: '推送记录', unit: '天', hint: '「告警到底发出去没有」的审计材料' },
+  { key: 'login_audit_days', label: '登录审计', unit: '天', hint: '谁在什么时候登过这台机器' },
+]
+
+async function loadRetention() {
+  if (!auth.isAdmin) return
+  try {
+    const { data } = await api.retention()
+    retention.value = data
+  } catch (e) {
+    message.error(errText(e))
+  }
+}
+
+async function saveRetention() {
+  if (!retention.value) return
+  savingRetention.value = true
+  retentionErrors.value = {}
+  try {
+    const { data } = await api.updateRetention(retention.value)
+    retention.value = data
+    message.success('保留策略已保存,下一次清理按新值执行')
+    await loadSystem()
+  } catch (e) {
+    const d = (e as any)?.response?.data
+    if (d && typeof d === 'object') {
+      const errs: Record<string, string> = {}
+      for (const [k, v] of Object.entries(d)) errs[k] = Array.isArray(v) ? v.join('; ') : String(v)
+      retentionErrors.value = errs
+    }
+    message.error(errText(e))
+  } finally {
+    savingRetention.value = false
+  }
+}
+
+// 磁盘使用率的告警线。**这是展示用的固定刻度,不是可配阈值** ——
+// 磁盘满了是硬故障,80/90 是通用经验值,不值得再加一个配置项
+const DISK_WARN = 80
+const DISK_CRIT = 90
+
 const COUNT_LABELS: Record<string, string> = {
-  probes: '检测线路', devices: '网络设备', notifiers: '通知渠道', events: '事件',
-  samples: '原始样本', users: '用户', users_active: '启用中', users_2fa: '已绑两步验证',
+  probes: '检测线路', probes_enabled: '其中启用', devices: '网络设备',
+  notifiers: '通知渠道', events: '事件', samples: '原始样本(估算)',
+  users: '用户', users_active: '启用中', users_2fa: '已绑两步验证',
 }
 
 onMounted(() => {
@@ -394,6 +462,7 @@ onMounted(() => {
   void loadUsers()
   void loadAudit()
   void loadSystem()
+  void loadRetention()
 })
 </script>
 
@@ -555,6 +624,93 @@ onMounted(() => {
 
       <!-- ============ 系统信息 ============ -->
       <NTabPane v-if="auth.isAdmin" name="system" tab="系统信息">
+        <!-- 磁盘单独一整行:这是数据采集平台,涨起来的就是磁盘 -->
+        <CyberPanel
+          title="磁盘"
+          :subtitle="sys?.disk?.ok ? `${sys.disk.path} · 承载 Docker 数据的那块盘` : '读不到'"
+          :level="(sys?.disk?.percent ?? 0) >= DISK_CRIT ? 'critical'
+            : (sys?.disk?.percent ?? 0) >= DISK_WARN ? 'warning' : 'normal'"
+          class="disk-panel"
+        >
+          <template #actions>
+            <NButton size="small" ghost :loading="sysLoading" @click="loadSystem()">刷新</NButton>
+          </template>
+          <div v-if="sys?.disk?.ok" class="disk">
+            <div class="disk-meter">
+              <MeterBar
+                :value="sys.disk.percent" :warn="DISK_WARN" :crit="DISK_CRIT" label="已用"
+              />
+              <div class="disk-nums cy-mono">
+                <span>总 {{ bytes(sys.disk.total) }}</span>
+                <span>已用 {{ bytes(sys.disk.used) }}</span>
+                <span class="free">可用 {{ bytes(sys.disk.free) }}</span>
+              </div>
+            </div>
+
+            <div class="disk-growth">
+              <div class="kv">
+                <span>每天新增样本</span>
+                <b class="cy-mono">{{ int(sys.growth?.rows_per_day) }} 行</b>
+              </div>
+              <div class="kv">
+                <span>折算每天</span>
+                <b class="cy-mono">{{ bytes(sys.growth?.bytes_per_day) }}</b>
+              </div>
+              <div class="kv">
+                <span>保留期内稳定占用</span>
+                <b class="cy-mono">{{ bytes(sys.growth?.steady_bytes) }}</b>
+              </div>
+              <p class="note tiny">
+                按<b>当前线路配置</b>推算(每条线路每天写 86400÷间隔 行),不是实测增速。
+                单行字节数由样本表实际大小反推,所以刚部署时还没有这个数。
+                清理跑起来之后,原始表会稳定在「保留期内稳定占用」那个量级。
+              </p>
+            </div>
+          </div>
+          <div v-else class="cy-empty">
+            读不到磁盘用量:{{ sys?.disk?.error || '—' }}
+          </div>
+        </CyberPanel>
+
+        <!-- 保留策略:磁盘不够时就是在这里动手 -->
+        <CyberPanel
+          title="数据保留"
+          :subtitle="retention?.updated_by ? `最后由 ${retention.updated_by} 修改` : '默认值'"
+        >
+          <template #actions>
+            <NButton
+              size="small" type="primary" ghost :loading="savingRetention"
+              :disabled="!retention" @click="saveRetention"
+            >
+              保存
+            </NButton>
+          </template>
+          <p class="note">
+            改完<b>下一次清理任务就按新值执行</b>,不用重启任何进程。
+            磁盘告急时先缩「原始秒级样本」—— 它是主要消费者,而长期趋势看的是降采样桶,不受影响。
+          </p>
+          <div v-if="retention" class="ret-grid">
+            <div v-for="f in RETENTION_FIELDS" :key="f.key" class="ret-item">
+              <label class="lab">{{ f.label }}</label>
+              <NInputNumber
+                v-model:value="(retention[f.key] as number)"
+                :min="f.forever ? 0 : 1" :status="retentionErrors[f.key] ? 'error' : undefined"
+                size="small" style="width: 100%"
+              >
+                <template #suffix>{{ f.unit }}</template>
+              </NInputNumber>
+              <p class="fe" :class="{ hint: !retentionErrors[f.key] }">
+                {{ retentionErrors[f.key] || f.hint }}
+              </p>
+            </div>
+          </div>
+          <p class="note tiny warnline">
+            <b>粗粒度的保留不能短于细粒度的。</b>图表按跨度自动选粒度
+            (≤2h 原始 / ≤2d 1m / ≤14d 5m / 更长 1h),细桶比粗桶留得久的话,
+            查粗桶的那个跨度就是一片空白 —— 后端会挡住这种配置。
+          </p>
+        </CyberPanel>
+
         <div class="sys-grid">
           <CyberPanel title="运行参数">
             <template #actions>
@@ -570,7 +726,10 @@ onMounted(() => {
                 <b :style="sys.debug ? `color:${STATE.down}` : ''">{{ sys.debug ? '开启(生产不该开)' : '关闭' }}</b>
               </div>
               <div class="kv"><span>派发间隔</span><b>{{ sys.tick_seconds }} 秒</b></div>
-              <div class="kv"><span>原始样本保留</span><b>{{ sys.raw_retention_hours }} 小时</b></div>
+              <div class="kv">
+                <span>原始样本保留</span>
+                <b>{{ sys.raw_retention_hours }} 小时<span class="from">来自保留策略</span></b>
+              </div>
               <div class="kv"><span>会话有效期</span><b>{{ sys.session_days }} 天</b></div>
             </div>
           </CyberPanel>
@@ -777,6 +936,52 @@ onMounted(() => {
 .kv > b.low { color: #ffb224; }
 .kv.sub > span { padding-left: 12px; font-size: 10.5px; }
 .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.disk-panel { margin-bottom: 14px; }
+.disk {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.3fr) minmax(240px, 1fr);
+  gap: 18px 26px;
+  align-items: start;
+}
+.disk-nums {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-top: 9px;
+  font-size: 11.5px;
+  color: #7a8fa0;
+}
+.disk-nums .free { color: #2ee6a8; }
+.disk-growth { min-width: 0; }
+.note.tiny { font-size: 10.5px; line-height: 1.65; margin: 10px 0 0; color: #7a8fa0; }
+.note.tiny b { color: #a8bcc8; }
+.warnline {
+  padding: 8px 11px;
+  background: rgba(255, 178, 36, 0.06);
+  border-left: 2px solid rgba(255, 178, 36, 0.55);
+}
+.warnline b { color: #ffb224; }
+
+.ret-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 4px 16px;
+}
+.ret-item { min-width: 0; }
+.ret-item .lab { display: block; margin: 10px 0 4px; }
+.ret-item .fe { margin-top: 3px; }
+.from {
+  font-size: 9.5px;
+  color: #7a8fa0;
+  font-weight: 400;
+  margin-left: 6px;
+  letter-spacing: 0.04em;
+}
+
+@media (max-width: 760px) {
+  .disk { grid-template-columns: 1fr; }
+}
 
 .qr-row { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 6px; }
 /* 二维码底色必须是白的 —— 深色底上的码有些老验证器扫不出来 */

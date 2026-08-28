@@ -367,6 +367,18 @@ export interface LoginAuditRow {
   created_at: string
 }
 
+export interface RetentionPolicy {
+  raw_hours: number
+  rollup_1m_days: number
+  rollup_5m_days: number
+  rollup_1h_days: number
+  event_days: number
+  notify_log_days: number
+  login_audit_days: number
+  updated_at?: string
+  updated_by?: string
+}
+
 export interface SystemInfo {
   version: string
   time: string
@@ -375,9 +387,26 @@ export interface SystemInfo {
   tick_seconds: number
   raw_retention_hours: number
   session_days: number
+  retention: RetentionPolicy
+  disk: {
+    ok: boolean
+    path?: string
+    total?: number
+    used?: number
+    free?: number
+    percent?: number | null
+    error?: string
+  }
+  growth: {
+    rows_per_day?: number
+    bytes_per_row?: number | null
+    bytes_per_day?: number | null
+    steady_bytes?: number | null
+    error?: string
+  }
   database: { ok: boolean; version?: string; error?: string }
   scheduler: Record<string, any>
-  counts: Record<string, number> & { error?: string }
+  counts: Record<string, number> & { error?: string; samples_estimated?: any }
   tables: Array<{ name: string; bytes: number; pretty: string }>
 }
 
@@ -469,4 +498,7 @@ export const api = {
   unlockUser: (id: number) => http.post(`/manage/users/${id}/unlock/`),
   loginAudit: (params?: object) => http.get<Paged<LoginAuditRow>>('/manage/login-audit/', { params }),
   systemInfo: () => http.get<SystemInfo>('/manage/system/'),
+  retention: () => http.get<RetentionPolicy>('/manage/retention/'),
+  updateRetention: (body: Partial<RetentionPolicy>) =>
+    http.patch<RetentionPolicy>('/manage/retention/', body),
 }

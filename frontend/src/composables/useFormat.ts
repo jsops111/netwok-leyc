@@ -42,6 +42,25 @@ export function bps(value: number | null | undefined): string {
   return `${v.toFixed(v < 10 && i > 0 ? 2 : v < 100 && i > 0 ? 1 : 0)} ${units[i]}`
 }
 
+/**
+ * 字节。磁盘和表占用用它。
+ *
+ * **用 1024 进制**,和 `bps()` 的 1000 进制不一样 —— 这不是不一致:
+ * 网络设备标带宽用 1000,而 `df` / Postgres 报磁盘用 1024,
+ * 页面上的数字要能和运维在终端里看到的对上。
+ */
+export function bytes(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return DASH
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  let v = value
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i += 1
+  }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`
+}
+
 /** 时长。事件表里的"持续"列用它。 */
 export function duration(seconds: number | null | undefined): string {
   if (seconds === null || seconds === undefined) return DASH
