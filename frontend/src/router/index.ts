@@ -1,10 +1,21 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
 
 /**
- * 三个页面 —— 需求里点名要的那三个。
+ * 路由。四个页面 + 一个登录页。
  * 大屏是首页:这个平台绝大多数时间是挂在墙上被看的,不是被操作的。
+ *
+ * **除了登录页,全部要登录**(`meta.public` 是唯一的例外标记)。
+ * 前端的守卫只是体验层 —— 真正的门在后端(DRF 默认 IsAuthenticated),
+ * 别把"前端藏起来了"当成权限。
  */
 const routes = [
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/Login.vue'),
+    meta: { title: '登录', public: true, bare: true },
+  },
   {
     path: '/',
     name: 'dashboard',
@@ -23,11 +34,35 @@ const routes = [
     component: () => import('@/views/Config.vue'),
     meta: { title: '配置中心', nav: '配置中心' },
   },
+  {
+    path: '/manage',
+    name: 'manage',
+    component: () => import('@/views/Manage.vue'),
+    meta: { title: '管理后台', nav: '管理后台' },
+  },
 ]
 
 const router = createRouter({
   history: createWebHistory(),
   routes,
+})
+
+router.beforeEach(async (to) => {
+  const auth = useAuthStore()
+  // **必须等第一次会话查询回来再判断。**不等的话刷新页面的瞬间 user 还是
+  // null,已登录的人会被踢回登录页,session 回来又跳回去 —— 表现是每次
+  // 刷新都闪一下登录框
+  await auth.load()
+
+  if (to.meta.public) {
+    // 已登录的人点到登录页就直接送回大屏,不要让他对着登录框发呆
+    return auth.authenticated ? { path: '/' } : true
+  }
+  if (!auth.authenticated) {
+    // 记下他本来要去哪儿,登录后直接送过去
+    return { path: '/login', query: to.fullPath === '/' ? {} : { next: to.fullPath } }
+  }
+  return true
 })
 
 router.afterEach((to) => {

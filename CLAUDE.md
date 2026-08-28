@@ -11,6 +11,8 @@
 - **异步**: Celery 5.6 + Redis 8
 - **采集**: `pysnmp` 7(asyncio)、`paramiko` 5、`requests`、`dnspython`
 - **加密**: `cryptography` Fernet,包在 `core.crypto.EncryptedTextField` 里
+- **登录**: Django session + DRF SessionAuthentication;两步验证是 `pyotp`(TOTP)
+  + `qrcode`(后端渲染 SVG,前端不引 QR 库)
 - **前端**: Vue 3 + Vite 6 + TypeScript + Naive UI + ECharts(按需引入)
 
 **故意没有的**:pytest、ruff/black/mypy、drf-spectacular、django-celery-beat。
@@ -121,6 +123,10 @@ SNMP 拿到的是单调递增的字节计数器,速率靠差值算。
 ## 各处的职责边界
 
 ```
+accounts/totp.py  TOTP 的**策略**(窗口宽度、防重放、恢复码)。算法本身交给 pyotp
+accounts/lockout  登录失败计数。短时状态放 Redis,不落库;历史看 LoginAudit
+accounts/views.py 登录流程的唯一实现。四个动作缺一不可:查锁定 / 记审计 /
+                  django_login(轮换 session key) / 清失败计数
 probes/*.py       只发探测,只报事实(ProbeResult)。不判定、不写库、不开事件
 probes/runner.py  evaluate() —— 唯一的阈值判定处。状态语义在这里定义完,
                   前端颜色、事件级别、大屏统计才对得上
@@ -138,6 +144,77 @@ C9200L 每分钟都白走一遍 SSH 降级。
 前端 `useMetaStore()`。`.vue` 文件里**不许硬编码中文枚举标签**,那是两边漂移的起点。
 
 顶部统计那五项(`views.py` 的 `TOP_KINDS`)和前端是对齐的,改一边要改另一边。
+
+---
+
+## 账号、登录与两步验证
+
+`accounts` 是后加的一个 app。**新增 app 记得在 `pyproject.toml` 的
+`[tool.setuptools.packages.find]` 里补一行**(已补),不补的话新环境报
+`ModuleNotFoundError`,而错误指不到那个文件。
+
+### 1. `/api/health/` 必须一直放开
+
+DRF 的默认权限已经是 `IsAuthenticated`,全站唯一常开的口子是 `/api/health/` ——
+**docker-compose 的 backend healthcheck 打的就是它**,而 `worker` / `beat` 依赖
+backend 起来才启动。给它加权限的症状是"整个栈起不来",且看不出和权限有关。
+
+代价是未登录也能读到它,所以内容**分级**:未登录只给 `probes_stale_count`,
+线路名字和调度器状态要登录后才返回 —— 线路名是网络拓扑,不该在登录页上就能读到。
+
+另外两个放开的是 `/api/auth/session/` 和 `/api/auth/login/`,都写了显式 `AllowAny`。
+
+### 2. CSRF 有两处反直觉
+
+**前端自己读 cookie 塞 `X-CSRFToken`**(`api/index.ts` 的请求拦截器),
+不依赖 axios 的 xsrf 自动处理 —— 后者在 `withCredentials` / 同源判断上有版本差异,
+而这条链路断掉的症状是所有写操作返回 "CSRF Failed",指不到任何一行业务代码。
+
+cookie 由 `GET /api/auth/session/` 种下(它带 `@ensure_csrf_cookie`),
+所以**前端启动时那一次 session 请求是必须的**,不是可有可无的探测。
+
+**登录接口上的 `@csrf_protect` 是手写的,别删。**DRF 的 SessionAuthentication
+只对**已认证**的请求校验 CSRF,而登录时请求还是匿名的 —— 等于这一个接口默认没防护。
+没有它,别人能让你的浏览器悄悄登进*他的*账号。
+
+### 3. TOTP 的三个决定
+
+- **验证窗口只放宽 ±1 步(±30 秒)。**放宽到 ±2 让一个码活 2.5 分钟,
+  那正好是别人从你屏幕上看一眼、走回工位再输进去的时间。
+- **验证通过要把时间步写回 `last_step`,同一步不再接受。**不写的话,
+  一个码在 30 秒内能用两次。`verify_device()` 把"校验"和"消费"放在一个函数里
+  就是为了让人没法只做一半 —— 漏掉的后果在测试里看不出来。
+  副作用:刚绑完就退出再登录会被拒(同一个时间步),这是对的,
+  界面上的话术是"验证码不正确**或已被使用**"。
+- **恢复码只存 sha256,明文只在生成那一次返回。**用 sha256 而不是 Django 的
+  password hasher:恢复码是自己生成的 50 bit 随机串,不需要抗字典的慢哈希,
+  而登录时要逐个比对十个码。
+
+TOTP 密钥和 SNMP community 同级 —— `EncryptedTextField` 落库加密,
+Django admin 里那张表也刻意不显示这个字段。
+
+### 4. 前端的会话守卫要等 `ready`
+
+`stores/auth.ts` 里的 `ready` 不是可有可无的 loading 标记。**路由守卫必须
+`await auth.load()` 之后再判断** —— 不等的话刷新页面的瞬间 `user` 还是 null,
+已登录的人被踢回登录页,session 回来又跳回去,表现是每次刷新闪一下登录框。
+
+401 和 403 是两件事,后端专门分开了(`accounts/exceptions.py` 把 DRF 默认
+报成 403 的 `NotAuthenticated` 还原成 401)。**别在前端又合并回去**:
+401 = 没登录,跳登录页;403 = 登录了但权限不够,原地提示。
+
+### 5. 权限守卫写在后端,不是靠前端藏按钮
+
+`/api/manage/*` 整段是 `IsAdminUser`。前端 `v-if="auth.isAdmin"` 只是别让人
+点到一个必然 403 的 tab。
+
+三条守卫在 `UserViewSet` 里(序列化器里做不到,那里拿不到 request):
+不能删/停用/降级**自己**,不能动**最后一个管理员** —— 后者会让所有人都进不来。
+
+### 6. 第一个管理员是自动建的
+
+`bootstrap_admin` 串在 backend 镜像的 CMD 里。**它只在库里一个用户都没有时动手** ——
+否则每次容器重启都会把页面上改过的密码重置回环境变量里那个值。
 
 ---
 
@@ -244,6 +321,10 @@ Sparkline 是**手写 SVG,不用 echarts**:一个大屏上有几十个,
 
 条件字段用 `FieldSpec.show`:SNMP v2c 和 v3 的字段完全不同、只有 FortiGate 有 VDOM,
 全铺开会得到一个四十个输入框的表单而其中三十个和当前选择无关。
+
+`Manage.vue` 的用户表单也走 `SchemaForm`。**新增页面要在 `router/index.ts` 里
+声明 meta**:`public: true` 是"不要登录"(只有登录页),`bare: true` 是
+"不套外壳"(App.vue 的导航/时钟/健康灯在登录页上全是噪声)。
 
 ---
 

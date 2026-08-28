@@ -30,8 +30,17 @@ dependencies = [
     # CNAME 链、TC 截断这些细节,那是 bug 的产地。dnspython 是纯 Python、
     # 无编译依赖。
     "dnspython>=2.7",
-    # 凭据字段加密(SNMP community / SSH 口令 / API token / Bot token)
+    # 凭据字段加密(SNMP community / SSH 口令 / API token / Bot token /
+    # 两步验证的 TOTP 密钥)
     "cryptography>=50.0.0",
+    # 两步验证。**这两个是有意新增的**:
+    #   pyotp  —— TOTP(RFC 6238)。算法本身三十行能写完,但"验证窗口放多宽"、
+    #             "时间步要不要记下来防重放"这些决定错了不会报错,只会静悄悄
+    #             留个洞。用现成的实现,自己只管窗口策略(见 accounts/totp.py)
+    #   qrcode —— 绑定时那张二维码。在后端渲染成 SVG(SvgPathImage 不需要
+    #             Pillow),前端就不用为一个一辈子只用一次的功能引 QR 库
+    "pyotp>=2.9.0",
+    "qrcode>=8.0",
     # 常驻进程与 WSGI
     "supervisor>=4.3.0",
     "gunicorn>=26.0.0",
@@ -50,4 +59,4 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["config*", "core*", "netcheck*"]
+include = ["config*", "core*", "accounts*", "netcheck*"]

@@ -53,7 +53,14 @@ USER netcheck
 EXPOSE 8000
 
 # 默认角色是 web。worker / beat 在 compose 里覆盖 command。
+#
+# bootstrap_admin 那一条**不能省**:全站要登录,而全新部署库里一个用户都没有,
+# 页面会停在登录框而没有任何账号能进去。它只在"一个用户都没有"时动手,
+# 所以重启容器不会把改过的密码重置回去(见 accounts/.../bootstrap_admin.py)。
+# 初始密码取 NETCHECK_ADMIN_PASSWORD;没配就随机生成并打印到日志,
+# 用 `docker compose logs backend` 捞。
 CMD ["sh", "-c", "python manage.py migrate --noinput && \
      python manage.py collectstatic --noinput && \
+     python manage.py bootstrap_admin && \
      exec gunicorn config.wsgi:application \
        --bind 0.0.0.0:8000 --workers 4 --timeout 90 --access-logfile - --error-logfile -"]

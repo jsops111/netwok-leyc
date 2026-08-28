@@ -15,11 +15,45 @@ export const http = axios.create({
   baseURL: '/api',
   timeout: 12000,
   headers: { 'Content-Type': 'application/json' },
+  // 会话是 Django 的 session cookie,跨端口的 dev 环境要带上
+  withCredentials: true,
 })
+
+function cookie(name: string): string {
+  const hit = document.cookie.split('; ').find((c) => c.startsWith(`${name}=`))
+  return hit ? decodeURIComponent(hit.slice(name.length + 1)) : ''
+}
+
+/**
+ * CSRF。**自己读 cookie 塞进头里,不依赖 axios 的 xsrf 自动处理** ——
+ * 后者在 withCredentials / 同源判断上有版本差异,而这条链路失效的症状是
+ * 所有写操作返回 "CSRF Failed",指不到任何一行业务代码。
+ *
+ * csrftoken 由 GET /api/auth/session/ 种下(它带 @ensure_csrf_cookie),
+ * 所以前端启动时那一次 session 请求是必须的,不是可有可无的探测。
+ */
+http.interceptors.request.use((config) => {
+  const method = (config.method || 'get').toUpperCase()
+  if (!['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method)) {
+    const token = cookie('csrftoken')
+    if (token) config.headers.set('X-CSRFToken', token)
+  }
+  return config
+})
+
+/** 收到 401 时被调用 —— 由 main.ts 注入,这里不 import router(会绕成循环依赖) */
+let onUnauthorized: (() => void) | null = null
+export function setUnauthorizedHandler(fn: () => void) {
+  onUnauthorized = fn
+}
 
 http.interceptors.response.use(
   (response) => response,
   (error) => {
+    // 401 = 没登录(会话过期或从没登过)。403 是"登录了但权限不够",
+    // 两者处置不同:前者跳登录页,后者原地提示 —— 后端专门把它们分开了
+    // (见 accounts/exceptions.py),别在这里又合并回去
+    if (error?.response?.status === 401) onUnauthorized?.()
     // 把 DRF 的字段级错误拍平成一句人能读的话,组件里直接展示
     const data = error?.response?.data
     if (data && typeof data === 'object' && !Array.isArray(data)) {
@@ -301,6 +335,52 @@ export interface DeviceCard {
   }>
 }
 
+export interface Me {
+  id: number
+  username: string
+  display_name: string
+  email: string
+  is_staff: boolean
+  is_superuser: boolean
+  last_login: string | null
+  two_factor: boolean
+  recovery_left: number
+}
+
+export interface UserRow extends Me {
+  is_active: boolean
+  date_joined: string
+  last_login_ip: string
+  password?: string
+}
+
+export interface LoginAuditRow {
+  id: number
+  username: string
+  user: number | null
+  result: string
+  result_label: string
+  used_2fa: boolean
+  ip: string | null
+  user_agent: string
+  detail: string
+  created_at: string
+}
+
+export interface SystemInfo {
+  version: string
+  time: string
+  timezone: string
+  debug: boolean
+  tick_seconds: number
+  raw_retention_hours: number
+  session_days: number
+  database: { ok: boolean; version?: string; error?: string }
+  scheduler: Record<string, any>
+  counts: Record<string, number> & { error?: string }
+  tables: Array<{ name: string; bytes: number; pretty: string }>
+}
+
 // ---------------------------------------------------------------- 接口
 
 export const api = {
@@ -360,4 +440,33 @@ export const api = {
   deleteNotifier: (id: number) => http.delete(`/notifiers/${id}/`),
   testNotifier: (id: number) => http.post(`/notifiers/${id}/test/`),
   notifyLogs: (params?: object) => http.get('/notify-logs/', { params }),
+
+  // 会话与自助
+  session: () => http.get<{ authenticated: boolean; user: Me | null }>('/auth/session/'),
+  login: (username: string, password: string, otp?: string) =>
+    http.post<{ authenticated?: boolean; user?: Me; status?: string; recovery_left?: number }>(
+      '/auth/login/', { username, password, otp },
+    ),
+  logout: () => http.post('/auth/logout/'),
+  changePassword: (old_password: string, new_password: string) =>
+    http.post('/auth/password/', { old_password, new_password }),
+  totpSetup: () =>
+    http.post<{ secret: string; uri: string; qr_svg: string; issuer: string }>('/auth/2fa/setup/'),
+  totpConfirm: (code: string) =>
+    http.post<{ detail: string; recovery_codes: string[] }>('/auth/2fa/confirm/', { code }),
+  totpDisable: (password: string) => http.post('/auth/2fa/disable/', { password }),
+  totpRecovery: (password: string) =>
+    http.post<{ recovery_codes: string[] }>('/auth/2fa/recovery/', { password }),
+
+  // 管理后台(仅管理员)
+  users: (params?: object) => http.get<Paged<UserRow>>('/manage/users/', { params }),
+  createUser: (body: Partial<UserRow>) => http.post<UserRow>('/manage/users/', body),
+  updateUser: (id: number, body: Partial<UserRow>) => http.patch<UserRow>(`/manage/users/${id}/`, body),
+  deleteUser: (id: number) => http.delete(`/manage/users/${id}/`),
+  resetUserPassword: (id: number, password: string) =>
+    http.post(`/manage/users/${id}/reset_password/`, { password }),
+  disableUser2fa: (id: number) => http.post(`/manage/users/${id}/disable_2fa/`),
+  unlockUser: (id: number) => http.post(`/manage/users/${id}/unlock/`),
+  loginAudit: (params?: object) => http.get<Paged<LoginAuditRow>>('/manage/login-audit/', { params }),
+  systemInfo: () => http.get<SystemInfo>('/manage/system/'),
 }

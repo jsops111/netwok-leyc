@@ -397,6 +397,13 @@ def purge_raw_samples() -> dict:
     log_cutoff = timezone.now() - timedelta(days=30)
     deleted["notify_logs"] = NotifyLog.objects.filter(ts__lt=log_cutoff).delete()[0]
 
+    # 登录审计留得比时序数据久得多(默认 180 天)—— 它回答的是"上个季度
+    # 是谁登过这台机器",而那种问题从来不在事发当周问出口
+    from accounts.models import LoginAudit
+
+    audit_cutoff = timezone.now() - timedelta(days=settings.NETCHECK_LOGIN_AUDIT_DAYS)
+    deleted["login_audit"] = LoginAudit.objects.filter(created_at__lt=audit_cutoff).delete()[0]
+
     # 1m 桶留 7 天,5m 留 30 天,1h 永久 —— 1h 桶一条线路一年才 8760 行,
     # 不值得清理,而它是唯一能回答"去年这条线怎么样"的东西
     ProbeRollup.objects.filter(

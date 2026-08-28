@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     "django_filters",
     "corsheaders",
     "core",
+    "accounts",
     "netcheck",
 ]
 
@@ -116,17 +117,71 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
     ],
-    # 拨测大屏是内网只读展示,先放开;要收权限在这里换成 IsAuthenticated
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+    # **默认要登录。**放开的只有两个,而且都是显式写在视图上的 @AllowAny:
+    #   /api/auth/session/  前端启动时要拿到"没登录"这个答案,顺带种 csrftoken
+    #   /api/auth/login/    登录本身
+    #   /api/health/        **容器 healthcheck 打的就是它**,收权限会让 backend
+    #                       永远 unhealthy,而 worker/beat 依赖它才启动 ——
+    #                       症状是"整个栈起不来",却看不出和权限有关
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ],
+    # 「没登录」要还原成 401 —— DRF 默认会把它和「权限不够」一起报 403,
+    # 而前端对这两种情况的处置完全不同(见 accounts/exceptions.py)
+    "EXCEPTION_HANDLER": "accounts.exceptions.api_exception_handler",
     "DEFAULT_PAGINATION_CLASS": "core.pagination.StandardPagination",
     "PAGE_SIZE": 20,
     "DATETIME_FORMAT": "%Y-%m-%d %H:%M:%S",
 }
+
+# ---------------------------------------------------------------- 认证与会话
+
+# 会话存 Redis + 落库(cached_db):
+#   纯 db —— 大屏每 5 秒三个请求,每个请求读一次 session 表,白读
+#   纯 cache —— Redis 一重启所有人被踢下线,包括挂在墙上的那块屏
+SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
+
+# **大屏是挂在墙上长期不动的**,默认 30 天。会话到期那块屏会停在登录页,
+# 所以这个值宁可长不要短;真要收紧就配短并接受要定期去点一次。
+SESSION_COOKIE_AGE = env_int("NETCHECK_SESSION_DAYS", 30) * 86400
+# 不做滑动续期:开了的话每个请求都要写一次 session,而大屏每 5 秒打三个接口。
+# 代价是从登录那一刻算满 30 天就要重新登一次,与其每天写几万行 session 更新,
+# 不如一个月点一次。
+SESSION_SAVE_EVERY_REQUEST = False
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+# CSRF 的 cookie 前端 JS 要读得到(SPA 自己往 X-CSRFToken 里塞),所以不能 HttpOnly。
+# 这不是漏洞:CSRF 防的是"别的站替你发请求",而别的站读不到你的 cookie。
+CSRF_COOKIE_HTTPONLY = False
+# 上了 HTTPS 就把这两个打开(反代终止 TLS 时同样要开)
+SESSION_COOKIE_SECURE = env_bool("NETCHECK_COOKIE_SECURE", False)
+CSRF_COOKIE_SECURE = env_bool("NETCHECK_COOKIE_SECURE", False)
+# 反代后面用 https 访问时,Django 要知道原始协议才能通过 CSRF 的 Origin 校验
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+CSRF_TRUSTED_ORIGINS = [
+    o.strip() for o in env("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()
+]
+
+# 登录失败锁定(见 accounts/lockout.py)。按用户名和 IP 各记一份。
+NETCHECK_LOGIN_MAX_FAILS = env_int("NETCHECK_LOGIN_MAX_FAILS", 8)
+NETCHECK_LOGIN_LOCK_SECONDS = env_int("NETCHECK_LOGIN_LOCK_MINUTES", 15) * 60
+# 登录审计保留多久。它是审计材料,比时序数据留得久。
+NETCHECK_LOGIN_AUDIT_DAYS = env_int("NETCHECK_LOGIN_AUDIT_DAYS", 180)
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+     "OPTIONS": {"min_length": env_int("NETCHECK_PASSWORD_MIN_LENGTH", 10)}},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+# 页面上「系统信息」那一栏显示的版本号
+NETCHECK_VERSION = env("NETCHECK_VERSION", "0.2.0")
 
 # ---------------------------------------------------------------- Redis / Celery
 

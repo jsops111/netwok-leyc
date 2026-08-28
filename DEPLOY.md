@@ -43,6 +43,9 @@ python3 -c "import secrets;print(secrets.token_urlsafe(24))"
 | `REDIS_PASSWORD` | Redis 密码 |
 | `WEB_PORT` | 对外访问端口,默认 `18120` |
 | `NETCHECK_TICK_SECONDS` | 派发器唤醒间隔。要支持"每秒一次"的线路填 `1`;线路都在 10 秒以上填 `5` 更省资源 |
+| `NETCHECK_ADMIN_PASSWORD` | 第一个管理员的初始密码。**留空更好** —— 留空会随机生成并打印到启动日志,填了它就一直躺在这个文件里 |
+| `NETCHECK_SESSION_DAYS` | 会话有效期(天),默认 30。大屏是挂在墙上的,到期那块屏会停在登录页,**宁可长不要短** |
+| `DJANGO_CSRF_TRUSTED_ORIGINS` | **通过域名或 HTTPS 访问时必须填**,要带 scheme。不填的症状是"能登录但一保存就 403" |
 
 ```bash
 chmod 600 .env.docker     # 里面有密钥,别让别人读
@@ -72,19 +75,34 @@ curl -s http://127.0.0.1:18120/api/health/
 
 `"status": "ok"` 才算真的好了。返回 `degraded` 时里面会写明是哪些线路停滞。
 
-### 4. 打开页面
+### 4. 拿到第一个管理员的密码
+
+**全站需要登录**(大屏也是)。第一个管理员是 backend 容器首次启动时
+自动建的 —— 不自动建的话页面会停在登录框,而库里一个账号都没有。
+
+```bash
+# 没在 .env.docker 里配 NETCHECK_ADMIN_PASSWORD 时,密码是随机生成的,
+# 只打印这一次:
+docker compose --env-file .env.docker logs backend | grep -A3 "管理员账号已创建"
+```
+
+用户名默认 `admin`(可用 `NETCHECK_ADMIN_USERNAME` 改)。
+**登录后第一件事是去「管理后台 → 我的安全」改密码。**
+
+初始化只在"库里一个用户都没有"时发生,所以重启容器不会把你改过的密码
+重置回环境变量里那个值。
+
+要另开账号,在「管理后台 → 用户管理」里建,不用进 Django admin。
+Django 自带的 `/admin/` 仍然在,是给救急用的原始表格。
+
+### 5. 打开页面并登录
 
 ```
 http://<服务器IP>:18120/
 ```
 
-### 5. 建管理员账号(要用 Django admin 时才需要)
-
-```bash
-docker compose --env-file .env.docker exec backend python manage.py createsuperuser
-```
-
-页面本身不需要登录(内网只读大屏),admin 在 `/admin/`。
+**两步验证是自愿的** —— 不绑也能用。要绑就在「管理后台 → 我的安全」里扫码,
+绑完会给十个恢复码,**只显示这一次**,现在就抄下来。
 
 ### 常用运维命令
 
@@ -191,10 +209,12 @@ vi .env
 #   ⚠ 和别的项目共用同一个 Redis 实例时,CELERY_BROKER_DB / CELERY_RESULT_DB /
 #     NETCHECK_CACHE_DB 三个 db 号必须错开,撞号会互相清对方的队列
 
-# 4. 迁移
+# 4. 迁移 + 建第一个管理员(全站要登录,不建的话没人进得去)
 cd backend
 .venv/bin/python manage.py migrate
 .venv/bin/python manage.py collectstatic --noinput
+.venv/bin/python manage.py bootstrap_admin      # 密码打印在输出里
+#   已经有用户时它会跳过;要指定密码用 --password,或配 NETCHECK_ADMIN_PASSWORD
 
 # 5. 三个进程(生产用 supervisor / systemd 托管)
 .venv/bin/gunicorn config.wsgi:application --bind 127.0.0.1:8100 --workers 4 --timeout 90
@@ -468,6 +488,68 @@ docker compose --env-file .env.docker up -d --scale worker=3
 
 常见原因:渠道的**最低级别**设得比事件级别高;或者**静默窗口**内已经发过一条;
 或者只勾了「推送告警」没勾「推送恢复」。这三项都在渠道的「过滤」列里显示。
+
+### 忘了密码 / 被锁在外面
+
+```bash
+# 重置某个账号的密码(容器里)
+docker compose --env-file .env.docker exec backend \
+  python manage.py changepassword admin
+
+# 一个管理员都进不去了 —— 强制重建 admin
+docker compose --env-file .env.docker exec backend \
+  python manage.py bootstrap_admin --force --username admin --password '新密码至少10位'
+```
+
+**两步验证的手机丢了**,按这个顺序:
+
+1. 用绑定时保存的**恢复码**登录 —— 登录页那个验证码框直接输恢复码就行,
+   两种它都试
+2. 恢复码也没了 → 让**另一个管理员**在「管理后台 → 用户管理」里点「解绑2FA」
+3. 只有一个管理员而且就是他 → 上面那条 `bootstrap_admin --force`
+   只重置密码,**不解 2FA**,还要:
+
+```bash
+docker compose --env-file .env.docker exec backend python manage.py shell -c "
+from accounts.models import TotpDevice, RecoveryCode
+from django.contrib.auth.models import User
+u = User.objects.get(username='admin')
+TotpDevice.objects.filter(user=u).delete(); RecoveryCode.objects.filter(user=u).delete()
+print('已解绑')"
+```
+
+### 能登录,但一保存就 403 / "CSRF Failed"
+
+通过**域名**或 **HTTPS** 访问时,Django 要求请求的 Origin 在信任列表里。
+在 `.env.docker` 里填上(**要带 scheme,多个用逗号分隔**),然后重启 backend:
+
+```bash
+DJANGO_CSRF_TRUSTED_ORIGINS=https://netcheck.example.com,http://10.0.0.5:18120
+NETCHECK_COOKIE_SECURE=true        # 上了 HTTPS 才开;http 访问时开了会导致登不上
+```
+
+用 IP + http 直接访问时不需要配这一条。
+
+### 大屏隔一阵就跳回登录页
+
+会话到期了。默认 30 天,从**登录那一刻**算起(不做滑动续期 —— 开了的话
+每个请求都要写一次 session,而大屏每 5 秒打三个接口)。
+
+```bash
+NETCHECK_SESSION_DAYS=90     # 改完重启 backend;已存在的会话不受影响
+```
+
+如果是**几分钟**就掉,那不是会话过期,看 backend 日志里有没有 `DJANGO_SECRET_KEY`
+变过 —— 换了 secret 会让所有已签发的会话立刻失效。
+
+### 登录一直提示"失败次数过多"
+
+同一个用户名或同一个 IP 连续失败 8 次会锁 15 分钟(可配)。等窗口过去,
+或者让管理员在「管理后台 → 用户管理」里点那一行的「解锁」。
+
+要看是谁在试:**管理后台 → 登录审计**,按结果筛「密码错误」。
+那里能分清是"有人在试口令"(密码错、用户名五花八门)还是
+"自己手机时间不对"(验证码错、同一个用户名)。
 
 ### 设备采不到数据
 

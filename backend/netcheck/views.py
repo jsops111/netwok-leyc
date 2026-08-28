@@ -505,7 +505,6 @@ class NotifyLogViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
 def dashboard_overview(request):
     """
     顶部那排统计。
@@ -590,7 +589,6 @@ def _safe_scheduler_stats():
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
 def dashboard_charts(request):
     """
     「一个监控类一个大图」的数据源。
@@ -693,7 +691,6 @@ def dashboard_charts(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
 def dashboard_devices(request):
     """设备卡片。交换机和防火墙分开返回 —— 它们关心的指标不一样。"""
 
@@ -780,7 +777,6 @@ def dashboard_devices(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
 def meta_choices(request):
     """
     所有枚举。**前端不许硬编码中文枚举标签** —— 那是两边漂移的起点。
@@ -817,6 +813,14 @@ def health(request):
     """
     健康检查。**它要能在数据库正常但采集停了的时候报出来** ——
     "接口 200 但图不更新"是最难被发现的故障。
+
+    **这是全站唯一始终放开的接口**,因为容器的 healthcheck 打的就是它
+    (见 docker-compose.yml 的 backend.healthcheck),而 worker/beat 依赖
+    backend 起来才启动。给它加权限的症状是"整个栈起不来",且看不出和权限有关。
+
+    代价是未登录也能看到这里的内容,所以**明细分级**:未登录只给数量,
+    线路名字和调度器内部状态要登录后才返回 —— 前者是网络拓扑,
+    不该在登录页上就能读到。
     """
 
     now = timezone.now()
@@ -829,11 +833,15 @@ def health(request):
     ][:20]
     never_run = enabled.filter(last_checked_at=None).count()
 
-    return Response({
+    payload = {
         "status": "degraded" if (stale or never_run) else "ok",
         "time": now,
         "probes_enabled": enabled.count(),
         "probes_never_run": never_run,
-        "probes_stale": stale,
-        "scheduler": _safe_scheduler_stats(),
-    })
+        # 计数始终给 —— 顶栏那个指示灯在登录页上也要能亮
+        "probes_stale_count": len(stale),
+    }
+    if request.user.is_authenticated:
+        payload["probes_stale"] = stale
+        payload["scheduler"] = _safe_scheduler_stats()
+    return Response(payload)

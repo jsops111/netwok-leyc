@@ -12,6 +12,8 @@
 技术栈:Django 6 + DRF + PostgreSQL 17 + Celery/Redis + pysnmp/paramiko;
 前端 Vue 3 + TypeScript + Naive UI + ECharts,赛博朋克深色大屏。
 
+**全站需要登录**(大屏也是),自带用户管理和**可选的**两步验证。
+
 部署看 [DEPLOY.md](DEPLOY.md)。改代码看 [CLAUDE.md](CLAUDE.md)。
 
 ---
@@ -79,9 +81,28 @@
 静默窗口防 flapping 轰炸。每次推送的结果都记在推送记录里 ——
 "告警到底发出去没有"这个问题必须能回答。
 
+### 账号与权限
+
+全站要登录。**两步验证是自愿绑定的,平台不强制** —— 但要有这个能力,
+所以管理后台里做全了:
+
+- **TOTP 两步验证** —— 扫码绑定标准验证器 App(Google Authenticator /
+  微软 Authenticator / 1Password 都行)。绑定要输一次码确认才算成功:
+  跳过这一步的话,手机时间不同步这类问题要等到下次登录才暴露,
+  而那时人已经被自己锁在门外了
+- **恢复码** —— 十个一次性码,只在生成那一次显示明文(库里存哈希)。
+  手机丢了时它是唯一能自己进来的路径
+- **管理员可强制解绑** —— 恢复码也丢了时的最后一条路,这个动作会记进审计
+- **登录审计** —— 成功和失败都记,而且分得开"密码错"和"验证码错":
+  前者可能是有人在试口令,后者通常是自己手机时间不对
+- **失败锁定** —— 按用户名和 IP 各记一份计数。只按 IP 记的话,
+  出口 NAT 后面一个人输错会锁掉整个办公室
+
+TOTP 密钥和设备凭据同一级别对待:落库用 `NETCHECK_ENCRYPTION_KEY` 加密。
+
 ---
 
-## 三个页面
+## 四个页面
 
 ### 监控大屏 `/`
 
@@ -106,6 +127,20 @@
 配错凭据是最常见的问题,不测的话要等一个采集周期再去大屏上找,
 中间任何一环出错都分辨不出是哪儿的问题。
 
+### 管理后台 `/manage`
+
+四个 tab,其中**只有「我的安全」对所有登录用户开放**,另外三个要管理员:
+
+| tab | 谁能看 | 干什么 |
+|---|---|---|
+| 用户管理 | 管理员 | 增删改、启用/停用、重置密码、强制解绑两步验证、清除失败锁定 |
+| 我的安全 | 所有人 | 改自己的密码;绑定/解绑两步验证、重新生成恢复码 |
+| 登录审计 | 管理员 | 谁在什么时候从哪个 IP 登的、失败的是密码还是验证码 |
+| 系统信息 | 管理员 | 版本、PG/调度器连通、各表行数与占用 —— 把排查命令搬到页面上 |
+
+有两条守卫是后端兜的,不是靠前端藏按钮:不能停用/降级/删除**自己**,
+也不能把**最后一个管理员**停掉 —— 那会让所有人都进不来。
+
 ---
 
 ## 快速上手
@@ -115,9 +150,13 @@ cp .env.docker.example .env.docker
 vi .env.docker                                    # 改四个密钥,见 DEPLOY.md
 docker compose --env-file .env.docker up -d --build
 curl -s http://127.0.0.1:18120/api/health/        # status 是 ok 才算好了
+
+# 第一个管理员是首次启动自动建的,密码在日志里(没配 NETCHECK_ADMIN_PASSWORD 时)
+docker compose --env-file .env.docker logs backend | grep -A3 "管理员账号已创建"
 ```
 
-打开 `http://<IP>:18120/` → 配置中心 → 建监控类 → 建线路 → 点「测试」。
+打开 `http://<IP>:18120/` → 登录 → 配置中心 → 建监控类 → 建线路 → 点「测试」。
+登录后顺手去「管理后台 → 我的安全」改掉初始密码。
 
 ---
 
@@ -202,6 +241,9 @@ curl -s http://127.0.0.1:18120/api/health/
 backend/
   config/            settings / celery / urls
   core/              BaseModel、EncryptedTextField(凭据落库加密)、分页
+  accounts/          登录、两步验证(TOTP + 恢复码)、用户管理、登录审计
+    totp.py          验证窗口/防重放/恢复码 —— 算法交给 pyotp,策略在这
+    lockout.py       失败锁定(Redis 计数,按用户名 + IP 各一份)
   netcheck/
     models.py        12 张表:拨测 / 设备 / 事件 / 通知
     scheduler.py     秒级派发器(Redis ZSET 到期表)
@@ -215,7 +257,8 @@ frontend/src/
   theme.ts           赛博朋克配色(NEON / STATE / CATEGORICAL 三套)
   styles/cyber.css   动效(扫描线、辉光、呼吸灯、切角面板)
   components/        cyber/(面板、统计格、状态灯、仪表条) charts/(大图、sparkline)
-  views/             Dashboard / Events / Config
+  views/             Dashboard / Events / Config / Manage / Login
+  stores/auth.ts     会话状态。ready 没到之前路由守卫不能判断,否则刷新闪登录页
 ```
 
 ## 数据保留
@@ -234,7 +277,10 @@ frontend/src/
 ## 当前状态
 
 已验证:四种协议探测、阈值判定全分支、事件开关与抖动抑制、恢复流程、
-Webhook 推送、秒级自动调度、Docker 全栈(含容器内 ICMP 权限)、三个页面渲染。
+Webhook 推送、秒级自动调度、Docker 全栈(含容器内 ICMP 权限)、页面渲染。
+登录与管理后台有一组冒烟测试覆盖(15 项):密码/两步验证/恢复码登录、
+验证码重放拒绝、失败锁定、CSRF 强制、权限边界(普通用户进不了 /api/manage/)、
+最后一个管理员不能被停用、健康接口对未登录只给计数不给线路名。
 
 **未在真机上验证**:SNMP / SSH / FortiGate API 三条设备采集通道 ——
 手边没有 C9300 / C9200L / FortiGate-401F。代码路径、错误分类和超时处理都测过,
