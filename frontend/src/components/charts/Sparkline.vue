@@ -5,6 +5,10 @@ import { STATE } from '@/theme'
 /**
  * 迷你趋势线。设备卡片和线路列表里用。
  *
+ * **颜色走 :style 绑定而不是 SVG 的 stroke / fill 属性** —— 颜色现在是
+ * `var(--cy-x)`,而 presentation 属性对 var() 的支持在各浏览器上不一致,
+ * style 是稳的。
+ *
  * **手写 SVG,不用 echarts** —— 一个大屏上可能有几十个 sparkline,
  * 每个都 init 一个 echarts 实例会让首屏卡住好几秒。这里是一条 path,
  * 没有实例、没有事件监听。
@@ -77,8 +81,8 @@ const gradId = `spark-${Math.random().toString(36).slice(2, 9)}`
   >
     <defs>
       <linearGradient :id="gradId" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" :stop-color="color" stop-opacity="0.34" />
-        <stop offset="100%" :stop-color="color" stop-opacity="0" />
+        <stop offset="0%" :style="{ stopColor: color }" stop-opacity="0.34" />
+        <stop offset="100%" :style="{ stopColor: color }" stop-opacity="0" />
       </linearGradient>
     </defs>
     <path v-if="geometry.area" :d="geometry.area" :fill="`url(#${gradId})`" stroke="none" />
@@ -86,7 +90,7 @@ const gradId = `spark-${Math.random().toString(36).slice(2, 9)}`
       v-if="geometry.path"
       :d="geometry.path"
       fill="none"
-      :stroke="color"
+      :style="{ stroke: color }"
       stroke-width="1.4"
       vector-effect="non-scaling-stroke"
       stroke-linejoin="round"
@@ -95,7 +99,7 @@ const gradId = `spark-${Math.random().toString(36).slice(2, 9)}`
       v-for="(gx, i) in showGaps ? geometry.gaps : []"
       :key="i"
       :x1="gx" :x2="gx" y1="0" :y2="height"
-      :stroke="STATE.down"
+      :style="{ stroke: STATE.down }"
       stroke-width="1"
       stroke-opacity="0.5"
       vector-effect="non-scaling-stroke"
@@ -103,7 +107,7 @@ const gradId = `spark-${Math.random().toString(36).slice(2, 9)}`
     <text
       v-if="!geometry.path"
       :x="W / 2" :y="height / 2 + 3"
-      text-anchor="middle" font-size="9" fill="#7a8fa0"
+      text-anchor="middle" font-size="9" style="fill: var(--cy-ink-3)"
     >无数据</text>
   </svg>
 </template>

@@ -3,11 +3,12 @@ import { computed, onMounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import {
   NButton, NConfigProvider, NDialogProvider, NDropdown, NMessageProvider,
-  darkTheme, zhCN, dateZhCN,
+  NTooltip, darkTheme, lightTheme, zhCN, dateZhCN,
 } from 'naive-ui'
-import { darkOverrides } from '@/theme'
+import { darkOverrides, lightOverrides } from '@/theme'
 import { useMetaStore } from '@/stores/meta'
 import { useAuthStore } from '@/stores/auth'
+import { useThemeStore } from '@/stores/theme'
 import { api } from '@/api'
 import { usePolling } from '@/composables/usePolling'
 
@@ -26,6 +27,7 @@ const route = useRoute()
 const router = useRouter()
 const meta = useMetaStore()
 const auth = useAuthStore()
+const theme = useThemeStore()
 const clock = ref(new Date())
 
 const bare = computed(() => route.meta.bare === true)
@@ -85,14 +87,14 @@ const healthState = computed(() => {
 })
 
 const DOT_COLORS: Record<string, string> = {
-  up: '#2ee6a8', degraded: '#ffb224', down: '#ff5470', unknown: '#7a8fa0',
+  up: 'var(--cy-up)', degraded: 'var(--cy-degraded)', down: 'var(--cy-down)', unknown: 'var(--cy-unknown)',
 }
 </script>
 
 <template>
   <NConfigProvider
-    :theme="darkTheme"
-    :theme-overrides="darkOverrides"
+    :theme="theme.isDark ? darkTheme : lightTheme"
+    :theme-overrides="theme.isDark ? darkOverrides : lightOverrides"
     :locale="zhCN"
     :date-locale="dateZhCN"
   >
@@ -141,6 +143,17 @@ const DOT_COLORS: Record<string, string> = {
               </span>
               <span class="clock cy-mono">{{ clockText }}</span>
 
+              <NTooltip trigger="hover">
+                <template #trigger>
+                  <NButton text class="theme-btn" @click="theme.toggle()">
+                    <!-- 图标表示"点了会变成什么",不是"现在是什么" ——
+                         后者要人先反应一次"所以点了会怎样" -->
+                    <span aria-hidden="true">{{ theme.isDark ? '☀' : '☾' }}</span>
+                  </NButton>
+                </template>
+                {{ theme.isDark ? '切到亮色' : '切到深色' }}
+              </NTooltip>
+
               <NDropdown
                 v-if="auth.user"
                 trigger="click"
@@ -175,8 +188,8 @@ const DOT_COLORS: Record<string, string> = {
   align-items: center;
   gap: 24px;
   padding: 11px 20px;
-  background: linear-gradient(180deg, rgba(8, 11, 20, 0.96), rgba(8, 11, 20, 0.82));
-  border-bottom: 1px solid rgba(34, 224, 232, 0.2);
+  background: linear-gradient(180deg, rgba(var(--cy-body-rgb), 0.96), rgba(var(--cy-body-rgb), 0.82));
+  border-bottom: 1px solid rgba(var(--cy-cyan-rgb), 0.2);
   backdrop-filter: blur(9px);
   flex-wrap: wrap;
 }
@@ -188,7 +201,7 @@ const DOT_COLORS: Record<string, string> = {
   right: 0;
   bottom: -1px;
   height: 1px;
-  background: linear-gradient(90deg, transparent, #22e0e8 22%, #ff3d8b 78%, transparent);
+  background: linear-gradient(90deg, transparent, var(--cy-cyan) 22%, var(--cy-magenta) 78%, transparent);
   opacity: 0.5;
 }
 
@@ -197,21 +210,21 @@ const DOT_COLORS: Record<string, string> = {
 .logo-mark {
   width: 15px;
   height: 15px;
-  background: linear-gradient(135deg, #22e0e8, #ff3d8b);
+  background: linear-gradient(135deg, var(--cy-cyan), var(--cy-magenta));
   clip-path: polygon(50% 0, 100% 28%, 100% 72%, 50% 100%, 0 72%, 0 28%);
-  box-shadow: 0 0 14px rgba(34, 224, 232, 0.6);
+  box-shadow: 0 0 14px rgba(var(--cy-cyan-rgb), 0.6);
 }
 .logo-text {
   position: relative;
   font-size: 18px;
   letter-spacing: 0.14em;
-  color: #e8f4f8;
-  text-shadow: 0 0 18px rgba(34, 224, 232, 0.42);
+  color: var(--cy-ink);
+  text-shadow: 0 0 18px rgba(var(--cy-cyan-rgb), 0.42);
 }
 .brand-sub {
   font-size: 10.5px;
   letter-spacing: 0.1em;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   padding-left: 24px;
 }
 
@@ -224,19 +237,27 @@ const DOT_COLORS: Record<string, string> = {
   gap: 18px;
 }
 .health { display: inline-flex; align-items: center; gap: 7px; }
+.theme-btn {
+  font-size: 15px;
+  line-height: 1;
+  color: var(--cy-ink-2);
+  transition: color 0.15s ease;
+}
+.theme-btn:hover { color: var(--cy-cyan); }
+
 .who { display: inline-flex; align-items: center; gap: 6px; }
-.who-name { font-size: 12px; color: #a8bcc8; letter-spacing: 0.02em; }
+.who-name { font-size: 12px; color: var(--cy-ink-2); letter-spacing: 0.02em; }
 .who-2fa {
   font-family: 'JetBrains Mono', monospace;
   font-size: 9px;
   letter-spacing: 0.06em;
-  color: #2ee6a8;
-  border: 1px solid rgba(46, 230, 168, 0.42);
+  color: var(--cy-up);
+  border: 1px solid rgba(var(--cy-up-rgb), 0.42);
   padding: 0 3px;
   line-height: 13px;
 }
 .health-txt { font-size: 11.5px; font-weight: 600; letter-spacing: 0.03em; }
-.clock { font-size: 12.5px; color: #a8bcc8; letter-spacing: 0.02em; }
+.clock { font-size: 12.5px; color: var(--cy-ink-2); letter-spacing: 0.02em; }
 
 .content {
   flex: 1;

@@ -142,7 +142,7 @@ const userColumns: DataTableColumns<UserRow> = [
           ? h(NTag, { size: 'tiny', type: 'info', bordered: false, style: 'margin-left:6px' }, () => '我')
           : null,
       ]),
-      h('div', { style: 'font-size:10.5px;color:#7a8fa0' }, r.display_name || r.email || '—'),
+      h('div', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, r.display_name || r.email || '—'),
     ]),
   },
   {
@@ -157,16 +157,16 @@ const userColumns: DataTableColumns<UserRow> = [
     render: (r) => (r.two_factor
       ? h('div', { style: 'line-height:1.4' }, [
         h('span', { style: `color:${STATE.up};font-size:11.5px;font-weight:600` }, '已开启'),
-        h('div', { style: 'font-size:10px;color:#7a8fa0' }, `恢复码剩 ${r.recovery_left}`),
+        h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, `恢复码剩 ${r.recovery_left}`),
       ])
       // 未开启不用红色 —— 平台不强制绑定,这是一个状态不是一个故障
-      : h('span', { style: 'color:#7a8fa0;font-size:11.5px' }, '未开启')),
+      : h('span', { style: 'color:var(--cy-ink-3);font-size:11.5px' }, '未开启')),
   },
   {
     title: '最后登录', key: 'last_login', width: 168,
     render: (r) => h('div', { style: 'line-height:1.4' }, [
       h('div', { style: 'font-size:11px' }, r.last_login ? ago(r.last_login) : '从未登录'),
-      h('div', { class: 'cy-mono', style: 'font-size:10px;color:#7a8fa0' }, r.last_login_ip || '—'),
+      h('div', { class: 'cy-mono', style: 'font-size:10px;color:var(--cy-ink-3)' }, r.last_login_ip || '—'),
     ]),
   },
   {
@@ -360,11 +360,11 @@ const auditColumns: DataTableColumns<LoginAuditRow> = [
       style: `color:${AUDIT_COLORS[r.result] || STATE.down};font-size:11.5px;font-weight:600`,
     }, r.result_label) },
   { title: '两步', key: 'used_2fa', width: 58,
-    render: (r) => (r.used_2fa ? h('span', { style: `color:${STATE.up}` }, '✓') : h('span', { style: 'color:#55636f' }, '—')) },
+    render: (r) => (r.used_2fa ? h('span', { style: `color:${STATE.up}` }, '✓') : h('span', { style: 'color:var(--cy-ink-3)' }, '—')) },
   { title: '来源 IP', key: 'ip', width: 130,
     render: (r) => h('span', { class: 'cy-mono', style: 'font-size:11px' }, r.ip || '—') },
   { title: '说明', key: 'detail', ellipsis: { tooltip: true },
-    render: (r) => h('span', { style: 'font-size:11px;color:#a8bcc8' }, r.detail || r.user_agent || '—') },
+    render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.detail || r.user_agent || '—') },
 ]
 
 // ================================================================ 系统信息
@@ -530,7 +530,7 @@ onMounted(() => {
             <!-- 已绑定 -->
             <div v-if="auth.user?.two_factor && !setup" class="stack">
               <div class="on-badge">
-                <span class="cy-dot is-live" style="--dot: #2ee6a8" />
+                <span class="cy-dot is-live" style="--dot: var(--cy-up)" />
                 登录时除了密码,还要输一次验证器上的 6 位码
               </div>
               <div class="kv">
@@ -890,34 +890,34 @@ onMounted(() => {
 .lab {
   font-size: 11px;
   letter-spacing: 0.07em;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   margin: 12px 0 5px;
 }
 .lab:first-child { margin-top: 0; }
 .mt { margin-top: 16px; align-self: flex-start; }
 
-.fe { font-size: 10.5px; line-height: 1.55; color: #ff5470; margin: 5px 0 0; }
-.fe.hint { color: #7a8fa0; }
-.fe b { color: #a8bcc8; }
+.fe { font-size: 10.5px; line-height: 1.55; color: var(--cy-down); margin: 5px 0 0; }
+.fe.hint { color: var(--cy-ink-3); }
+.fe b { color: var(--cy-ink-2); }
 
 .note {
   font-size: 11.5px;
   line-height: 1.7;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   margin: 0 0 14px;
 }
-.note b { color: #22e0e8; font-weight: 600; }
+.note b { color: var(--cy-cyan); font-weight: 600; }
 
 .on-badge {
   display: flex;
   align-items: center;
   gap: 9px;
   font-size: 11.5px;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   padding: 9px 12px;
   margin-bottom: 12px;
-  background: rgba(46, 230, 168, 0.06);
-  border-left: 2px solid #2ee6a8;
+  background: rgba(var(--cy-up-rgb), 0.06);
+  border-left: 2px solid var(--cy-up);
 }
 
 .kvs { display: flex; flex-direction: column; }
@@ -928,12 +928,12 @@ onMounted(() => {
   gap: 12px;
   padding: 6px 0;
   font-size: 11.5px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  border-bottom: 1px solid rgba(var(--cy-ink-rgb), 0.045);
 }
 .kv:last-child { border-bottom: none; }
-.kv > span { color: #7a8fa0; flex: none; }
-.kv > b { color: #e8f4f8; font-weight: 600; text-align: right; word-break: break-all; }
-.kv > b.low { color: #ffb224; }
+.kv > span { color: var(--cy-ink-3); flex: none; }
+.kv > b { color: var(--cy-ink); font-weight: 600; text-align: right; word-break: break-all; }
+.kv > b.low { color: var(--cy-degraded); }
 .kv.sub > span { padding-left: 12px; font-size: 10.5px; }
 .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
@@ -950,18 +950,18 @@ onMounted(() => {
   gap: 4px 18px;
   margin-top: 9px;
   font-size: 11.5px;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
 }
-.disk-nums .free { color: #2ee6a8; }
+.disk-nums .free { color: var(--cy-up); }
 .disk-growth { min-width: 0; }
-.note.tiny { font-size: 10.5px; line-height: 1.65; margin: 10px 0 0; color: #7a8fa0; }
-.note.tiny b { color: #a8bcc8; }
+.note.tiny { font-size: 10.5px; line-height: 1.65; margin: 10px 0 0; color: var(--cy-ink-3); }
+.note.tiny b { color: var(--cy-ink-2); }
 .warnline {
   padding: 8px 11px;
-  background: rgba(255, 178, 36, 0.06);
-  border-left: 2px solid rgba(255, 178, 36, 0.55);
+  background: rgba(var(--cy-degraded-rgb), 0.06);
+  border-left: 2px solid rgba(var(--cy-degraded-rgb), 0.55);
 }
-.warnline b { color: #ffb224; }
+.warnline b { color: var(--cy-degraded); }
 
 .ret-grid {
   display: grid;
@@ -973,7 +973,7 @@ onMounted(() => {
 .ret-item .fe { margin-top: 3px; }
 .from {
   font-size: 9.5px;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   font-weight: 400;
   margin-left: 6px;
   letter-spacing: 0.04em;
@@ -990,8 +990,8 @@ onMounted(() => {
   width: 148px;
   height: 148px;
   padding: 7px;
-  background: #fff;
-  border: 1px solid rgba(34, 224, 232, 0.3);
+  background: #fff;   /* 与主题无关:二维码底必须白 */
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.3);
 }
 .qr :deep(svg) { width: 100%; height: 100%; display: block; }
 .qr-side { flex: 1; min-width: 0; }
@@ -999,23 +999,23 @@ onMounted(() => {
   display: block;
   font-size: 11px;
   line-height: 1.6;
-  color: #22e0e8;
+  color: var(--cy-cyan);
   word-break: break-all;
   padding: 7px 9px;
-  background: rgba(34, 224, 232, 0.06);
-  border: 1px solid rgba(34, 224, 232, 0.2);
+  background: rgba(var(--cy-cyan-rgb), 0.06);
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.2);
 }
 
 .warn {
   font-size: 11.5px;
   line-height: 1.75;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   margin: 0 0 14px;
   padding: 10px 12px;
-  background: rgba(255, 178, 36, 0.07);
-  border-left: 2px solid #ffb224;
+  background: rgba(var(--cy-degraded-rgb), 0.07);
+  border-left: 2px solid var(--cy-degraded);
 }
-.warn b { color: #ffb224; font-weight: 600; }
+.warn b { color: var(--cy-degraded); font-weight: 600; }
 
 .codes {
   display: grid;
@@ -1026,9 +1026,9 @@ onMounted(() => {
 .codes span {
   font-size: 13px;
   letter-spacing: 0.06em;
-  color: #e8f4f8;
+  color: var(--cy-ink);
   padding: 6px 9px;
-  background: rgba(255, 255, 255, 0.035);
+  background: rgba(var(--cy-ink-rgb), 0.035);
   text-align: center;
 }
 </style>

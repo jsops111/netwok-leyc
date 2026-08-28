@@ -46,7 +46,7 @@ const rows = computed(() =>
     <div v-for="row in rows" :key="row.key" class="trend-row">
       <div class="trend-head">
         <span class="lbl">{{ row.label }}</span>
-        <span class="val cy-mono" :style="{ color: row.hasData ? row.color : '#7a8fa0' }">
+        <span class="val cy-mono" :style="{ color: row.hasData ? row.color : 'var(--cy-ink-3)' }">
           {{ row.hasData ? num(row.current, row.key === 'temp' ? 0 : 1, row.unit) : '—' }}
         </span>
       </div>
@@ -66,14 +66,14 @@ const rows = computed(() =>
   justify-content: space-between;
   margin-bottom: 3px;
 }
-.lbl { font-size: 11px; color: #7a8fa0; letter-spacing: 0.06em; }
+.lbl { font-size: 11px; color: var(--cy-ink-3); letter-spacing: 0.06em; }
 .val { font-size: 13px; font-weight: 700; }
 .na {
   height: 26px;
   display: flex;
   align-items: center;
   font-size: 10px;
-  color: #5c6b78;
-  border-bottom: 1px dashed rgba(122, 143, 160, 0.28);
+  color: var(--cy-ink-3);
+  border-bottom: 1px dashed rgba(var(--cy-ink-rgb), 0.28);
 }
 </style>

@@ -13,28 +13,148 @@
       不碰 width/top/left 那些会触发重排的属性。
    ========================================================================== */
 
-:root {
+/* ---------------------------------------------------------------------------
+ * 配色令牌。**页面上不许再出现裸的十六进制颜色** —— 两套主题就是靠这一层
+ * 切换的,漏掉一处就会在另一套主题下变成看不见的字或刺眼的块。
+ *
+ * 每个颜色都有 `-rgb` 三元组版本,给需要透明度的地方用:
+ *     border: 1px solid rgba(var(--cy-cyan-rgb), 0.2)
+ * 直接写 rgba(34, 224, 232, 0.2) 的话换主题它不会跟着变。
+ *
+ * 两套都是**量过的**(见提交说明):
+ *   - 文字类令牌对各自底色 ≥4.5:1(WCAG AA)
+ *   - 图表色对底色 ≥3:1,且色盲(protan/deutan)两两分离度 ΔE2000 ≥15.8
+ * ------------------------------------------------------------------------- */
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
   --cy-cyan: #22e0e8;
+  --cy-cyan-rgb: 34, 224, 232;
   --cy-magenta: #ff3d8b;
   --cy-violet: #b18aff;
   --cy-up: #2ee6a8;
+  --cy-up-rgb: 46, 230, 168;
   --cy-degraded: #ffb224;
+  --cy-degraded-rgb: 255, 178, 36;
   --cy-down: #ff5470;
+  --cy-down-rgb: 255, 84, 112;
   --cy-unknown: #7a8fa0;
 
   --cy-body: #050710;
+  --cy-body-rgb: 8, 11, 20;
   --cy-card: #0e1220;
+  --cy-card-rgb: 14, 18, 32;
   --cy-raised: #141a2c;
+  --cy-raised-rgb: 20, 26, 44;
 
   --cy-line: rgba(34, 224, 232, 0.17);
   --cy-line-soft: rgba(34, 224, 232, 0.09);
   --cy-glow: rgba(34, 224, 232, 0.35);
+  --cy-shadow-rgb: 0, 0, 0;
 
   --cy-ink: #e8f4f8;
+  --cy-ink-rgb: 232, 244, 248;
   --cy-ink-2: #a8bcc8;
   --cy-ink-3: #7a8fa0;
+  --cy-popover: #161d31;
+
+  /* 深色专属的"发光感"。亮色下这些要归零 —— 白底上的辉光只会糊成一团脏 */
+  --cy-info: #38d9f7;
+  --cy-tooltip-bg: rgba(10, 14, 26, 0.94);
+  /* 状态色块上的字色。深色主题的状态色都很亮 → 用深字 */
+  --cy-on-state: #0c1016;
+
+  /* 图表刻度色。**这八个值是校验过的,别凭手感改**(见 theme.ts 顶部)。
+     深色这套:对面板底 ≥3:1、OKLCH 明度 [0.48,0.67]、色度 ≥0.1。
+     已知缺陷:色盲分离度不达标(protan 最差 ΔE 0.7)。 */
+  --cy-cat-1: #009aa8;
+  --cy-cat-2: #e6247a;
+  --cy-cat-3: #d9631a;
+  --cy-cat-4: #8757e6;
+  --cy-cat-5: #0f8f6b;
+  --cy-cat-6: #b8860b;
+  --cy-cat-7: #2563eb;
+  --cy-cat-8: #c026d3;
+
+  --cy-glow-strength: 1;
+  --cy-grid-alpha: 0.055;
+  --cy-scanline-alpha: 0.32;
+  --cy-panel-shadow: 0.5;
 
   /* 切角尺寸。整站统一,改这一个值就能整体调"锐利度" */
+  --cy-notch: 12px;
+}
+
+/* ---------------------------------------------------------------------------
+ * 亮色。**不是把深色反过来** —— 霓虹色在白底上要压深才读得出来
+ * (#22e0e8 在白底上只有 1.6:1,是看不见的)。这一套的每个值都是按
+ * "对白底 ≥4.5:1" 重新解出来的,不是手调的。
+ *
+ * 同时关掉辉光和扫描线:那两样是"暗处发光"的语言,白底上只会显脏。
+ * 保留的是切角、边框、状态色语义 —— 那才是这套界面的骨架。
+ * ------------------------------------------------------------------------- */
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --cy-cyan: #007a89;
+  --cy-cyan-rgb: 0, 122, 137;
+  --cy-magenta: #c8175f;
+  --cy-violet: #6a3fd0;
+  --cy-up: #0e7a56;
+  --cy-up-rgb: 14, 122, 86;
+  --cy-degraded: #9a5b00;
+  --cy-degraded-rgb: 154, 91, 0;
+  --cy-down: #c8283f;
+  --cy-down-rgb: 200, 40, 63;
+  --cy-unknown: #5f7082;
+
+  --cy-body: #eef2f7;
+  --cy-body-rgb: 238, 242, 247;
+  --cy-card: #ffffff;
+  --cy-card-rgb: 255, 255, 255;
+  --cy-raised: #f6f9fc;
+  --cy-raised-rgb: 246, 249, 252;
+
+  --cy-line: rgba(0, 122, 137, 0.26);
+  --cy-line-soft: rgba(0, 122, 137, 0.13);
+  --cy-glow: rgba(0, 122, 137, 0.14);
+  --cy-shadow-rgb: 32, 48, 66;
+
+  /* 叠加层用 ink 的三元组:深色下它是近白(提亮),亮色下是近黑(压暗) ——
+     同一条规则在两套主题下自动反向,不用写两遍 */
+  --cy-ink: #101a26;
+  --cy-ink-rgb: 16, 26, 38;
+  --cy-ink-2: #3d4d5e;
+  --cy-ink-3: #5c7183;
+  --cy-popover: #ffffff;
+
+  --cy-info: #0a6f9e;
+  --cy-tooltip-bg: rgba(255, 255, 255, 0.97);
+  /* 亮色主题的状态色都压深了 → 上面用白字 */
+  --cy-on-state: #ffffff;
+
+  /* 图表刻度色(亮色)。**搜出来的,不是挑出来的**:约束是对白底和页面底
+     都 ≥3:1、OKLCH 明度 [0.40,0.70]、色度 ≥0.10、八个色相扇区各一个,
+     目标是最大化色盲分离度 —— 正常/protan/deutan 三种视觉下两两
+     ΔE2000 最差 15.8(深色那套同一指标是 0.7)。改了要重跑校验器。 */
+  --cy-cat-1: #1d9999;
+  --cy-cat-2: #ff307c;
+  --cy-cat-3: #b07a00;
+  --cy-cat-4: #4a40e7;
+  --cy-cat-5: #248160;
+  --cy-cat-6: #5b7fe6;
+  --cy-cat-7: #702d71;
+  --cy-cat-8: #385816;
+
+  --cy-glow-strength: 0;
+  --cy-grid-alpha: 0.05;
+  --cy-scanline-alpha: 0;
+  /* 白底上 0.5 的投影是脏的一团;亮色靠边框分层,不靠阴影 */
+  --cy-panel-shadow: 0.10;
+
   --cy-notch: 12px;
 }
 
@@ -51,9 +171,10 @@
   z-index: 0;
   pointer-events: none;
   background-color: var(--cy-body);
+  /* 网格线的浓度走令牌 —— 深色下是"电路板",亮色下要更淡才不像方格纸 */
   background-image:
-    linear-gradient(rgba(34, 224, 232, 0.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(34, 224, 232, 0.045) 1px, transparent 1px);
+    linear-gradient(rgba(var(--cy-cyan-rgb), var(--cy-grid-alpha)) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(var(--cy-cyan-rgb), var(--cy-grid-alpha)) 1px, transparent 1px);
   background-size: 44px 44px, 44px 44px;
 }
 
@@ -66,17 +187,19 @@
   height: 46vw;
   border-radius: 50%;
   filter: blur(90px);
-  opacity: 0.16;
+  /* 亮色下这两团辉光要关掉(--cy-glow-strength: 0)。白底上一大团模糊的
+     青色和品红不会"发光",只会像印刷没对准 */
+  opacity: calc(0.16 * var(--cy-glow-strength));
   will-change: transform;
 }
 .cy-bg::before {
-  background: radial-gradient(circle, #22e0e8 0%, transparent 68%);
+  background: radial-gradient(circle, var(--cy-cyan) 0%, transparent 68%);
   top: -14vw;
   left: -10vw;
   animation: cy-drift-a 50s ease-in-out infinite alternate;
 }
 .cy-bg::after {
-  background: radial-gradient(circle, #ff3d8b 0%, transparent 68%);
+  background: radial-gradient(circle, var(--cy-magenta) 0%, transparent 68%);
   bottom: -16vw;
   right: -12vw;
   animation: cy-drift-b 62s ease-in-out infinite alternate;
@@ -98,12 +221,14 @@
   pointer-events: none;
   background: repeating-linear-gradient(
     to bottom,
-    rgba(0, 0, 0, 0) 0px,
-    rgba(0, 0, 0, 0) 2px,
-    rgba(0, 0, 0, 0.22) 3px,
-    rgba(0, 0, 0, 0) 4px
+    rgba(var(--cy-shadow-rgb), 0) 0px,
+    rgba(var(--cy-shadow-rgb), 0) 2px,
+    rgba(var(--cy-shadow-rgb), 0.22) 3px,
+    rgba(var(--cy-shadow-rgb), 0) 4px
   );
-  opacity: 0.32;
+  /* 亮色下这一层整个关掉(令牌为 0)。CRT 扫描线是"暗处发光"的语言,
+     白底上只会把字糊掉 —— 保留它就是那种"半套亮色"的典型症状 */
+  opacity: var(--cy-scanline-alpha);
 }
 
 /* --------------------------------------------------------------- 面板 */
@@ -115,16 +240,16 @@
 .cy-panel {
   position: relative;
   background:
-    linear-gradient(160deg, rgba(20, 26, 44, 0.92) 0%, rgba(14, 18, 32, 0.96) 100%);
+    linear-gradient(160deg, rgba(var(--cy-raised-rgb), 0.92) 0%, rgba(var(--cy-card-rgb), 0.96) 100%);
   border: 1px solid var(--cy-line);
   clip-path: polygon(
     var(--cy-notch) 0, 100% 0, 100% calc(100% - var(--cy-notch)),
     calc(100% - var(--cy-notch)) 100%, 0 100%, 0 var(--cy-notch)
   );
   box-shadow:
-    0 0 0 1px rgba(34, 224, 232, 0.05),
-    0 8px 34px rgba(0, 0, 0, 0.5),
-    inset 0 1px 0 rgba(34, 224, 232, 0.08);
+    0 0 0 1px rgba(var(--cy-cyan-rgb), 0.05),
+    0 8px 34px rgba(var(--cy-shadow-rgb), var(--cy-panel-shadow)),
+    inset 0 1px 0 rgba(var(--cy-cyan-rgb), 0.08);
 }
 
 /* 顶部那道霓虹细线 —— 面板的"通电"标志 */
@@ -143,15 +268,15 @@
 
 /* 面板级状态:有严重事件时整块面板的边框脉冲 */
 .cy-panel.is-critical {
-  border-color: rgba(255, 84, 112, 0.5);
+  border-color: rgba(var(--cy-down-rgb), 0.5);
   animation: cy-pulse-critical 2s ease-in-out infinite;
 }
 .cy-panel.is-warning {
-  border-color: rgba(255, 178, 36, 0.42);
+  border-color: rgba(var(--cy-degraded-rgb), 0.42);
 }
 @keyframes cy-pulse-critical {
-  0%, 100% { box-shadow: 0 0 0 1px rgba(255, 84, 112, 0.18), 0 8px 34px rgba(0,0,0,.5); }
-  50%      { box-shadow: 0 0 22px 2px rgba(255, 84, 112, 0.3), 0 8px 34px rgba(0,0,0,.5); }
+  0%, 100% { box-shadow: 0 0 0 1px rgba(var(--cy-down-rgb), 0.18), 0 8px 34px rgba(var(--cy-shadow-rgb), .5); }
+  50%      { box-shadow: 0 0 22px 2px rgba(var(--cy-down-rgb), 0.3), 0 8px 34px rgba(var(--cy-shadow-rgb), .5); }
 }
 
 /* 面板标题:左侧竖条 + 字距 */
@@ -201,7 +326,7 @@
   height: 64px;
   pointer-events: none;
   background: linear-gradient(
-    to bottom, transparent, rgba(34, 224, 232, 0.07) 55%, rgba(34, 224, 232, 0.13) 82%, transparent
+    to bottom, transparent, rgba(var(--cy-cyan-rgb), 0.07) 55%, rgba(var(--cy-cyan-rgb), 0.13) 82%, transparent
   );
   animation: cy-sweep 5.5s linear infinite;
   will-change: transform;
@@ -298,7 +423,7 @@
 .cy-tile {
   position: relative;
   padding: 13px 15px 12px;
-  background: linear-gradient(155deg, rgba(20,26,44,.85), rgba(10,14,26,.92));
+  background: linear-gradient(155deg, rgba(var(--cy-raised-rgb),.85), rgba(var(--cy-card-rgb),.92));
   border: 1px solid var(--cy-line-soft);
   border-left: 2px solid var(--tile, var(--cy-cyan));
   clip-path: polygon(0 0, 100% 0, 100% calc(100% - 9px), calc(100% - 9px) 100%, 0 100%);
@@ -353,7 +478,7 @@
  */
 .cy-flash { animation: cy-flash .45s ease-out 1; }
 @keyframes cy-flash {
-  0%   { background-color: rgba(34, 224, 232, 0.22); }
+  0%   { background-color: rgba(var(--cy-cyan-rgb), 0.22); }
   100% { background-color: transparent; }
 }
 
@@ -362,7 +487,7 @@
 .cy-meter {
   position: relative;
   height: 6px;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(var(--cy-ink-rgb), 0.06);
   overflow: hidden;
 }
 .cy-meter-fill {
@@ -377,7 +502,7 @@
   top: -2px;
   bottom: -2px;
   width: 1px;
-  background: rgba(255, 255, 255, 0.45);
+  background: rgba(var(--cy-ink-rgb), 0.45);
 }
 
 /* --------------------------------------------------------------- 表格 */

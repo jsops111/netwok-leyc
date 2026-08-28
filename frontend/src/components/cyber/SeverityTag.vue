@@ -1,20 +1,30 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { severityColor } from '@/theme'
+import { resolveColor, severityColor } from '@/theme'
+import { useThemeStore } from '@/stores/theme'
 
 /**
  * 级别标签。
  *
- * **字色按底色亮度算,不写死白色。**警告档的底色 #ffb224 上白字只有 1.83:1,
+ * **字色按底色亮度算,不写死白色。**警告档的底色 var(--cy-degraded) 上白字只有 1.83:1,
  * 根本读不出来 —— 这是隔壁项目实测踩过的坑(全站 49 处)。
  */
 const props = defineProps<{ severity: string; label?: string }>()
+const theme = useThemeStore()
 
 const bg = computed(() => severityColor(props.severity))
 
-/** 相对亮度决定用深字还是浅字。阈值 0.55 是实测出来的分界。 */
+/**
+ * 相对亮度决定用深字还是浅字。阈值 0.35 是实测出来的分界。
+ *
+ * **两套主题都要算,不能写死。**深色主题的级别色都很亮(白字读不出来),
+ * 亮色主题的压深了(黑字读不出来)—— 方向正好相反,所以只能按底色算。
+ * 这里要 `resolveColor`:亮度是数值运算,拿 `var(--x)` 算不出来。
+ */
 const ink = computed(() => {
-  const hex = bg.value.replace('#', '')
+  void theme.mode                       // 换主题时重算
+  const hex = resolveColor(bg.value).replace('#', '')
+  if (hex.length < 6) return '#ffffff'
   const [r, g, b] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
   const lin = (c: number) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)
   const luminance = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)

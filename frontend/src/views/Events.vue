@@ -132,10 +132,10 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
     minWidth: 190,
     render: (row) =>
       h('div', [
-        h('div', { style: 'font-size:12.5px;color:#e8f4f8' }, row.source_name),
+        h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, row.source_name),
         h(
           'div',
-          { style: "font-size:10.5px;color:#7a8fa0;font-family:'JetBrains Mono',monospace" },
+          { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
           `${row.source_type_label}${row.group_name ? ' · ' + row.group_name : ''}`,
         ),
       ]),
@@ -146,11 +146,11 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
     minWidth: 240,
     render: (row) =>
       h('div', [
-        h('div', { style: 'font-size:12px;color:#a8bcc8;line-height:1.45' }, row.message || row.title),
+        h('div', { style: 'font-size:12px;color:var(--cy-ink-2);line-height:1.45' }, row.message || row.title),
         row.trigger_value !== null
           ? h(
               'div',
-              { style: "font-size:10.5px;color:#7a8fa0;font-family:'JetBrains Mono',monospace;margin-top:2px" },
+              { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace;margin-top:2px" },
               `实测 ${num(row.trigger_value, 1, row.unit)}${row.threshold !== null ? ` / 阈值 ${num(row.threshold, 0, row.unit)}` : ''} · 失败 ${row.fail_count} 次`,
             )
           : null,
@@ -164,7 +164,7 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
     render: (row) =>
       h('div', [
         h('div', { style: 'font-size:11.5px' }, dateTimeOf(row.started_at)),
-        h('div', { style: 'font-size:10px;color:#7a8fa0' }, ago(row.started_at)),
+        h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, ago(row.started_at)),
       ]),
   },
   {
@@ -176,7 +176,7 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
       row.resolved_at
         ? h('div', [
             h('div', { style: 'font-size:11.5px' }, dateTimeOf(row.resolved_at)),
-            h('div', { style: 'font-size:10px;color:#2ee6a8' }, '已恢复'),
+            h('div', { style: 'font-size:10px;color:var(--cy-up)' }, '已恢复'),
           ])
         : // 未恢复的显式标出来,不是留空 —— 留空看起来像数据缺失
           h(
@@ -194,7 +194,7 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
       h(
         'span',
         {
-          style: `font-size:11.5px;color:${row.is_open ? STATE.down : '#a8bcc8'}`,
+          style: `font-size:11.5px;color:${row.is_open ? STATE.down : 'var(--cy-ink-2)'}`,
         },
         // 未恢复的用实时时长(后端算的 live_duration_s)
         duration(row.is_open ? row.live_duration_s : row.duration_s),
@@ -208,7 +208,7 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
       const tags = []
       if (row.notified_alert) tags.push(h(NTag, { size: 'tiny', type: 'info', bordered: false }, () => '告警'))
       if (row.notified_recover) tags.push(h(NTag, { size: 'tiny', type: 'success', bordered: false }, () => '恢复'))
-      if (!tags.length) tags.push(h('span', { style: 'font-size:10.5px;color:#7a8fa0' }, '未推送'))
+      if (!tags.length) tags.push(h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '未推送'))
       return h('div', { style: 'display:flex;gap:3px;flex-wrap:wrap' }, tags)
     },
   },
@@ -221,7 +221,7 @@ const columns = computed<DataTableColumns<EventRow>>(() => [
         row.acknowledged_at
           ? h(
               'span',
-              { style: 'font-size:10.5px;color:#2ee6a8', title: row.note },
+              { style: 'font-size:10.5px;color:var(--cy-up)', title: row.note },
               `${row.acknowledged_by} 已认领`,
             )
           : h(NButton, { size: 'tiny', ghost: true, onClick: () => openAck(row) }, () => '认领'),
@@ -265,7 +265,7 @@ const deviceRank = computed(() => summary.value?.top_devices || [])
         <NSelect v-model:value="hours" :options="HOURS_OPTIONS" size="small" style="width: 132px" />
       </div>
       <div class="tiles">
-        <StatTile label="事件总数" :value="summary?.total ?? null" unit="条" color="#22e0e8" :dim-zero="false" />
+        <StatTile label="事件总数" :value="summary?.total ?? null" unit="条" color="var(--cy-cyan)" :dim-zero="false" />
         <StatTile
           label="未恢复" :value="summary?.open ?? null" unit="条" :color="STATE.down"
           :foot="summary?.open ? '需要处理' : '全部已恢复'"
@@ -278,7 +278,7 @@ const deviceRank = computed(() => summary.value?.top_devices || [])
         />
         <StatTile
           label="累计故障时长" :value="summary ? duration(summary.duration.total_s) : null"
-          color="#b18aff" :dim-zero="false"
+          color="var(--cy-violet)" :dim-zero="false"
         />
       </div>
 
@@ -390,9 +390,9 @@ const deviceRank = computed(() => summary.value?.top_devices || [])
 .ev { display: flex; flex-direction: column; gap: 16px; }
 
 .sum-bar {
-  background: linear-gradient(150deg, rgba(20, 26, 44, 0.7), rgba(8, 11, 20, 0.85));
-  border: 1px solid rgba(34, 224, 232, 0.13);
-  border-top: 2px solid rgba(34, 224, 232, 0.5);
+  background: linear-gradient(150deg, rgba(var(--cy-raised-rgb), 0.7), rgba(var(--cy-body-rgb), 0.85));
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.13);
+  border-top: 2px solid rgba(var(--cy-cyan-rgb), 0.5);
   padding: 13px 16px 14px;
   clip-path: polygon(0 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);
 }
@@ -414,16 +414,16 @@ const deviceRank = computed(() => summary.value?.top_devices || [])
   gap: 20px;
   margin-top: 14px;
   padding-top: 12px;
-  border-top: 1px solid rgba(34, 224, 232, 0.1);
+  border-top: 1px solid rgba(var(--cy-cyan-rgb), 0.1);
 }
 .rank-title {
   font-size: 10.5px;
   letter-spacing: 0.12em;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   text-transform: uppercase;
   margin-bottom: 7px;
 }
-.rank-empty { font-size: 11.5px; color: #5c6b78; }
+.rank-empty { font-size: 11.5px; color: var(--cy-ink-3); }
 .rank-row {
   display: grid;
   grid-template-columns: 88px minmax(0, 1fr) 34px;
@@ -433,38 +433,38 @@ const deviceRank = computed(() => summary.value?.top_devices || [])
 }
 .rk-name {
   font-size: 11.5px;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.rk-bar { height: 5px; background: rgba(255, 255, 255, 0.055); }
+.rk-bar { height: 5px; background: rgba(var(--cy-ink-rgb), 0.055); }
 .rk-bar i {
   display: block;
   height: 100%;
-  background: #22e0e8;
-  box-shadow: 0 0 8px rgba(34, 224, 232, 0.5);
+  background: var(--cy-cyan);
+  box-shadow: 0 0 8px rgba(var(--cy-cyan-rgb), 0.5);
   transition: width 0.4s ease;
 }
-.rk-bar i.warn { background: #ffb224; box-shadow: 0 0 8px rgba(255, 178, 36, 0.5); }
-.rk-bar i.violet { background: #b18aff; box-shadow: 0 0 8px rgba(177, 138, 255, 0.5); }
-.rk-num { font-size: 11.5px; color: #e8f4f8; text-align: right; }
+.rk-bar i.warn { background: var(--cy-degraded); box-shadow: 0 0 8px rgba(var(--cy-degraded-rgb), 0.5); }
+.rk-bar i.violet { background: var(--cy-violet); box-shadow: 0 0 8px var(--cy-glow); }
+.rk-num { font-size: 11.5px; color: var(--cy-ink); text-align: right; }
 
 .tbl-err {
   padding: 8px 16px;
   font-size: 11.5px;
-  color: #ffb224;
+  color: var(--cy-degraded);
   font-family: 'JetBrains Mono', monospace;
 }
 
 .ack { display: flex; flex-direction: column; gap: 10px; }
-.ack-title { font-size: 14px; font-weight: 600; color: #e8f4f8; }
-.ack-msg { font-size: 12px; color: #a8bcc8; line-height: 1.5; }
+.ack-title { font-size: 14px; font-weight: 600; color: var(--cy-ink); }
+.ack-msg { font-size: 12px; color: var(--cy-ink-2); line-height: 1.5; }
 </style>
 
 <style>
 /* 未恢复的行左侧一道红边 —— 整行染色会盖掉文字,只标边框 */
 .n-data-table .row-open td:first-child {
-  box-shadow: inset 2px 0 0 #ff5470;
+  box-shadow: inset 2px 0 0 var(--cy-down);
 }
 </style>

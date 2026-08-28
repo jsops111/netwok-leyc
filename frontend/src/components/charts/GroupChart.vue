@@ -8,7 +8,8 @@ import {
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import type { ChartGroup } from '@/api'
-import { CATEGORICAL, INK, STATE, seriesColor } from '@/theme'
+import { CATEGORICAL, INK, STATE, resolveColor, seriesColor } from '@/theme'
+import { useThemeStore } from '@/stores/theme'
 import { ms, pct } from '@/composables/useFormat'
 
 /**
@@ -43,6 +44,31 @@ const props = defineProps<{
 
 const el = ref<HTMLDivElement>()
 const chart = shallowRef<echarts.ECharts>()
+const theme = useThemeStore()
+
+/**
+ * **ECharts 画在 canvas 上,不认 CSS 变量** —— 所以这里要把 `var(--cy-x)`
+ * 解成具体颜色。解出来的值不会随主题更新,必须在主题切换时重新解一次。
+ *
+ * 用 flush:'post' 是有意的:主题 store 把 `data-theme` 写到 <html> 上是在
+ * pre 阶段,post 阶段读 getComputedStyle 才拿得到新值。写成默认的 pre
+ * 会解出**上一套主题**的颜色,而且只差一帧 —— 这种错最难看出来。
+ */
+const C = ref(readColors())
+
+function readColors() {
+  return {
+    ink: resolveColor(INK.base),
+    ink2: resolveColor(INK.secondary),
+    ink3: resolveColor(INK.muted),
+    down: resolveColor(STATE.down),
+    degraded: resolveColor(STATE.degraded),
+    tooltipBg: resolveColor('var(--cy-tooltip-bg)'),
+    cat: CATEGORICAL.map((c) => resolveColor(c)),
+  }
+}
+
+watch(() => theme.mode, () => { C.value = readColors() }, { flush: 'post' })
 
 const METRIC_META = {
   rtt: { name: '延迟', unit: 'ms', fmt: ms, warnKey: 'latency_warn', critKey: 'latency_crit' },
@@ -53,7 +79,7 @@ const METRIC_META = {
 /** 分组自定义了强调色就用它当第一条线的颜色,否则整组走色板。 */
 function lineColor(index: number): string {
   if (index === 0 && props.data.group.color) return props.data.group.color
-  return seriesColor(index)
+  return C.value.cat[index % C.value.cat.length]
 }
 
 /**
@@ -142,7 +168,7 @@ const option = computed(() => {
         downAreas.length && i === 0
           ? {
               silent: true,
-              itemStyle: { color: 'rgba(255, 84, 112, 0.13)' },
+              itemStyle: { color: 'rgba(var(--cy-down-rgb), 0.13)' },
               data: downAreas,
             }
           : undefined,
@@ -151,15 +177,15 @@ const option = computed(() => {
           ? {
               silent: true,
               symbol: 'none',
-              label: { formatter: '{b}', color: INK.muted, fontSize: 10, position: 'insideEndTop' },
+              label: { formatter: '{b}', color: C.value.ink3, fontSize: 10, position: 'insideEndTop' },
               data: [
                 ...(warnLine
                   ? [{ yAxis: warnLine, name: `警告 ${warnLine}${meta.unit}`,
-                       lineStyle: { color: STATE.degraded, type: 'dashed', width: 1, opacity: 0.6 } }]
+                       lineStyle: { color: C.value.degraded, type: 'dashed', width: 1, opacity: 0.6 } }]
                   : []),
                 ...(critLine
                   ? [{ yAxis: critLine, name: `严重 ${critLine}${meta.unit}`,
-                       lineStyle: { color: STATE.down, type: 'dashed', width: 1, opacity: 0.6 } }]
+                       lineStyle: { color: C.value.down, type: 'dashed', width: 1, opacity: 0.6 } }]
                   : []),
               ],
             }
@@ -176,17 +202,17 @@ const option = computed(() => {
       bottom: 0,
       itemWidth: 14,
       itemHeight: 2,
-      textStyle: { color: INK.secondary, fontSize: 11 },
-      pageIconColor: CATEGORICAL[0],
-      pageTextStyle: { color: INK.muted },
+      textStyle: { color: C.value.ink2, fontSize: 11 },
+      pageIconColor: C.value.cat[0],
+      pageTextStyle: { color: C.value.ink3 },
     },
     tooltip: {
       trigger: 'axis',
-      backgroundColor: 'rgba(10, 14, 26, 0.94)',
-      borderColor: 'rgba(34, 224, 232, 0.3)',
+      backgroundColor: C.value.tooltipBg,
+      borderColor: 'rgba(var(--cy-cyan-rgb), 0.3)',
       borderWidth: 1,
-      textStyle: { color: INK.base, fontSize: 12 },
-      axisPointer: { type: 'line', lineStyle: { color: 'rgba(34, 224, 232, 0.4)' } },
+      textStyle: { color: C.value.ink, fontSize: 12 },
+      axisPointer: { type: 'line', lineStyle: { color: 'rgba(var(--cy-cyan-rgb), 0.4)' } },
       // 值为 null 的行不显示 —— 断线时十条线里有一条断了,
       // 默认会显示 "线路A: -",那一行是噪音
       formatter: (params: any[]) => {
@@ -203,21 +229,21 @@ const option = computed(() => {
           })
         const missing = params.length - rows.length
         const foot = missing
-          ? `<div style="margin-top:4px;color:${STATE.down};font-size:11px">${missing} 条无数据 / 断线</div>`
+          ? `<div style="margin-top:4px;color:${C.value.down};font-size:11px">${missing} 条无数据 / 断线</div>`
           : ''
-        return `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:${INK.muted};margin-bottom:5px">${time}</div>${rows.join('')}${foot}`
+        return `<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:${C.value.ink3};margin-bottom:5px">${time}</div>${rows.join('')}${foot}`
       },
     },
     xAxis: {
       type: 'time',
-      axisLine: { lineStyle: { color: 'rgba(34, 224, 232, 0.2)' } },
-      axisLabel: { color: INK.muted, fontSize: 10, hideOverlap: true },
+      axisLine: { lineStyle: { color: 'rgba(var(--cy-cyan-rgb), 0.2)' } },
+      axisLabel: { color: C.value.ink3, fontSize: 10, hideOverlap: true },
       splitLine: { show: false },
     },
     yAxis: {
       type: 'value',
       name: `${meta.name}(${meta.unit})`,
-      nameTextStyle: { color: INK.muted, fontSize: 10, align: 'right' },
+      nameTextStyle: { color: C.value.ink3, fontSize: 10, align: 'right' },
       // 丢包率固定 0-100,否则一条全 0 的线会把 Y 轴缩到 0~0.001,
       // 看着像剧烈波动。
       // **延迟和抖动不强制从 0 起**:内网线路常年在 0.0x ms,从 0 起会把
@@ -226,8 +252,8 @@ const option = computed(() => {
       min: props.metric === 'loss' ? 0 : 'dataMin',
       scale: props.metric !== 'loss',
       axisLine: { show: false },
-      axisLabel: { color: INK.muted, fontSize: 10 },
-      splitLine: { lineStyle: { color: 'rgba(34, 224, 232, 0.07)' } },
+      axisLabel: { color: C.value.ink3, fontSize: 10 },
+      splitLine: { lineStyle: { color: 'rgba(var(--cy-cyan-rgb), 0.07)' } },
     },
     series,
   }

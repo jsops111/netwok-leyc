@@ -260,7 +260,7 @@ const groupFields: FieldSpec[] = [
     placeholder: '如:互联网出口 / 专线 / 内网核心', hint: '大屏上一个监控类就是一张大图' },
   { key: 'order', label: '排序', type: 'number', min: 0, hint: '数字小的排在前面' },
   { key: 'description', label: '说明', type: 'text', full: true },
-  { key: 'color', label: '强调色', type: 'text', placeholder: '#22e0e8(留空自动分配)',
+  { key: 'color', label: '强调色', type: 'text', placeholder: 'var(--cy-cyan)(留空自动分配)',
     hint: '别填高饱和亮色 —— 深色底上会发晕' },
   { key: 'enabled', label: '启用', type: 'switch' },
 ]
@@ -463,7 +463,7 @@ const groupOptions = computed(() =>
 const groupColumns: DataTableColumns<ProbeGroup> = [
   { title: '名称', key: 'name', minWidth: 140 },
   { title: '说明', key: 'description', minWidth: 180,
-    render: (r) => h('span', { style: 'color:#a8bcc8;font-size:12px' }, r.description || '—') },
+    render: (r) => h('span', { style: 'color:var(--cy-ink-2);font-size:12px' }, r.description || '—') },
   { title: '线路数', key: 'target_count', width: 80, className: 'num' },
   { title: '排序', key: 'order', width: 62, className: 'num' },
   { title: '启用', key: 'enabled', width: 66,
@@ -485,12 +485,12 @@ const probeColumns: DataTableColumns<ProbeTarget> = [
     render: (r) => h(StateDot, { state: r.state, label: true }) },
   { title: '线路', key: 'name', minWidth: 170,
     render: (r) => h('div', [
-      h('div', { style: 'font-size:12.5px;color:#e8f4f8' }, r.name),
-      h('div', { style: "font-size:10.5px;color:#7a8fa0;font-family:'JetBrains Mono',monospace" },
+      h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
+      h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         endpoint(r.host, r.protocol, r.port)),
     ]) },
   { title: '监控类', key: 'group_name', width: 110,
-    render: (r) => h('span', { style: 'font-size:12px;color:#a8bcc8' }, r.group_name || '—') },
+    render: (r) => h('span', { style: 'font-size:12px;color:var(--cy-ink-2)' }, r.group_name || '—') },
   { title: '频率', key: 'interval_seconds', width: 74, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
   { title: '延迟', key: 'last_rtt_ms', width: 84, className: 'num',
@@ -502,10 +502,10 @@ const probeColumns: DataTableColumns<ProbeTarget> = [
       style: `font-size:11.5px;color:${r.availability >= 99.9 ? STATE.up : r.availability >= 99 ? STATE.degraded : STATE.down}`,
     }, r.total_checks ? pct(r.availability, 2) : '—') },
   { title: '阈值', key: 'thresholds', width: 156,
-    render: (r) => h('span', { style: "font-size:10.5px;color:#7a8fa0;font-family:'JetBrains Mono',monospace" },
+    render: (r) => h('span', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
       `${r.latency_warn_ms}/${r.latency_crit_ms}ms · ${r.loss_warn_pct}/${r.loss_crit_pct}% · ${r.jitter_warn_ms}/${r.jitter_crit_ms}ms`) },
   { title: '最后检测', key: 'last_checked_at', width: 96,
-    render: (r) => h('span', { style: 'font-size:11px;color:#7a8fa0' }, ago(r.last_checked_at)) },
+    render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_checked_at)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('probe', r) }) },
   { title: '操作', key: 'act', width: 172, fixed: 'right',
@@ -525,13 +525,13 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
     render: (r) => h(StateDot, { state: r.state, label: true }) },
   { title: '设备', key: 'name', minWidth: 165,
     render: (r) => h('div', [
-      h('div', { style: 'font-size:12.5px;color:#e8f4f8' }, r.name),
-      h('div', { style: "font-size:10.5px;color:#7a8fa0;font-family:'JetBrains Mono',monospace" }, r.mgmt_ip),
+      h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
+      h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" }, r.mgmt_ip),
     ]) },
   { title: '型号', key: 'model_label', width: 172,
     render: (r) => h('div', [
-      h('div', { style: 'font-size:11.5px;color:#a8bcc8' }, r.model_label || r.model),
-      h('div', { style: 'font-size:10px;color:#7a8fa0' },
+      h('div', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.model_label || r.model),
+      h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
         `${r.kind_label || r.kind}${r.os_version ? ' · ' + r.os_version : ''}`),
     ]) },
   { title: '通道', key: 'collect_method', width: 118,
@@ -551,13 +551,13 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
       r.has_ssh_credential ? h(NTag, { size: 'tiny', bordered: false }, () => 'SSH') : null,
       r.has_api_token ? h(NTag, { size: 'tiny', bordered: false }, () => 'API') : null,
       !r.has_snmp_community && !r.has_ssh_credential && !r.has_api_token
-        ? h('span', { style: 'font-size:10.5px;color:#ff5470' }, '未配置') : null,
+        ? h('span', { style: 'font-size:10.5px;color:var(--cy-down)' }, '未配置') : null,
     ]) },
   { title: '接口', key: 'interface_count', width: 66, className: 'num' },
   { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
   { title: '最后采集', key: 'last_collected_at', width: 96,
-    render: (r) => h('span', { style: 'font-size:11px;color:#7a8fa0' }, ago(r.last_collected_at)) },
+    render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('device', r) }) },
   { title: '操作', key: 'act', width: 208, fixed: 'right',
@@ -578,11 +578,11 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
 const notifierColumns: DataTableColumns<NotifierRow> = [
   { title: '渠道', key: 'name', minWidth: 140,
     render: (r) => h('div', [
-      h('div', { style: 'font-size:12.5px;color:#e8f4f8' }, r.name),
-      h('div', { style: 'font-size:10.5px;color:#7a8fa0' }, r.kind_label || r.kind),
+      h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
+      h('div', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, r.kind_label || r.kind),
     ]) },
   { title: '目标', key: 'dest', minWidth: 180,
-    render: (r) => h('span', { style: "font-size:11px;color:#a8bcc8;font-family:'JetBrains Mono',monospace;word-break:break-all" },
+    render: (r) => h('span', { style: "font-size:11px;color:var(--cy-ink-2);font-family:'JetBrains Mono',monospace;word-break:break-all" },
       r.kind === 'telegram' ? `chat ${r.telegram_chat_id || '?'}` : r.webhook_url || '—') },
   { title: '推送', key: 'phases', width: 96,
     render: (r) => h('div', { style: 'display:flex;gap:3px' }, [
@@ -590,7 +590,7 @@ const notifierColumns: DataTableColumns<NotifierRow> = [
       r.on_recover ? h(NTag, { size: 'tiny', bordered: false, type: 'success' }, () => '恢复') : null,
     ]) },
   { title: '过滤', key: 'filters', minWidth: 150,
-    render: (r) => h('div', { style: 'font-size:10.5px;color:#7a8fa0;line-height:1.5' }, [
+    render: (r) => h('div', { style: 'font-size:10.5px;color:var(--cy-ink-3);line-height:1.5' }, [
       h('div', null, `级别 ≥ ${meta.label('severity', r.min_severity)}`),
       r.kinds?.length ? h('div', null, `类型 ${r.kinds.length} 项`) : null,
       r.group_names?.length ? h('div', null, `监控类 ${r.group_names.join('/')}`) : null,
@@ -600,7 +600,7 @@ const notifierColumns: DataTableColumns<NotifierRow> = [
     render: (r) => h('div', { style: 'font-size:11px;line-height:1.5' }, [
       h('div', { style: `color:${STATE.up}` }, `成功 ${r.total_sent}`),
       r.total_failed ? h('div', { style: `color:${STATE.down}` }, `失败 ${r.total_failed}`) : null,
-      h('div', { style: 'color:#7a8fa0;font-size:10px' }, ago(r.last_sent_at)),
+      h('div', { style: 'color:var(--cy-ink-3);font-size:10px' }, ago(r.last_sent_at)),
     ]) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('notifier', r) }) },
@@ -763,11 +763,11 @@ const profileNote = computed(() => {
   margin-bottom: 14px;
   font-size: 11.5px;
   line-height: 1.6;
-  color: #a8bcc8;
-  background: rgba(34, 224, 232, 0.05);
-  border-left: 2px solid rgba(34, 224, 232, 0.45);
+  color: var(--cy-ink-2);
+  background: rgba(var(--cy-cyan-rgb), 0.05);
+  border-left: 2px solid rgba(var(--cy-cyan-rgb), 0.45);
 }
-.profile-note b { color: #22e0e8; }
+.profile-note b { color: var(--cy-cyan); }
 
 .test-res { display: flex; gap: 14px; align-items: flex-start; }
 .test-badge {
@@ -778,14 +778,14 @@ const profileNote = computed(() => {
   letter-spacing: 0.08em;
   clip-path: polygon(4px 0, 100% 0, calc(100% - 4px) 100%, 0 100%);
 }
-.test-badge.ok { background: #2ee6a8; color: #0c1016; }
-.test-badge.bad { background: #ff5470; color: #fff; }
+.test-badge.ok { background: var(--cy-up); color: var(--cy-on-state); }
+.test-badge.bad { background: var(--cy-down); color: var(--cy-on-state); }
 .test-lines { flex: 1; min-width: 0; }
 .test-line {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11.5px;
   line-height: 1.75;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   word-break: break-all;
 }
 </style>

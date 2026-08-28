@@ -61,8 +61,8 @@ const TILE_COLORS: Record<string, string> = {
   down: STATE.down,
   loss: STATE.degraded,
   latency: STATE.degraded,
-  jitter: '#b18aff',
-  anomaly: '#ff3d8b',
+  jitter: 'var(--cy-violet)',
+  anomaly: 'var(--cy-magenta)',
 }
 
 /** 有未恢复的严重事件 → 整个大屏进入告警态(面板边框脉冲)。 */
@@ -155,7 +155,7 @@ const schedulerWarning = computed(() => {
           <span class="v cy-mono">{{ overview.data.value?.devices.total ?? '—' }}</span>
           <span class="chips">
             <i class="chip" :style="{ '--c': STATE.up }">交换机 {{ overview.data.value?.devices.switches ?? 0 }}</i>
-            <i class="chip" :style="{ '--c': '#b18aff' }">防火墙 {{ overview.data.value?.devices.firewalls ?? 0 }}</i>
+            <i class="chip" :style="{ '--c': 'var(--cy-violet)' }">防火墙 {{ overview.data.value?.devices.firewalls ?? 0 }}</i>
             <i v-if="overview.data.value?.devices.down" class="chip" :style="{ '--c': STATE.down }">
               失联 {{ overview.data.value?.devices.down }}
             </i>
@@ -168,7 +168,7 @@ const schedulerWarning = computed(() => {
             <i class="chip" :style="{ '--c': STATE.down }">
               未恢复 {{ overview.data.value?.events.open ?? 0 }}
             </i>
-            <i class="chip" :style="{ '--c': '#ff3d8b' }">
+            <i class="chip" :style="{ '--c': 'var(--cy-magenta)' }">
               严重 {{ overview.data.value?.events.critical_open ?? 0 }}
             </i>
             <i class="chip" :style="{ '--c': STATE.unknown }">
@@ -322,7 +322,7 @@ const schedulerWarning = computed(() => {
             </span>
             <span
               v-if="iface.util_in !== null" class="if-util cy-mono"
-              :style="{ color: iface.util_in! > 80 ? STATE.down : iface.util_in! > 60 ? STATE.degraded : '#7a8fa0' }"
+              :style="{ color: iface.util_in! > 80 ? STATE.down : iface.util_in! > 60 ? STATE.degraded : 'var(--cy-ink-3)' }"
             >{{ pct(Math.max(iface.util_in || 0, iface.util_out || 0), 0) }}</span>
             <span v-if="iface.errors > 0" class="if-err">错包 {{ iface.errors }}</span>
           </div>
@@ -345,9 +345,9 @@ const schedulerWarning = computed(() => {
 
 /* ---- 顶部 ---- */
 .top-bar {
-  background: linear-gradient(150deg, rgba(20, 26, 44, 0.7), rgba(8, 11, 20, 0.85));
-  border: 1px solid rgba(34, 224, 232, 0.13);
-  border-top: 2px solid rgba(34, 224, 232, 0.5);
+  background: linear-gradient(150deg, rgba(var(--cy-raised-rgb), 0.7), rgba(var(--cy-body-rgb), 0.85));
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.13);
+  border-top: 2px solid rgba(var(--cy-cyan-rgb), 0.5);
   padding: 13px 16px 14px;
   clip-path: polygon(0 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);
 }
@@ -362,7 +362,7 @@ const schedulerWarning = computed(() => {
 .top-title {
   font-size: 14px;
   letter-spacing: 0.14em;
-  color: #e8f4f8;
+  color: var(--cy-ink);
   text-transform: uppercase;
   display: flex;
   align-items: baseline;
@@ -372,16 +372,16 @@ const schedulerWarning = computed(() => {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
   letter-spacing: 0.04em;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   text-transform: none;
 }
 .top-actions { display: flex; align-items: center; gap: 12px; }
 .refresh-note {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
 }
-.refresh-note.stale { color: #ffb224; }
+.refresh-note.stale { color: var(--cy-degraded); }
 
 .tiles {
   display: grid;
@@ -395,12 +395,12 @@ const schedulerWarning = computed(() => {
   gap: 10px 26px;
   margin-top: 13px;
   padding-top: 12px;
-  border-top: 1px solid rgba(34, 224, 232, 0.1);
+  border-top: 1px solid rgba(var(--cy-cyan-rgb), 0.1);
   align-items: center;
 }
 .strip-item { display: flex; align-items: baseline; gap: 8px; }
-.strip-item .k { font-size: 11px; color: #7a8fa0; letter-spacing: 0.1em; }
-.strip-item .v { font-size: 18px; font-weight: 700; color: #e8f4f8; }
+.strip-item .k { font-size: 11px; color: var(--cy-ink-3); letter-spacing: 0.1em; }
+.strip-item .v { font-size: 18px; font-weight: 700; color: var(--cy-ink); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
   font-size: 11px;
@@ -412,7 +412,7 @@ const schedulerWarning = computed(() => {
 }
 .sched-warn {
   font-size: 11px;
-  color: #ffb224;
+  color: var(--cy-degraded);
   margin-left: auto;
   font-family: 'JetBrains Mono', monospace;
 }
@@ -461,26 +461,26 @@ const schedulerWarning = computed(() => {
   gap: 10px;
   align-items: center;
   padding: 6px 8px;
-  background: rgba(255, 255, 255, 0.018);
+  background: rgba(var(--cy-ink-rgb), 0.018);
   border-left: 2px solid transparent;
 }
 .line-item.bad {
-  border-left-color: #ff5470;
-  background: rgba(255, 84, 112, 0.055);
+  border-left-color: var(--cy-down);
+  background: rgba(var(--cy-down-rgb), 0.055);
 }
 .line-l { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .line-meta { min-width: 0; }
 .line-name {
   font-size: 12.5px;
   font-weight: 600;
-  color: #e8f4f8;
+  color: var(--cy-ink);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .line-host {
   font-size: 10.5px;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -488,11 +488,11 @@ const schedulerWarning = computed(() => {
 .line-r { display: flex; flex-direction: column; gap: 2px; }
 .line-nums { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
 .line-nums .n { font-size: 13px; font-weight: 700; }
-.line-nums .sub { font-size: 9.5px; color: #7a8fa0; }
+.line-nums .sub { font-size: 9.5px; color: var(--cy-ink-3); }
 .line-err {
   grid-column: 1 / -1;
   font-size: 10.5px;
-  color: #ff8fa3;
+  color: var(--cy-down);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -511,19 +511,19 @@ const schedulerWarning = computed(() => {
   gap: 6px;
   flex-wrap: wrap;
   font-size: 11.5px;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   margin-bottom: 12px;
   padding-bottom: 9px;
-  border-bottom: 1px solid rgba(34, 224, 232, 0.08);
+  border-bottom: 1px solid rgba(var(--cy-cyan-rgb), 0.08);
 }
-.dev-id .sep { color: #46545f; }
-.dev-id .ver { color: #7a8fa0; }
+.dev-id .sep { color: var(--cy-ink-3); }
+.dev-id .ver { color: var(--cy-ink-3); }
 .dev-id .method {
   font-size: 10px;
   letter-spacing: 0.08em;
   padding: 0 5px;
-  color: #22e0e8;
-  border: 1px solid rgba(34, 224, 232, 0.3);
+  color: var(--cy-cyan);
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.3);
 }
 
 .sessions {
@@ -533,17 +533,17 @@ const schedulerWarning = computed(() => {
   margin-top: 13px;
 }
 .sessions > :first-child { flex: 1; }
-.sess-num { font-size: 14px; font-weight: 700; color: #b18aff; white-space: nowrap; }
+.sess-num { font-size: 14px; font-weight: 700; color: var(--cy-violet); white-space: nowrap; }
 
 .ifaces {
   margin-top: 13px;
   padding-top: 10px;
-  border-top: 1px solid rgba(34, 224, 232, 0.08);
+  border-top: 1px solid rgba(var(--cy-cyan-rgb), 0.08);
 }
 .ifaces-head {
   font-size: 10.5px;
   letter-spacing: 0.12em;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   text-transform: uppercase;
   margin-bottom: 6px;
 }
@@ -555,11 +555,11 @@ const schedulerWarning = computed(() => {
   font-size: 10.5px;
   padding: 2px 0;
 }
-.if-name { color: #a8bcc8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.if-rate { color: #e8f4f8; text-align: right; }
-.if-rate .dim { color: #46545f; }
+.if-name { color: var(--cy-ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.if-rate { color: var(--cy-ink); text-align: right; }
+.if-rate .dim { color: var(--cy-ink-3); }
 .if-util { text-align: right; font-weight: 600; }
-.if-err { grid-column: 1 / -1; color: #ffb224; font-size: 10px; }
+.if-err { grid-column: 1 / -1; color: var(--cy-degraded); font-size: 10px; }
 
 .dev-foot {
   display: flex;
@@ -568,15 +568,15 @@ const schedulerWarning = computed(() => {
   gap: 8px;
   margin-top: 13px;
   padding-top: 9px;
-  border-top: 1px solid rgba(34, 224, 232, 0.08);
+  border-top: 1px solid rgba(var(--cy-cyan-rgb), 0.08);
   font-size: 10.5px;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   font-family: 'JetBrains Mono', monospace;
 }
 .dev-err {
   margin-top: 6px;
   font-size: 10.5px;
-  color: #ff8fa3;
+  color: var(--cy-down);
   font-family: 'JetBrains Mono', monospace;
   word-break: break-all;
 }

@@ -53,6 +53,6 @@ const markPos = (threshold?: number | null) =>
   justify-content: space-between;
   margin-bottom: 4px;
 }
-.lbl { font-size: 11px; color: #7a8fa0; letter-spacing: 0.06em; }
+.lbl { font-size: 11px; color: var(--cy-ink-3); letter-spacing: 0.06em; }
 .val { font-size: 13px; font-weight: 600; }
 </style>

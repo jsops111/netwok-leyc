@@ -18,7 +18,7 @@ const props = withDefaults(
     /** 值为 0 时用暗色 —— 一排都是 0 的时候不该五颜六色地亮着 */
     dimZero?: boolean
   }>(),
-  { unit: '', color: '#22e0e8', foot: '', dimZero: true },
+  { unit: '', color: 'var(--cy-cyan)', foot: '', dimZero: true },
 )
 
 const flash = ref(false)
@@ -43,7 +43,7 @@ const isZero = () => props.value === 0 || props.value === '0'
   <div
     class="cy-tile"
     :class="{ 'cy-flash': flash }"
-    :style="{ '--tile': dimZero && isZero() ? '#7a8fa0' : color }"
+    :style="{ '--tile': dimZero && isZero() ? 'var(--cy-ink-3)' : color }"
   >
     <div class="cy-tile-label">{{ label }}</div>
     <div class="cy-tile-value">

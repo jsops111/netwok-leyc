@@ -4,11 +4,16 @@ import App from './App.vue'
 import router from './router'
 import { setUnauthorizedHandler } from './api'
 import { useAuthStore } from './stores/auth'
+import { useThemeStore } from './stores/theme'
 import './styles/global.css'
 
 const app = createApp(App)
 const pinia = createPinia()
 app.use(pinia).use(router)
+
+// **挂载前就把主题定下来。**放到组件里做的话,首帧会先按默认(深色)画一遍
+// 再跳到亮色 —— 那一下闪烁在大屏上很明显
+useThemeStore(pinia)
 
 /**
  * 会话在后台过期时(比如 30 天到了,或者管理员停用了这个账号),

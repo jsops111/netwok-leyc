@@ -10,7 +10,8 @@
 ```
 
 技术栈:Django 6 + DRF + PostgreSQL 17 + Celery/Redis + pysnmp/paramiko;
-前端 Vue 3 + TypeScript + Naive UI + ECharts,赛博朋克深色大屏。
+前端 Vue 3 + TypeScript + Naive UI + ECharts,赛博朋克风格。
+**深色 / 亮色两套主题**,顶栏右上角切换,选择记在浏览器里。
 
 **全站需要登录**(大屏也是),自带用户管理和**可选的**两步验证。
 
@@ -103,6 +104,11 @@ TOTP 密钥和设备凭据同一级别对待:落库用 `NETCHECK_ENCRYPTION_KEY`
 ---
 
 ## 四个页面
+
+页面右上角可以切换**深色 / 亮色**。深色是默认 —— 这个平台首先是挂在墙上的
+大屏;亮色给白天在工位上看的人。两套都是整套的,不是给某个组件加个媒体查询:
+颜色全部收在 CSS 变量里,`frontend/scripts/theme_check.py` 会检查有没有漏网的
+硬编码颜色,以及对比度和色盲分离度是否达标。
 
 ### 监控大屏 `/`
 

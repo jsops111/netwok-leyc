@@ -134,7 +134,7 @@ function setJson(field: FieldSpec, text: string) {
 .sf :deep(.full) { grid-column: 1 / -1; }
 .sf :deep(.n-form-item-label) {
   font-size: 12px;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
 }
 .sf :deep(.n-form-item-feedback) { font-size: 10.5px; }
 </style>

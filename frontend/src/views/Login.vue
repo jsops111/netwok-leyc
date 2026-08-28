@@ -160,35 +160,35 @@ function back() {
   width: 26px;
   height: 26px;
   flex: none;
-  background: linear-gradient(135deg, #22e0e8, #ff3d8b);
+  background: linear-gradient(135deg, var(--cy-cyan), var(--cy-magenta));
   clip-path: polygon(50% 0, 100% 28%, 100% 72%, 50% 100%, 0 72%, 0 28%);
-  box-shadow: 0 0 18px rgba(34, 224, 232, 0.55);
+  box-shadow: 0 0 18px rgba(var(--cy-cyan-rgb), 0.55);
 }
 .logo-text {
   position: relative;
   font-size: 21px;
   letter-spacing: 0.15em;
-  color: #e8f4f8;
-  text-shadow: 0 0 18px rgba(34, 224, 232, 0.42);
+  color: var(--cy-ink);
+  text-shadow: 0 0 18px rgba(var(--cy-cyan-rgb), 0.42);
 }
-.sub { font-size: 10.5px; letter-spacing: 0.09em; color: #7a8fa0; margin-top: 2px; }
+.sub { font-size: 10.5px; letter-spacing: 0.09em; color: var(--cy-ink-3); margin-top: 2px; }
 
 .form { display: flex; flex-direction: column; }
 .lab {
   font-size: 11px;
   letter-spacing: 0.08em;
-  color: #a8bcc8;
+  color: var(--cy-ink-2);
   margin: 0 0 5px;
 }
 .lab + :deep(.n-input) { margin-bottom: 15px; }
 
 .who {
   font-size: 11.5px;
-  color: #22e0e8;
+  color: var(--cy-cyan);
   margin-bottom: 16px;
   padding: 7px 10px;
-  background: rgba(34, 224, 232, 0.06);
-  border-left: 2px solid rgba(34, 224, 232, 0.5);
+  background: rgba(var(--cy-cyan-rgb), 0.06);
+  border-left: 2px solid rgba(var(--cy-cyan-rgb), 0.5);
 }
 
 /* 验证码是要一眼看清的一串数字 —— 等宽 + 拉开字距 */
@@ -197,33 +197,33 @@ function back() {
 .hint {
   font-size: 10.5px;
   line-height: 1.65;
-  color: #7a8fa0;
+  color: var(--cy-ink-3);
   margin: -8px 0 14px;
 }
-.hint b { color: #a8bcc8; font-weight: 600; }
+.hint b { color: var(--cy-ink-2); font-weight: 600; }
 
 /* 错误信息不做闪烁动画:它是要被读的文字,不是状态灯(见 cyber.css 的自律 2) */
 .err {
   font-size: 11.5px;
   line-height: 1.5;
-  color: #ff5470;
+  color: var(--cy-down);
   margin: 0 0 12px;
   padding: 7px 10px;
-  background: rgba(255, 84, 112, 0.08);
-  border-left: 2px solid #ff5470;
+  background: rgba(var(--cy-down-rgb), 0.08);
+  border-left: 2px solid var(--cy-down);
   white-space: pre-line;
 }
 
 .go { letter-spacing: 0.2em; }
-.back { margin-top: 12px; align-self: center; color: #7a8fa0; }
+.back { margin-top: 12px; align-self: center; color: var(--cy-ink-3); }
 
 .foot {
   margin-top: 22px;
   padding-top: 13px;
-  border-top: 1px solid rgba(34, 224, 232, 0.12);
+  border-top: 1px solid rgba(var(--cy-cyan-rgb), 0.12);
   font-size: 10px;
   letter-spacing: 0.1em;
-  color: #556677;
+  color: var(--cy-ink-3);
   text-align: center;
 }
 </style>
