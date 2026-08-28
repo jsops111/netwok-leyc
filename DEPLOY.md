@@ -13,10 +13,15 @@
 
 ## 一、Docker 部署(推荐)
 
-### 1. 准备配置
+整段可复制的极简版在 [README 的「部署 / 更新 / 卸载」](README.md#部署--更新--卸载)。
+这一节是同一件事的详细版,解释每一步在干什么。
+
+### 1. 拉代码并准备配置
 
 ```bash
-cd network-check
+mkdir -p /data && cd /data
+git clone https://github.com/jsops111/netwok-leyc.git
+cd /data/netwok-leyc
 cp .env.docker.example .env.docker
 ```
 
@@ -150,7 +155,7 @@ gunzip -c netcheck-2026-08-28.sql.gz | \
 ### 在有外网的机器上打包
 
 ```bash
-cd network-check
+cd /data/netwok-leyc
 
 # 1. 构建镜像
 docker compose --env-file .env.docker build
@@ -292,7 +297,7 @@ echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee -a /etc/sysctl.conf
 ### 0. 先看这一版有没有改表结构
 
 ```bash
-cd network-check
+cd /data/netwok-leyc
 git pull origin main
 git log --oneline -5
 
@@ -308,7 +313,7 @@ git diff --name-only HEAD@{1} HEAD -- backend/netcheck/migrations/
 服务器上留一份 git 工作副本,更新就是三行:
 
 ```bash
-cd network-check
+cd /data/netwok-leyc
 git pull origin main
 docker compose --env-file .env.docker up -d --build
 ```
@@ -337,7 +342,7 @@ python manage.py migrate --noinput && python manage.py collectstatic --noinput &
 
 ```bash
 # ---- 在有外网的机器上 ----
-cd network-check
+cd /data/netwok-leyc
 git pull origin main
 docker compose --env-file .env.docker build
 
@@ -351,7 +356,7 @@ ls -lh netcheck-app-*.tar.gz
 gunzip -c netcheck-app-2026-08-29.tar.gz | docker load
 docker images | grep netcheck
 
-cd network-check                       # 这里只需要 docker-compose.yml 和 .env.docker
+cd /data/netwok-leyc                       # 这里只需要 docker-compose.yml 和 .env.docker
 docker compose --env-file .env.docker up -d --no-build
 ```
 

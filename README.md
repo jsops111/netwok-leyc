@@ -146,14 +146,29 @@ TOTP 密钥和设备凭据同一级别对待:落库用 `NETCHECK_ENCRYPTION_KEY`
 ## 部署 / 更新 / 卸载
 
 下面每一段都是**整段复制粘贴就能跑**的,不用改里面的值。
-默认目录 `/root/netwok-leyc`,不是这个路径就改第一行的 `cd`。
+下面用 `/data/netwok-leyc` 做部署目录,换地方就把路径一起改掉。
 
 ### 一、首次部署
 
-**第 1 步:生成配置和密钥**(只做一次,整段粘贴)
+**第 1 步:拉代码**
 
 ```bash
-cd /root/netwok-leyc
+mkdir -p /data && cd /data
+git clone https://github.com/jsops111/netwok-leyc.git
+cd /data/netwok-leyc
+ls docker-compose.yml backend frontend      # 这三个都在,说明拉全了
+```
+
+仓库是公开的,不需要账号密码。要是提示输用户名,说明仓库被改成私有了,
+用 GitHub 的 personal access token 当密码。
+
+服务器上装了 git 才能这么拉。没有的话:`dnf install -y git`(Amazon Linux /
+CentOS)或 `apt install -y git`(Debian / Ubuntu)。
+
+**第 2 步:生成配置和密钥**(只做一次,整段粘贴)
+
+```bash
+cd /data/netwok-leyc
 cp -n .env.docker.example .env.docker
 
 # 四个密钥自动生成写入。只用 openssl,不需要装 python 的 cryptography
@@ -173,10 +188,10 @@ grep -c CHANGE_ME .env.docker    # 输出 0 才算改干净了
 丢了它,库里所有 SNMP community / SSH 口令 / API token / 两步验证密钥都解不出来,
 光有数据库备份没用。
 
-**第 2 步:构建并启动**
+**第 3 步:构建并启动**
 
 ```bash
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 docker compose --env-file .env.docker up -d --build
 ```
 
@@ -185,7 +200,7 @@ buildx 太旧或没装 —— **那不是"还在构建",是直接失败退出了
 它们走老构建器,不经过 buildx:
 
 ```bash
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 DOCKER_BUILDKIT=0 docker build -t netcheck-backend:latest  ./backend
 DOCKER_BUILDKIT=0 docker build -t netcheck-frontend:latest ./frontend
 docker compose --env-file .env.docker up -d --no-build
@@ -193,10 +208,10 @@ docker compose --env-file .env.docker up -d --no-build
 
 首次构建 3-5 分钟(拉基础镜像 + 装依赖),会一直有输出滚动。
 
-**第 3 步:确认起来了,拿管理员密码**
+**第 4 步:确认起来了,拿管理员密码**
 
 ```bash
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 docker compose --env-file .env.docker ps
 curl -s http://127.0.0.1:18120/api/health/; echo
 
@@ -213,7 +228,7 @@ docker compose --env-file .env.docker logs backend | grep -A3 "管理员账号�
 ### 二、更新到新版本
 
 ```bash
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 git pull origin main
 docker compose --env-file .env.docker up -d --build
 docker compose --env-file .env.docker ps
@@ -223,7 +238,7 @@ curl -s http://127.0.0.1:18120/api/health/; echo
 同样,报 buildx 错误就换成:
 
 ```bash
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 git pull origin main
 DOCKER_BUILDKIT=0 docker build -t netcheck-backend:latest  ./backend
 DOCKER_BUILDKIT=0 docker build -t netcheck-frontend:latest ./frontend
@@ -240,14 +255,14 @@ docker compose --env-file .env.docker up -d --no-build
 
 ```bash
 # 停止服务,数据全部保留,随时 up -d 回来
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 docker compose --env-file .env.docker down
 ```
 
 ```bash
 # 一键彻底卸载:容器 + 数据卷 + 本项目镜像 全删
 # ⚠ 历史样本、事件记录、用户账号会全部消失,不可恢复
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 docker compose --env-file .env.docker down -v --rmi local --remove-orphans
 docker image rm postgres:17-alpine redis:8-alpine 2>/dev/null
 docker volume ls | grep netcheck        # 应该没有输出了
@@ -265,7 +280,7 @@ docker system prune -a
 ### 常用运维命令
 
 ```bash
-cd /root/netwok-leyc
+cd /data/netwok-leyc
 # 采集出问题优先看 worker
 docker compose --env-file .env.docker logs -f worker
 docker compose --env-file .env.docker logs --tail 100 backend
