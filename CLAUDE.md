@@ -304,6 +304,22 @@ Postgres 的精确计数要全表扫描 —— 而**这一页恰恰是磁盘告�
 CRT 扫描线**(令牌 `--cy-glow-strength` / `--cy-scanline-alpha` 归零)——
 那两样是"暗处发光"的语言,白底上只会显脏。
 
+### 模板里用了组件就必须 import,而且 vue-tsc 查不出来
+
+**这是实测踩出来的坑。**`vue-tsc` 没法确定一个 PascalCase 组件是不是全局
+注册的,所以漏了 import 既不报类型错、也不让构建失败。Vue 在运行时把它当成
+未知元素渲染成一个**裸标签**:没有样式、不响应交互 —— 页面上看到的是"一片
+灰色的东西",而所有检查都是绿的。
+
+`NInputNumber` 漏了一次,保留策略那七个天数输入框全成了死的灰块,
+从表现上完全看不出是 import 的问题。
+
+```bash
+python3 frontend/scripts/check_components.py
+```
+
+改完 `.vue` 跑一下,和 `theme_check.py` 一起。
+
 ### 改颜色必须跑校验器
 
 ```bash

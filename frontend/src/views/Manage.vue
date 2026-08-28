@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref, watch } from 'vue'
 import {
-  NButton, NDataTable, NInput, NModal, NPopconfirm, NSelect, NSpace, NSwitch,
-  NTabPane, NTabs, NTag, useMessage,
+  NButton, NDataTable, NInput, NInputNumber, NModal, NPopconfirm, NSelect,
+  NSpace, NSwitch, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
