@@ -173,6 +173,12 @@ backend 起来才启动。给它加权限的症状是"整个栈起不来",且看
 cookie 由 `GET /api/auth/session/` 种下(它带 `@ensure_csrf_cookie`),
 所以**前端启动时那一次 session 请求是必须的**,不是可有可无的探测。
 
+**nginx 转发时 Host 必须用 `$http_host`,不能用 `$host`。**`$host` 会把端口
+去掉,而这个平台跑在 18120 这类非标准端口上。Django 的 CSRF 拿浏览器的
+`Origin`(带端口)和 `request.get_host()`(来自这个头)比对,端口被剥掉就
+永远对不上 —— 所有写操作 403,包括登录本身。**实测踩出来的**:全站加登录
+之前没有任何请求走 CSRF 校验,所以这个配置一直是错的但从没发作过。
+
 **登录接口上的 `@csrf_protect` 是手写的,别删。**DRF 的 SessionAuthentication
 只对**已认证**的请求校验 CSRF,而登录时请求还是匿名的 —— 等于这一个接口默认没防护。
 没有它,别人能让你的浏览器悄悄登进*他的*账号。

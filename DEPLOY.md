@@ -523,7 +523,21 @@ TotpDevice.objects.filter(user=u).delete(); RecoveryCode.objects.filter(user=u).
 print('已解绑')"
 ```
 
-### 能登录,但一保存就 403 / "CSRF Failed"
+### 403 / "CSRF验证失败" —— 登录不进去,或者一保存就报错
+
+先确认 nginx 传的是 `$http_host` 而不是 `$host`:
+
+```bash
+docker compose --env-file .env.docker exec frontend \
+  grep "proxy_set_header Host" /etc/nginx/conf.d/default.conf
+```
+
+**必须是 `$http_host`。**`$host` 会把端口去掉,而这个平台跑在 18120 这类
+非标准端口上 —— Django 拿浏览器发来的 `Origin`(带端口)和它看到的 Host
+(被剥了端口)比对,永远对不上,于是所有写操作 403。
+镜像里是 `$host` 的话说明前端镜像太旧,`git pull` 后重新构建 frontend 即可。
+
+### 通过域名 / HTTPS 访问时的 403
 
 通过**域名**或 **HTTPS** 访问时,Django 要求请求的 Origin 在信任列表里。
 在 `.env.docker` 里填上(**要带 scheme,多个用逗号分隔**),然后重启 backend:
