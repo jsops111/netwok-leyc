@@ -414,13 +414,21 @@ const RETENTION_FIELDS: RetentionField[] = [
   { key: 'login_audit_days', label: '登录审计', unit: '天', hint: '谁在什么时候登过这台机器' },
 ]
 
+const retentionError = ref('')
+
 async function loadRetention() {
   if (!auth.isAdmin) return
+  retentionError.value = ''
   try {
     const { data } = await api.retention()
     retention.value = data
   } catch (e) {
-    message.error(errText(e))
+    // **失败要在面板里留下痕迹。**原来这里只弹一个会消失的 toast,
+    // 然后面板静默地少掉整块输入区 —— 看到的人只会以为"没做这个功能",
+    // 而真正的原因(后端是旧版、没有这个接口)一点线索都没有
+    retentionError.value = errText(e)
+    // 系统信息接口里也带了一份保留策略,拿它兜底,至少能看到当前值
+    if (sys.value?.retention) retention.value = { ...sys.value.retention }
   }
 }
 
@@ -440,6 +448,7 @@ async function saveRetention() {
       for (const [k, v] of Object.entries(d)) errs[k] = Array.isArray(v) ? v.join('; ') : String(v)
       retentionErrors.value = errs
     }
+    retentionError.value = errText(e)
     message.error(errText(e))
   } finally {
     savingRetention.value = false
@@ -461,8 +470,8 @@ onMounted(() => {
   void auth.load()
   void loadUsers()
   void loadAudit()
-  void loadSystem()
-  void loadRetention()
+  // 先取 system(它带一份保留策略),再取 retention —— 后者失败时能兜底
+  void loadSystem().then(loadRetention)
 })
 </script>
 
@@ -689,6 +698,16 @@ onMounted(() => {
             改完<b>下一次清理任务就按新值执行</b>,不用重启任何进程。
             磁盘告急时先缩「原始秒级样本」—— 它是主要消费者,而长期趋势看的是降采样桶,不受影响。
           </p>
+          <div v-if="retentionError" class="ret-error">
+            <b>读不到保留策略:</b>{{ retentionError }}
+            <div class="ret-error-hint">
+              如果这里显示 404,说明<b>后端还是旧版本</b> ——
+              保留策略的接口在后端,只重建前端不够。
+              在服务器上 <code>git pull</code> 后**把 backend 也重建一次**,
+              然后 <code>docker compose up -d</code>。
+            </div>
+            <NButton size="tiny" ghost class="ret-retry" @click="loadRetention()">重试</NButton>
+          </div>
           <div v-if="retention" class="ret-grid">
             <div v-for="f in RETENTION_FIELDS" :key="f.key" class="ret-item">
               <label class="lab">{{ f.label }}</label>
@@ -704,7 +723,8 @@ onMounted(() => {
               </p>
             </div>
           </div>
-          <p class="note tiny warnline">
+          <div v-if="!retention && !retentionError" class="cy-empty">加载中…</div>
+          <p v-if="retention" class="note tiny warnline">
             <b>粗粒度的保留不能短于细粒度的。</b>图表按跨度自动选粒度
             (≤2h 原始 / ≤2d 1m / ≤14d 5m / 更长 1h),细桶比粗桶留得久的话,
             查粗桶的那个跨度就是一片空白 —— 后端会挡住这种配置。
@@ -962,6 +982,25 @@ onMounted(() => {
   border-left: 2px solid rgba(var(--cy-degraded-rgb), 0.55);
 }
 .warnline b { color: var(--cy-degraded); }
+
+.ret-error {
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--cy-ink-2);
+  padding: 10px 12px;
+  background: rgba(var(--cy-down-rgb), 0.07);
+  border-left: 2px solid var(--cy-down);
+}
+.ret-error b { color: var(--cy-down); }
+.ret-error-hint { margin-top: 6px; color: var(--cy-ink-3); font-size: 10.5px; }
+.ret-error-hint b { color: var(--cy-ink-2); }
+.ret-error-hint code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  padding: 0 3px;
+  background: rgba(var(--cy-ink-rgb), 0.07);
+}
+.ret-retry { margin-top: 8px; }
 
 .ret-grid {
   display: grid;
