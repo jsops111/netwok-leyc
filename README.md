@@ -143,95 +143,145 @@ TOTP 密钥和设备凭据同一级别对待:落库用 `NETCHECK_ENCRYPTION_KEY`
 
 ---
 
-## 快速上手
+## 部署 / 更新 / 卸载
+
+下面每一段都是**整段复制粘贴就能跑**的,不用改里面的值。
+默认目录 `/root/netwok-leyc`,不是这个路径就改第一行的 `cd`。
+
+### 一、首次部署
+
+**第 1 步:生成配置和密钥**(只做一次,整段粘贴)
 
 ```bash
-cp .env.docker.example .env.docker
-vi .env.docker                                    # 改四个密钥,见 DEPLOY.md
-docker compose --env-file .env.docker up -d --build
-curl -s http://127.0.0.1:18120/api/health/        # status 是 ok 才算好了
+cd /root/netwok-leyc
+cp -n .env.docker.example .env.docker
 
-# 第一个管理员是首次启动自动建的,密码在日志里(没配 NETCHECK_ADMIN_PASSWORD 时)
-docker compose --env-file .env.docker logs backend | grep -A3 "管理员账号已创建"
+# 四个密钥自动生成写入。只用 openssl,不需要装 python 的 cryptography
+SECRET=$(openssl rand -base64 48 | tr -d '\n')
+FERNET=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')
+PGPASS=$(openssl rand -base64 24 | tr -d '/+=\n')
+RDPASS=$(openssl rand -base64 24 | tr -d '/+=\n')
+sed -i "s|^DJANGO_SECRET_KEY=.*|DJANGO_SECRET_KEY=${SECRET}|"           .env.docker
+sed -i "s|^NETCHECK_ENCRYPTION_KEY=.*|NETCHECK_ENCRYPTION_KEY=${FERNET}|" .env.docker
+sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PGPASS}|"           .env.docker
+sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${RDPASS}|"                 .env.docker
+chmod 600 .env.docker
+grep -c CHANGE_ME .env.docker    # 输出 0 才算改干净了
 ```
 
-打开 `http://<IP>:18120/` → 登录 → 配置中心 → 建监控类 → 建线路 → 点「测试」。
-登录后顺手去「管理后台 → 我的安全」改掉初始密码。
+⚠ **`.env.docker` 里的 `NETCHECK_ENCRYPTION_KEY` 要单独备份。**
+丢了它,库里所有 SNMP community / SSH 口令 / API token / 两步验证密钥都解不出来,
+光有数据库备份没用。
 
----
-
-## 更新发布
-
-代码更新后怎么发新版,两条路,取决于服务器能不能上网。
-
-### 服务器能上网
-
-服务器上留一份 git 工作副本,更新就是三行:
+**第 2 步:构建并启动**
 
 ```bash
-cd /path/to/network-check
-git pull origin main
+cd /root/netwok-leyc
 docker compose --env-file .env.docker up -d --build
 ```
 
-`up -d --build` 只重启镜像变了的服务,**db / redis 不动** —— 数据在命名卷里,
-不加 `-v` 就不会丢。
-
-**不用手动跑 migrate**:backend 镜像的启动命令里已经串了
-`migrate --noinput && collectstatic --noinput && gunicorn`,容器每次起来都会自动迁移。
-
-依赖没改时后端重建十几秒(Dockerfile 里 `COPY pyproject.toml` 单独一层,
-改业务代码命中缓存不重装依赖);前端要重跑 `vite build`,一两分钟。
-
-### 机房无外网
-
-本机构建 → 打包 → 拷过去 load。**日常更新不用带 postgres/redis 基础镜像**,
-只带自己的两个,包从两百多 MB 降到几十 MB:
+报 **`compose build requires buildx 0.17.0 or later`** 的话,说明这台机器的
+buildx 太旧或没装 —— **那不是"还在构建",是直接失败退出了**。改用下面这三条,
+它们走老构建器,不经过 buildx:
 
 ```bash
-# ---- 有外网的机器 ----
-git pull origin main
-docker compose --env-file .env.docker build
-docker save netcheck-backend:latest netcheck-frontend:latest | gzip > netcheck-app.tar.gz
-
-# ---- 机房 ----
-gunzip -c netcheck-app.tar.gz | docker load
+cd /root/netwok-leyc
+DOCKER_BUILDKIT=0 docker build -t netcheck-backend:latest  ./backend
+DOCKER_BUILDKIT=0 docker build -t netcheck-frontend:latest ./frontend
 docker compose --env-file .env.docker up -d --no-build
 ```
 
-`--no-build` 是必须的,不加它会试着联网构建然后失败。
-首次部署要连基础镜像一起带,见 [DEPLOY.md 第二节](DEPLOY.md#二离线部署机房没有外网)。
+首次构建 3-5 分钟(拉基础镜像 + 装依赖),会一直有输出滚动。
 
-### 这一版带 migration 时,分两步发
-
-compose 里 worker 依赖的是 backend 的 `service_started` 而不是 `service_healthy` ——
-backend 容器一启动(migrate 还在跑)worker 就起来了。平时无所谓,
-但**改了表结构的版本**里 worker 会撞上旧 schema 报一阵错。所以:
+**第 3 步:确认起来了,拿管理员密码**
 
 ```bash
-# 1. 先只更新 backend,等它 healthy —— 那说明 migrate 已经跑完
-docker compose --env-file .env.docker up -d --build backend
-docker compose --env-file .env.docker ps backend
+cd /root/netwok-leyc
+docker compose --env-file .env.docker ps
+curl -s http://127.0.0.1:18120/api/health/; echo
 
-# 2. 再滚采集进程和前端
-docker compose --env-file .env.docker up -d --build worker beat frontend
+# 全站需要登录。第一个管理员是首次启动自动建的,密码只打印这一次:
+docker compose --env-file .env.docker logs backend | grep -A3 "管理员账号已创建"
 ```
 
-### 回滚
+`db` `redis` `backend` `frontend` 是 `healthy`、`worker` `beat` 是 `Up`,
+并且 health 返回 `"status": "ok"`,才算真的好了。
 
-镜像现在打的是 `:latest`,新版一构建就把旧版覆盖了,**回滚只能重新构建旧代码**。
-需要秒级回滚就把 compose 里的 `image:` 改成 `netcheck-backend:${IMAGE_TAG:-latest}`,
-发布时带上日期或 git tag,回滚就是改回上一个值重启。
+然后打开 `http://<服务器IP>:18120/` → 用 `admin` + 上面那个密码登录 →
+**先去「管理后台 → 我的安全」改掉初始密码** → 配置中心建监控类和线路。
 
-### 发布后确认这一次
+### 二、更新到新版本
 
 ```bash
-curl -s http://127.0.0.1:18120/api/health/
+cd /root/netwok-leyc
+git pull origin main
+docker compose --env-file .env.docker up -d --build
+docker compose --env-file .env.docker ps
+curl -s http://127.0.0.1:18120/api/health/; echo
 ```
 
-必须是 `"status": "ok"`。返回 `degraded` 时里面会写明哪些线路停滞了 ——
-这比看容器是不是 `Up` 有用得多:**"接口 200 但采集停了"是这类平台最容易漏掉的故障**,
-图还在,只是不再往前走。
+同样,报 buildx 错误就换成:
+
+```bash
+cd /root/netwok-leyc
+git pull origin main
+DOCKER_BUILDKIT=0 docker build -t netcheck-backend:latest  ./backend
+DOCKER_BUILDKIT=0 docker build -t netcheck-frontend:latest ./frontend
+docker compose --env-file .env.docker up -d --no-build
+```
+
+**数据不会丢** —— 库和 Redis 在命名卷里,只要不加 `-v` 就一直在。
+数据库迁移是 backend 容器启动时自动跑的,不用手动 `migrate`。
+
+改了阈值、线路、设备这些**配置不用重启**,页面上保存即生效。
+只改了 `.env.docker` 的话不用 `--build`,`up -d` 就行。
+
+### 三、停止 / 卸载
+
+```bash
+# 停止服务,数据全部保留,随时 up -d 回来
+cd /root/netwok-leyc
+docker compose --env-file .env.docker down
+```
+
+```bash
+# 一键彻底卸载:容器 + 数据卷 + 本项目镜像 全删
+# ⚠ 历史样本、事件记录、用户账号会全部消失,不可恢复
+cd /root/netwok-leyc
+docker compose --env-file .env.docker down -v --rmi local --remove-orphans
+docker image rm postgres:17-alpine redis:8-alpine 2>/dev/null
+docker volume ls | grep netcheck        # 应该没有输出了
+```
+
+想连基础镜像和构建缓存一起清干净,再加一条(会影响这台机器上别的项目):
+
+```bash
+docker system prune -a
+```
+
+`.env.docker` 不会被删。**要重装同一套数据的话必须留着它**(加密密钥在里面);
+彻底不要了再 `rm -f .env.docker`。
+
+### 常用运维命令
+
+```bash
+cd /root/netwok-leyc
+# 采集出问题优先看 worker
+docker compose --env-file .env.docker logs -f worker
+docker compose --env-file .env.docker logs --tail 100 backend
+
+# 只重启采集进程
+docker compose --env-file .env.docker restart worker beat
+
+# 线路多了扛不住:加 worker 副本(beat 绝对不能多起,它是定时器)
+docker compose --env-file .env.docker up -d --scale worker=3
+
+# 备份数据库(记得同时备份 .env.docker)
+docker compose --env-file .env.docker exec -T db \
+  pg_dump -U netcheck network_check | gzip > netcheck-$(date +%F).sql.gz
+```
+
+机房没有外网、故障排查、离线打包这些看 [DEPLOY.md](DEPLOY.md)。
 
 ---
 
