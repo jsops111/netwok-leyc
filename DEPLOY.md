@@ -6,7 +6,8 @@
 - [二、离线部署(机房没有外网)](#二离线部署机房没有外网)
 - [三、裸机部署](#三裸机部署)
 - [四、部署后必做的四件事](#四部署后必做的四件事)
-- [五、故障排查](#五故障排查)
+- [五、更新发布新版本](#五更新发布新版本)
+- [六、故障排查](#六故障排查)
 
 ---
 
@@ -264,7 +265,169 @@ echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee -a /etc/sysctl.conf
 
 ---
 
-## 五、故障排查
+## 五、更新发布新版本
+
+代码改完之后怎么把新版本发到服务器上。**首次部署看第一节,这一节是之后每一次更新。**
+
+### 0. 先看这一版有没有改表结构
+
+```bash
+cd network-check
+git pull origin main
+git log --oneline -5
+
+# 有输出 = 这一版带 migration,按第 3 小节两步发;没输出 = 直接第 1 或第 2 小节
+git diff --name-only HEAD@{1} HEAD -- backend/netcheck/migrations/
+```
+
+⚠ **带 migration 的版本,发布前先备份数据库**(备份命令见第一节末尾)。
+迁移是不可逆的,回滚代码不会回滚表结构。
+
+### 1. 服务器能上网 —— 直接构建
+
+服务器上留一份 git 工作副本,更新就是三行:
+
+```bash
+cd network-check
+git pull origin main
+docker compose --env-file .env.docker up -d --build
+```
+
+`up -d --build` 会重新构建变更的镜像,**只重启镜像真的变了的服务**;
+`db` / `redis` 不动 —— 数据在命名卷里,不加 `-v` 就不会丢。
+
+**不用手动跑 migrate。**backend 镜像的启动命令里已经串了:
+
+```
+python manage.py migrate --noinput && python manage.py collectstatic --noinput && gunicorn ...
+```
+
+容器每次启动都会自己迁移一遍(已迁移过的是空操作)。
+
+耗时:依赖没改时后端重建十几秒(`backend/Dockerfile` 里 `COPY pyproject.toml`
+单独一层,改业务代码命中缓存不重装依赖);前端要重跑 `vite build`,一两分钟。
+
+⚠ **改了 `backend/pyproject.toml` 的依赖时,那一层缓存会失效,重建要三五分钟** ——
+这是正常的,不是卡住了。
+
+### 2. 机房无外网 —— 传镜像过去
+
+和第二节的离线部署同一套办法,区别是:**日常更新不用带 `postgres` / `redis`
+基础镜像**,它们没变。只带自己的两个,包能从两百多 MB 降到几十 MB。
+
+```bash
+# ---- 在有外网的机器上 ----
+cd network-check
+git pull origin main
+docker compose --env-file .env.docker build
+
+docker save netcheck-backend:latest netcheck-frontend:latest \
+  | gzip > netcheck-app-$(date +%F).tar.gz
+ls -lh netcheck-app-*.tar.gz
+```
+
+```bash
+# ---- 拷到机房机器上 ----
+gunzip -c netcheck-app-2026-08-29.tar.gz | docker load
+docker images | grep netcheck
+
+cd network-check                       # 这里只需要 docker-compose.yml 和 .env.docker
+docker compose --env-file .env.docker up -d --no-build
+```
+
+⚠ **`--no-build` 必须加。**不加它会试着联网构建,然后在拉基础镜像那一步失败。
+
+⚠ 只改了 compose 或 `.env.docker`(没改代码)时不用传镜像,
+机房上直接 `docker compose --env-file .env.docker up -d --no-build` 就生效。
+
+### 3. 带 migration 的版本,分两步发
+
+`docker-compose.yml` 里 worker 依赖的是 backend 的 `service_started`,
+不是 `service_healthy` —— backend 容器一启动(migrate 还在跑)worker 就起来了。
+平时无所谓,但**这一版改了表结构**时,worker 会撞上旧 schema 报一阵错,
+直到 migrate 跑完才自己恢复。要干净就分两步:
+
+```bash
+# 第一步:只更新 backend,等它 healthy —— healthy 就说明 migrate 已经跑完
+docker compose --env-file .env.docker up -d --build backend
+watch -n2 'docker compose --env-file .env.docker ps backend'   # 等到 (healthy),Ctrl-C 退出
+
+# 第二步:再滚采集进程和前端
+docker compose --env-file .env.docker up -d --build worker beat frontend
+```
+
+看迁移到底做了什么:
+
+```bash
+docker compose --env-file .env.docker exec backend python manage.py showmigrations netcheck
+docker compose --env-file .env.docker logs backend | grep -i "applying"
+```
+
+### 4. 确认新版真的在跑
+
+三件事都要看,缺一件都可能是"发了但没生效":
+
+```bash
+# 1) 六个服务的状态 —— db/redis/backend/frontend 是 healthy,worker/beat 是 Up
+docker compose --env-file .env.docker ps
+
+# 2) 容器用的确实是新构建的镜像(比对 CREATED 时间)
+docker compose --env-file .env.docker images
+
+# 3) 采集真的在跑 —— 这一条最关键
+curl -s http://127.0.0.1:18120/api/health/
+```
+
+`"status": "ok"` 才算发布成功。返回 `degraded` 时里面会写明是哪些线路停滞。
+
+⚠ **"页面能打开"不等于"发布成功"。**前端是静态文件,后端挂了页面照样出来,
+只是图不再往前走 —— 所以必须看 `/api/health/`,不是看首页。
+
+发布后几分钟里再扫一眼 worker 日志:
+
+```bash
+docker compose --env-file .env.docker logs --tail 50 -f worker
+```
+
+### 5. 回滚
+
+镜像现在打的是 `:latest`,新版一构建就把旧版覆盖了,**所以回滚 = 切回旧代码重新构建**:
+
+```bash
+git log --oneline -10
+git checkout <上一个正常的 commit>
+docker compose --env-file .env.docker up -d --build
+```
+
+⚠ **代码能回滚,migration 不能。**旧代码配新表结构在大多数情况下能跑
+(Django 不校验多出来的列),但删列/改类型的迁移回滚后会直接报错。
+所以第 0 小节说的"带 migration 就先备份"不是客套话。
+
+想要**秒级回滚**就给镜像打版本号,改 `docker-compose.yml` 两处 `image:`:
+
+```yaml
+image: netcheck-backend:${IMAGE_TAG:-latest}      # frontend 同理
+```
+
+发布时 `IMAGE_TAG=$(date +%Y%m%d) docker compose --env-file .env.docker up -d --build`,
+回滚就是把 `IMAGE_TAG` 改回上一个值重启 —— 不重新构建,几秒钟。
+配合 `git tag` 一起打,版本号和代码就对得上了。
+
+### 6. 什么改动不需要重新构建镜像
+
+| 改了什么 | 怎么生效 |
+|---|---|
+| 线路 / 设备 / 渠道 / 阈值 | **不用动容器**,配置是实时生效的 |
+| `.env.docker` 里的参数 | `docker compose --env-file .env.docker up -d`(不加 `--build`) |
+| `docker-compose.yml` | 同上 |
+| 后端 / 前端代码 | 要 `--build` |
+
+⚠ 改了 `NETCHECK_TICK_SECONDS`、`NETCHECK_RAW_RETENTION_HOURS` 这类采集参数,
+要重启 `worker` 和 `beat` 才读得到新值。
+
+---
+
+## 六、故障排查
 
 ### 所有 ICMP 线路报 "Operation not permitted"
 

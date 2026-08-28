@@ -121,6 +121,81 @@ curl -s http://127.0.0.1:18120/api/health/        # status 是 ok 才算好了
 
 ---
 
+## 更新发布
+
+代码更新后怎么发新版,两条路,取决于服务器能不能上网。
+
+### 服务器能上网
+
+服务器上留一份 git 工作副本,更新就是三行:
+
+```bash
+cd /path/to/network-check
+git pull origin main
+docker compose --env-file .env.docker up -d --build
+```
+
+`up -d --build` 只重启镜像变了的服务,**db / redis 不动** —— 数据在命名卷里,
+不加 `-v` 就不会丢。
+
+**不用手动跑 migrate**:backend 镜像的启动命令里已经串了
+`migrate --noinput && collectstatic --noinput && gunicorn`,容器每次起来都会自动迁移。
+
+依赖没改时后端重建十几秒(Dockerfile 里 `COPY pyproject.toml` 单独一层,
+改业务代码命中缓存不重装依赖);前端要重跑 `vite build`,一两分钟。
+
+### 机房无外网
+
+本机构建 → 打包 → 拷过去 load。**日常更新不用带 postgres/redis 基础镜像**,
+只带自己的两个,包从两百多 MB 降到几十 MB:
+
+```bash
+# ---- 有外网的机器 ----
+git pull origin main
+docker compose --env-file .env.docker build
+docker save netcheck-backend:latest netcheck-frontend:latest | gzip > netcheck-app.tar.gz
+
+# ---- 机房 ----
+gunzip -c netcheck-app.tar.gz | docker load
+docker compose --env-file .env.docker up -d --no-build
+```
+
+`--no-build` 是必须的,不加它会试着联网构建然后失败。
+首次部署要连基础镜像一起带,见 [DEPLOY.md 第二节](DEPLOY.md#二离线部署机房没有外网)。
+
+### 这一版带 migration 时,分两步发
+
+compose 里 worker 依赖的是 backend 的 `service_started` 而不是 `service_healthy` ——
+backend 容器一启动(migrate 还在跑)worker 就起来了。平时无所谓,
+但**改了表结构的版本**里 worker 会撞上旧 schema 报一阵错。所以:
+
+```bash
+# 1. 先只更新 backend,等它 healthy —— 那说明 migrate 已经跑完
+docker compose --env-file .env.docker up -d --build backend
+docker compose --env-file .env.docker ps backend
+
+# 2. 再滚采集进程和前端
+docker compose --env-file .env.docker up -d --build worker beat frontend
+```
+
+### 回滚
+
+镜像现在打的是 `:latest`,新版一构建就把旧版覆盖了,**回滚只能重新构建旧代码**。
+需要秒级回滚就把 compose 里的 `image:` 改成 `netcheck-backend:${IMAGE_TAG:-latest}`,
+发布时带上日期或 git tag,回滚就是改回上一个值重启。
+
+### 发布后确认这一次
+
+```bash
+curl -s http://127.0.0.1:18120/api/health/
+```
+
+必须是 `"status": "ok"`。返回 `degraded` 时里面会写明哪些线路停滞了 ——
+这比看容器是不是 `Up` 有用得多:**"接口 200 但采集停了"是这类平台最容易漏掉的故障**,
+图还在,只是不再往前走。
+
+---
+
 ## 项目结构
 
 ```
