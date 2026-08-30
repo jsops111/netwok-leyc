@@ -67,6 +67,9 @@ def _collect_snmp(device: Device, profile: Profile) -> dict:
     scalar_fields: dict[str, tuple[str, float]] = {}
     table_specs: dict[str, str] = {}
     table_fields: dict[str, tuple[str, str, float]] = {}
+    # table_max_named 用:值列 key → 名字列 key,名字列 key → 要匹配的子串
+    name_columns: dict[str, str] = {}
+    name_matches: dict[str, tuple[str, ...]] = {}
 
     for field, spec in profile.metrics.items():
         if spec.kind == "scalar":
@@ -78,6 +81,11 @@ def _collect_snmp(device: Device, profile: Profile) -> dict:
                 key = f"{field}#{idx}"
                 table_specs[key] = oid
                 table_fields[key] = (field, spec.kind, spec.scale)
+                if spec.kind == "table_max_named" and spec.name_oid:
+                    name_key = f"{key}@name"
+                    table_specs[name_key] = spec.name_oid
+                    name_columns[key] = name_key
+                    name_matches[name_key] = tuple(m.lower() for m in spec.name_match)
 
     try:
         scalars = snmp.snmp_get(device, list(dict.fromkeys(scalar_oids)))
@@ -114,6 +122,8 @@ def _collect_snmp(device: Device, profile: Profile) -> dict:
             tables = {}
 
     for key, rows in tables.items():
+        if key in name_matches:  # 名字列是用来筛行的,它自己不是指标
+            continue
         field, kind, scale = table_fields[key]
         if not rows or field in out:
             continue
@@ -126,10 +136,18 @@ def _collect_snmp(device: Device, profile: Profile) -> dict:
                 if not ok:
                     out["extra"][f"{field}_codes"] = codes[:8]
             continue
+        if kind == "table_max_named":
+            rows = _filter_by_name(
+                device, field, rows,
+                tables.get(name_columns.get(key, "")) or {},
+                name_matches[name_columns[key]], out,
+            )
+            if rows is None:
+                continue
         values = [v for v in (_as_float(v) for v in rows.values()) if v is not None]
         if not values:
             continue
-        aggregated = max(values) if kind == "table_max" else sum(values)
+        aggregated = sum(values) if kind == "table_sum" else max(values)
         out[field] = round(aggregated * scale, 3)
 
     # 内存使用率要自己算(Cisco 只给 used/free 两个绝对值)
@@ -160,6 +178,38 @@ def _collect_snmp(device: Device, profile: Profile) -> dict:
 
     out["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
     return out
+
+
+def _filter_by_name(
+    device: Device, field: str, rows: dict, names: dict,
+    wanted: tuple[str, ...], out: dict,
+) -> dict | None:
+    """
+    按同表的名字列筛行(索引对索引)。返回 None 表示"这个指标这次不出数"。
+
+    **名字列走不通时不退回全表最大值。**FortiGate 的传感器表里温度、风扇转速、
+    电压混在一列,退回去取到的是 9000+ 的转速当温度报上来 —— 错的数字比没有
+    数字糟得多:页面上看不出它是错的,阈值判定还会拿它去刷严重告警。
+    采不到就让它留空,这类指标本来就在画像的 optional 里。
+    """
+
+    if not names:
+        out["extra"].setdefault("name_column_missing", []).append(field)
+        log.warning("设备 %s 的 %s 取不到名字列,跳过(不退回全表最大值)", device.name, field)
+        return None
+    matched = {
+        idx: value for idx, value in rows.items()
+        if any(w in str(names.get(idx, "")).lower() for w in wanted)
+    }
+    if not matched:
+        out["extra"].setdefault("name_no_match", []).append(field)
+        log.info(
+            "设备 %s 的 %s:%d 行传感器里没有名字匹配 %s 的,示例名字 %s",
+            device.name, field, len(rows), list(wanted),
+            [str(v) for v in list(names.values())[:6]],
+        )
+        return None
+    return matched
 
 
 def _version_from_descr(descr: str, vendor: str) -> str:

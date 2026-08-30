@@ -101,8 +101,12 @@ FG_VERSION = "1.3.6.1.4.1.12356.101.4.1.1.0"
 FG_SERIAL = "1.3.6.1.4.1.12356.100.1.1.1.0"  # fnSysSerial
 FG_HA_MODE = "1.3.6.1.4.1.12356.101.13.1.1.0"  # fgHaSystemMode
 FG_VPN_TUNNEL_UP = "1.3.6.1.4.1.12356.101.12.1.2.0"
+# fgHwSensorEntValue **不是温度表,是"所有硬件传感器"表**:温度(~40)、
+# 风扇转速(~9000)、电压(~12)混在同一列里,量纲全不一样。
+# 唯一能把它们分开的是同表的名字列 fgHwSensorEntName("CPU Temp" / "FAN1" /
+# "+VCC3V3"),所以温度必须用 kind="table_max_named" 按名字筛完再取最大值。
 FG_SENSOR_VALUE = "1.3.6.1.4.1.12356.101.4.3.2.1.3"  # fgHwSensorEntValue(表)
-FG_SENSOR_NAME = "1.3.6.1.4.1.12356.101.4.3.2.1.2"
+FG_SENSOR_NAME = "1.3.6.1.4.1.12356.101.4.3.2.1.2"  # fgHwSensorEntName(表)
 FG_SENSOR_ALARM = "1.3.6.1.4.1.12356.101.4.3.2.1.4"
 
 
@@ -111,14 +115,24 @@ class MetricSpec:
     """
     一个整机指标怎么采。
 
-    oids   候选 OID,按顺序试,第一个取到值的赢
-    kind   scalar(单值) | table_max(表,取最大值) | table_sum(表,求和)
-    scale  取到的原始值乘这个系数(如 sysUpTime 的 timeticks → 秒)
+    oids       候选 OID,按顺序试,第一个取到值的赢
+    kind       scalar(单值) | table_max(表,取最大值) | table_sum(表,求和)
+               | table_max_named(表,先按名字列筛掉别的行再取最大值)
+    scale      取到的原始值乘这个系数(如 sysUpTime 的 timeticks → 秒)
+    name_oid   同一张表的名字列,只有 table_max_named 用
+    name_match 名字里出现其中任一子串(不分大小写)的行才算数
+
+    ⚠ **一张表里混着不同量纲时必须用 table_max_named。**FortiGate 的
+    fgHwSensorEntValue 把温度、风扇转速、电压放在同一列,直接 table_max
+    赢的永远是风扇转速 —— 页面上是一排 9100、9300 的"温度",而且每一拍都
+    撞穿 68℃ 的严重线刷告警。**实测踩出来的。**
     """
 
     oids: list[str]
     kind: str = "scalar"
     scale: float = 1.0
+    name_oid: str = ""
+    name_match: tuple[str, ...] = ()
 
 
 @dataclass
@@ -220,7 +234,14 @@ PROFILES: dict[str, Profile] = {
             "session_count": MetricSpec([FG_SESSION]),
             "session_rate": MetricSpec([FG_SESSION_RATE]),
             "vpn_tunnels_up": MetricSpec([FG_VPN_TUNNEL_UP]),
-            "temp_c": MetricSpec([FG_SENSOR_VALUE], kind="table_max"),
+            # 按名字筛出温度传感器再取最大值。401F 上典型是
+            # "CPU Temp" / "SYS Temp" / "PS1 Temp";同一张表里还有
+            # "FAN1"(转速)和 "+VCC3V3"(电压),不筛掉就会把转速当温度。
+            # 遇到名字不带 temp 的温度传感器,往 name_match 里加一项。
+            "temp_c": MetricSpec(
+                [FG_SENSOR_VALUE], kind="table_max_named",
+                name_oid=FG_SENSOR_NAME, name_match=("temp",),
+            ),
             "uptime_s": MetricSpec([SYS["sysUpTime"]], scale=0.01),
         },
         cli={
@@ -235,8 +256,9 @@ PROFILES: dict[str, Profile] = {
         notes=(
             "FortiOS 7.x。**推荐 collect_method=api、fallback=snmp**:"
             "会话数、策略命中、HA 成员状态、License 到期只有 REST API 能拿全,"
-            "SNMP 的 fgSysSesCount 只有总数。fgHwSensorEntValue 表在 401F 上"
-            "包含多个传感器(CPU/系统/电源),取最大值。"
+            "SNMP 的 fgSysSesCount 只有总数。fgHwSensorEntValue 表里温度、"
+            "风扇转速、电压混在一起,温度靠 fgHwSensorEntName 筛出来再取最大值,"
+            "**不能对整张表取最大值**(拿到的会是风扇的 9000+ RPM)。"
             "多 VDOM 环境下 SNMP 拿到的是全局值,按 VDOM 拆分必须走 API。"
         ),
     ),
