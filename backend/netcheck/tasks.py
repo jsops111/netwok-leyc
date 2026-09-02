@@ -300,12 +300,50 @@ def backup_device_task(self, device_id: int) -> dict:
     now = timezone.now()
     next_interval = device.backup_interval_hours * 3600
     try:
-        result = backup_mod.backup_device(device)
+        result = backup_mod.backup_and_check(device)
 
         device.last_backup_at = now
         device.last_backup_status = BackupStatus.OK
         device.last_backup_error = ""
-        device.save(update_fields=["last_backup_at", "last_backup_status", "last_backup_error"])
+        fields = ["last_backup_at", "last_backup_status", "last_backup_error"]
+
+        # ---- 未保存的配置 ----
+        # **三态**:True / False / None(没检查)。None 不能写成 False ——
+        # 那是在替设备做一个我们没验证过的保证
+        if result.get("unsaved") is not None or result.get("unsaved_error"):
+            device.config_unsaved = result.get("unsaved")
+            device.config_unsaved_lines = result.get("unsaved_lines")
+            device.config_checked_at = now
+            meta = dict(device.meta or {})
+            if result.get("unsaved_diff"):
+                meta["unsaved_diff"] = result["unsaved_diff"]
+            else:
+                meta.pop("unsaved_diff", None)
+            if result.get("unsaved_error"):
+                meta["unsaved_error"] = result["unsaved_error"]
+            else:
+                meta.pop("unsaved_error", None)
+            device.meta = meta
+            fields += ["config_unsaved", "config_unsaved_lines", "config_checked_at", "meta"]
+        device.save(update_fields=fields)
+
+        if result.get("unsaved"):
+            # warning 级并推送:配置没保存意味着"下一次重启这些改动就没了",
+            # 而设备重启这件事没人会提前通知你。去重窗口按备份间隔 ——
+            # 每个备份周期最多说一次,直到有人去 write memory
+            event = engine_mod.record_point_event(
+                engine_mod.EventSource.from_device(device),
+                EventKind.CONFIG_UNSAVED, Severity.WARNING,
+                title=f"{device.name} 有未保存的配置",
+                message=(
+                    f"running-config 和 startup-config 相差 "
+                    f"{result.get('unsaved_lines')} 行 —— 设备重启后这些改动会丢失。"
+                    "登上去 `write memory` / `copy running-config startup-config`"
+                ),
+                dedupe_seconds=max(3600, device.backup_interval_hours * 3600 - 300),
+            )
+            if event is not None:
+                send_notification.delay(event.pk, "alert")
 
         if result["changed"] and not result.get("is_first"):
             event = engine_mod.record_point_event(

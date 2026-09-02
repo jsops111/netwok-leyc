@@ -203,6 +203,11 @@ class DeviceSerializer(serializers.ModelSerializer):
     has_api_token = serializers.SerializerMethodField()
     interface_count = serializers.SerializerMethodField()
     profile_notes = serializers.SerializerMethodField()
+    # 这款型号支不支持备份 / 策略同步 / 未保存检查 —— 前端据此禁掉开关,
+    # 而不是让人打开一个必然失败的功能
+    profile_supports = serializers.SerializerMethodField()
+    # running 和 startup 的差异(前 200 行)。存在 meta 里,不单独建列
+    unsaved_diff = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
@@ -238,6 +243,21 @@ class DeviceSerializer(serializers.ModelSerializer):
         from netcheck.devices.profiles import get_profile
 
         return get_profile(obj.model, obj.vendor).notes
+
+    def get_profile_supports(self, obj) -> dict:
+        from netcheck.devices.profiles import get_profile
+
+        profile = get_profile(obj.model, obj.vendor)
+        return {
+            "backup": bool(profile.backup_cli),
+            "policy": bool(profile.policy_cli),
+            # 「未保存检查」要有 startup 命令。FortiOS 改完即存,没这个概念 ——
+            # 前端把开关灰掉并说明原因,比让人打开一个永远返回"未检查"的开关好
+            "unsaved_check": bool(profile.startup_cli),
+        }
+
+    def get_unsaved_diff(self, obj) -> list:
+        return (obj.meta or {}).get("unsaved_diff") or []
 
     def validate(self, attrs):
         """Device.clean() 的镜像。"""
@@ -337,6 +357,13 @@ class DeviceInterfaceSerializer(serializers.ModelSerializer):
     device_name = serializers.CharField(source="device.name", read_only=True)
     util_in_pct = serializers.FloatField(read_only=True)
     util_out_pct = serializers.FloatField(read_only=True)
+    # **数据成色**:ifHC*(64 位)采不到时退回了 32 位计数器。
+    # 48 口千兆交换机满速时 32 位的 ifInOctets 约 34 秒回绕一次,60 秒
+    # 采集间隔算出来的速率纯粹是噪声 —— 页面上必须能看出这个数不可信,
+    # 否则会有人拿它去排查一个不存在的流量问题(见 CLAUDE.md 第 6 条)
+    counter_32bit = serializers.SerializerMethodField()
+    # 管理上启用但链路 down —— 这是真正要看的那一类口
+    link_problem = serializers.SerializerMethodField()
 
     class Meta:
         model = DeviceInterface
@@ -344,13 +371,20 @@ class DeviceInterfaceSerializer(serializers.ModelSerializer):
             "id", "device", "device_name", "if_index", "if_name", "if_alias", "if_type",
             "mac", "speed_bps", "admin_up", "oper_up", "last_change", "monitored",
             "in_bps", "out_bps", "in_err_delta", "out_err_delta",
-            "util_in_pct", "util_out_pct", "updated_at",
+            "util_in_pct", "util_out_pct", "counter_32bit", "link_problem", "updated_at",
         ]
         read_only_fields = [
             "if_index", "if_name", "if_alias", "if_type", "mac", "speed_bps",
             "admin_up", "oper_up", "last_change", "in_bps", "out_bps",
             "in_err_delta", "out_err_delta",
         ]
+
+    def get_counter_32bit(self, obj) -> bool:
+        return bool((obj.meta or {}).get("counter_32bit"))
+
+    def get_link_problem(self, obj) -> bool:
+        # admin down 是人为关的,不是故障 —— 不算问题
+        return bool(obj.admin_up) and obj.oper_up is False
 
 
 class DeviceSampleSerializer(serializers.ModelSerializer):

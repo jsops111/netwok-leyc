@@ -162,6 +162,10 @@ class Profile:
     backup_volatile: tuple[str, ...] = ()
     # 防火墙策略的 SSH 命令。同样留空 = 不支持
     policy_cli: str = ""
+    # 「启动配置」的命令,用来判断有没有**改了但没保存**的配置
+    # (Cisco 的 `show startup-config`)。留空 = 这款型号没有这个概念:
+    # FortiOS 改完即存,拿它去比对只会得到一堆假的"未保存"
+    startup_cli: str = ""
     notes: str = ""
 
 
@@ -194,6 +198,11 @@ _CISCO_CAT9K_CLI = {
 # 这条命令直接报 "Invalid input detected"。
 _CISCO_BACKUP_CLI = "show running-config"
 
+# 启动配置。和 running-config 比对,不一样就说明有人改了配置没 `write memory`
+# —— 设备一重启那些改动就没了。**这是备份功能天然该回答的一问**:
+# 一份备份下来的 running-config 看着好好的,而它可能一次断电就不存在了。
+_CISCO_STARTUP_CLI = "show startup-config"
+
 # 每次导出都不一样的行:
 #   ! Last configuration change at 12:00:01 CST Mon Sep 1 2025 by admin
 #   ! NVRAM config last updated at ...
@@ -220,6 +229,7 @@ PROFILES: dict[str, Profile] = {
         cli_needs_enable=True,
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
+        startup_cli=_CISCO_STARTUP_CLI,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes=(
             "48 个千兆电口。**必须用 ifHC* 64 位计数器**:48 口满速时 32 位的 "
@@ -236,6 +246,7 @@ PROFILES: dict[str, Profile] = {
         cli_needs_enable=True,
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
+        startup_cli=_CISCO_STARTUP_CLI,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes="和 C9300-48T 同一套采集,区别只是口数。",
     ),
@@ -248,6 +259,7 @@ PROFILES: dict[str, Profile] = {
         cli_needs_enable=True,
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
+        startup_cli=_CISCO_STARTUP_CLI,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         # 温度和电源在 C9200L 上经常采不到:它是固定配置的入门款,
         # 入风口传感器和内置电源不一定注册进 ENVMON MIB。
@@ -318,6 +330,7 @@ PROFILES: dict[str, Profile] = {
         cli_needs_enable=True,
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
+        startup_cli=_CISCO_STARTUP_CLI,
         optional={"temp_c", "psu_state", "fan_state"},
         notes="没在册的 Cisco 设备。能采到的照采,采不到的留空,不因为型号不认识就整台不采。",
     ),

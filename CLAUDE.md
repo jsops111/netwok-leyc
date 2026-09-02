@@ -457,6 +457,26 @@ Cisco 的 `! Last configuration change at ...`、`Current configuration : N byte
 FortiOS 用 `show` 而不是 `show full-configuration`:后者把所有默认值也打出来,
 401F 上是几 MB、十几万行,走 SSH 读完要好几分钟,而且 diff 里全是默认值的噪声。
 
+### 未保存的配置(running vs startup)
+
+`show running-config` 备下来的配置**可能一次断电就不存在了** —— 有人改完忘了
+`write memory`。所以备份顺带比一次 startup-config:画像里的 `startup_cli`
+(只有 Cisco 有;FortiOS 改完即存,没有这个概念)。
+
+三态,和别处一样:`True` 有未保存改动 / `False` 已保存 / **`None` 没检查过或
+不支持**。`None` 不能显示成"已保存" —— 那是替设备做一个我们没验证过的保证。
+
+**返回的是差异行数 + diff 本身,不只是一个布尔。**running 和 startup 之间
+天生有一些无害差异,画像的 `backup_volatile` 盖住了已知的那些;真机上如果这一项
+长期报"未保存"而实际保存过,**去看 diff 把那几行的正则加到 `backup_volatile`
+里**,不要把开关关掉。让工程师自己看一眼比让他信一个不透明的判断靠得住。
+
+已经踩到的一个假阳性:`sanitize()` 原来只去尾部空行。`show running-config`
+开头的 `Building configuration...` 被滤掉之后留下一个空行,而 startup 没有
+那一行 → 凭空一行差异 → 报"未保存 1 行"。**头尾空行都要去。**
+
+代价是每次备份多取一份配置,时间大约翻倍,所以它是单独一个开关。
+
 ### 两个截断陷阱
 
 - `ssh_cli._run_shell` 的 `hard_limit` 默认 20 秒,**备份必须调大**(这里给 180)。
@@ -660,6 +680,18 @@ Sparkline 是**手写 SVG,不用 echarts**:一个大屏上有几十个,
 
 大屏**一次刷新只打三个接口**(`overview` / `charts` / `devices`)。
 别改成每条线路一个请求 —— 几十条线路 × 每 5 秒会把 gunicorn 打满。
+
+### 接口页的「速率成色」不是装饰
+
+`/interfaces` 那一列显示 64 位 / 32 位。**ifHC* 采不到时退回 32 位计数器,
+而 48 口千兆交换机满速时 32 位的 ifInOctets 约 34 秒回绕一次** ——
+60 秒采集间隔算出来的速率纯粹是噪声,可它看起来是一个正常的数字。
+不显式标出来就会有人拿着噪声去排查一个不存在的流量问题(CLAUDE.md 第 6 条)。
+CSV 导出里也有这一列:表格出了这个系统就再也看不出哪几行不能信。
+
+「仅异常」筛的是 **admin up 但链路 down**,或本周期新增了错包。
+**admin down 不算** —— 48 口交换机上一半的口是人为关掉的,
+把它们算进去这个筛选就没用了。
 
 ### 加一张 CRUD 表
 

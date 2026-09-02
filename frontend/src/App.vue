@@ -52,6 +52,7 @@ async function logout() {
 const NAV = [
   { to: '/', label: '监控大屏' },
   { to: '/servers', label: '服务器' },
+  { to: '/interfaces', label: '设备接口' },
   { to: '/backups', label: '配置备份' },
   { to: '/policies', label: '防火墙策略' },
   { to: '/events', label: '事件记录' },

@@ -87,6 +87,7 @@ class EventKind(models.TextChoices):
     # 见 events/engine.py 的 record_point_event()
     BACKUP_FAILED = "backup_failed", "配置备份失败"
     CONFIG_CHANGED = "config_changed", "配置发生变更"
+    CONFIG_UNSAVED = "config_unsaved", "配置未保存"
 
 
 class SourceType(models.TextChoices):
@@ -537,6 +538,23 @@ class Device(BaseModel):
         "保留版本数", default=20, validators=[MinValueValidator(1), MaxValueValidator(500)],
         help_text="**只数「变更过的版本」**:配置没变不会新增版本,所以 20 个版本通常够回溯很久",
     )
+    backup_check_unsaved = models.BooleanField(
+        "检查配置是否未保存", default=True,
+        help_text=(
+            "只对 Cisco 有效(比对 running-config 和 startup-config)。"
+            "**代价是每次备份多取一份配置**,时间大约翻倍。"
+            "FortiOS 改完即存,没有这个概念"
+        ),
+    )
+    # 三态:True=有未保存的改动 / False=已保存 / None=没检查过(或不支持)。
+    # **None 不能显示成"已保存"** —— 那是在替设备做一个我们没验证过的保证
+    config_unsaved = models.BooleanField("配置未保存", null=True, blank=True)
+    config_unsaved_lines = models.IntegerField(
+        "未保存的差异行数", null=True, blank=True,
+        help_text="running 和 startup 之间的差异行数。具体 diff 在 meta.unsaved_diff 里",
+    )
+    config_checked_at = models.DateTimeField("最后检查时间", null=True, blank=True)
+
     last_backup_at = models.DateTimeField("最后备份时间", null=True, blank=True)
     last_backup_status = models.CharField(
         "最后备份结果", max_length=8, choices=BackupStatus.choices, default=BackupStatus.NEVER

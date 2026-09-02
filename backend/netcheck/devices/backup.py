@@ -152,6 +152,87 @@ def _fetch_ssh(device: Device, profile: Profile) -> str:
     return text
 
 
+def check_unsaved(device: Device, running_text: str, profile: Profile) -> dict:
+    """
+    比对 running-config 和 startup-config,判断有没有**改了但没保存**的配置。
+
+    这是备份功能天然该回答的一问:一份备份下来的 running-config 看着好好的,
+    而它可能一次断电就不存在了 —— `write memory` 是个人容易忘的动作,
+    而忘了的后果要到设备重启才暴露。
+
+    ## 比对同样走 sanitize,但仍然可能有假阳性
+
+    running 和 startup 之间**天生就有一些无害差异**(两边的头部注释不一样、
+    某些平台会在 startup 里多写几行),画像的 `backup_volatile` 盖住了
+    已知的那些。真机上如果这一项长期报"未保存"而实际已经保存过,
+    **去看 diff**(页面上有),把那几行的正则加到 `backup_volatile` 里 ——
+    而不是把这个开关关掉。
+
+    所以返回的是**差异行数 + diff 本身**,不只是一个布尔:让工程师自己看一眼
+    比让他信一个不透明的判断更靠得住。
+
+    返回 {"unsaved": bool|None, "lines": int|None, "diff": [str], "error": str}。
+    `unsaved=None` 表示**没能检查**(不支持 / 取不到)—— 那和"已保存"是
+    两件事,不能混。
+    """
+
+    if not profile.startup_cli:
+        return {"unsaved": None, "lines": None, "diff": [],
+                "error": "这款型号没有「启动配置」的概念(FortiOS 改完即存)"}
+    if not (device.ssh_username and (device.ssh_password or device.ssh_private_key)):
+        return {"unsaved": None, "lines": None, "diff": [], "error": "需要 SSH 凭据"}
+
+    command = profile.startup_cli
+    hard_limit = 180.0
+    try:
+        client = ssh_cli._connect(device)
+    except ssh_cli.SshError as exc:
+        return {"unsaved": None, "lines": None, "diff": [], "error": str(exc)}
+    try:
+        if device.vendor == Vendor.CISCO:
+            outputs = ssh_cli._run_shell(
+                client, ["terminal length 0", command], timeout=hard_limit + 30,
+                enable_password=device.ssh_enable_password if profile.cli_needs_enable else "",
+                hard_limit=hard_limit,
+            )
+            raw = outputs.get(command, "")
+        else:
+            raw = ssh_cli._run_exec(client, command, timeout=hard_limit)
+    except ssh_cli.SshError as exc:
+        return {"unsaved": None, "lines": None, "diff": [], "error": str(exc)}
+    finally:
+        client.close()
+
+    startup = _strip_cli_noise(raw, command)
+    if not startup.strip():
+        return {"unsaved": None, "lines": None, "diff": [],
+                "error": f"`{command}` 没有输出(需要 enable 权限?)"}
+    lowered = startup.lower()
+    if len(startup) < 400 and any(
+        m in lowered for m in ("invalid input", "permission denied", "startup-config is not present")
+    ):
+        return {"unsaved": None, "lines": None, "diff": [],
+                "error": f"设备拒绝了命令:{startup.strip()[:120]}"}
+
+    run_clean = sanitize(running_text, profile).split("\n")
+    start_clean = sanitize(startup, profile).split("\n")
+    diff = list(difflib.unified_diff(
+        start_clean, run_clean,
+        fromfile="startup-config(已保存)", tofile="running-config(当前生效)",
+        n=2, lineterm="",
+    ))
+    changed = sum(1 for line in diff
+                  if (line.startswith(("+", "-")) and not line.startswith(("+++", "---"))))
+    return {
+        "unsaved": changed > 0,
+        "lines": changed,
+        # 只留前 200 行 —— 整机重配的 diff 有上万行,而那种情况看前 200 行
+        # 就够判断了,全存进 meta 会让设备表变得很重
+        "diff": diff[:200] + ([f"... 还有 {len(diff) - 200} 行差异"] if len(diff) > 200 else []),
+        "error": "",
+    }
+
+
 def _fetch_api(device: Device) -> str:
     try:
         return fortigate_api.fetch_config(device)
@@ -202,9 +283,14 @@ def sanitize(text: str, profile: Profile) -> str:
         if any(p.match(line) for p in patterns):
             continue
         out.append(line.rstrip())
-    # 尾部空行不参与比对
+    # **头尾的空行都要去掉。**只去尾部的话,`show running-config` 开头那个
+    # "Building configuration..." 被 backup_volatile 滤掉之后会留下一个空行,
+    # 而 `show startup-config` 没有那一行 —— 于是 running / startup 比对
+    # 凭空多出一行差异,页面上报"未保存 1 行"而配置其实是一致的
     while out and not out[-1]:
         out.pop()
+    while out and not out[0]:
+        out.pop(0)
     return "\n".join(out)
 
 
@@ -266,10 +352,17 @@ def backup_device(device: Device) -> dict:
 
     失败时抛 BackupError —— 由调用方(tasks.backup_device_task)负责回写
     Device.last_backup_* 并记事件。这里只管"取到并存好"。
+
+    要顺带检查"配置有没有未保存"用 `backup_and_check()`。
     """
 
     profile = get_profile(device.model, device.vendor)
     text, method = fetch_config(device)
+    return _store(device, text, method, profile)
+
+
+def _store(device: Device, text: str, method: str, profile: Profile) -> dict:
+    """把取回来的配置文本存成版本(变了才新增行)。"""
 
     truncated = False
     encoded = text.encode("utf-8", "replace")
@@ -323,6 +416,36 @@ def backup_device(device: Device) -> dict:
         "size_bytes": version.size_bytes, "lines_added": added, "lines_removed": removed,
         "is_first": version.is_first, "truncated": truncated,
     }
+
+
+def backup_and_check(device: Device) -> dict:
+    """
+    备份 + 顺带检查未保存的配置。
+
+    检查**只在 SSH 通道下做**:走 API 拿到的是备份文件,和 startup-config
+    不是同一种文本,拿它们比对会得到一堆假差异。
+    """
+
+    profile = get_profile(device.model, device.vendor)
+    text, method = fetch_config(device)
+    result = _store(device, text, method, profile)
+
+    result["unsaved"] = None
+    result["unsaved_lines"] = None
+    result["unsaved_diff"] = []
+    result["unsaved_error"] = ""
+    if device.backup_check_unsaved and method == "ssh" and profile.startup_cli:
+        try:
+            check = check_unsaved(device, text, profile)
+        except Exception as exc:  # noqa: BLE001 —— 检查失败不能让备份也失败
+            log.warning("设备 %s 未保存检查异常: %s", device.name, exc)
+            check = {"unsaved": None, "lines": None, "diff": [],
+                     "error": f"{type(exc).__name__}: {exc}"}
+        result["unsaved"] = check["unsaved"]
+        result["unsaved_lines"] = check["lines"]
+        result["unsaved_diff"] = check["diff"]
+        result["unsaved_error"] = check["error"]
+    return result
 
 
 def _prune(device: Device) -> int:

@@ -101,6 +101,7 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
     fail_threshold: 2, recover_threshold: 2,
     collect_interfaces: true, enabled: true, order: 0,
     backup_enabled: false, backup_interval_hours: 24, backup_keep: 20,
+    backup_check_unsaved: true,
     policy_sync_enabled: false, policy_sync_interval_minutes: 30,
   },
   server: {
@@ -471,6 +472,13 @@ const deviceFields: FieldSpec[] = [
   { key: 'backup_keep', label: '保留版本数', type: 'number', min: 1, max: 500, suffix: '个',
     show: (m) => m.backup_enabled,
     hint: '只数「变更过的版本」—— 配置没变不会新增版本,所以 20 个够回溯很久' },
+  { key: 'backup_check_unsaved', label: '检查配置是否未保存', type: 'switch', full: true,
+    // 只对 Cisco 有意义(比对 running-config 和 startup-config)。
+    // FortiOS 改完即存,没有这个概念 —— 画像里 startup_cli 为空的型号
+    // 这个开关打开也只会返回"未检查"
+    show: (m) => m.backup_enabled && m.vendor === 'cisco',
+    hint: '比对 running-config 和 startup-config,找出「改了但没 write memory」的配置'
+      + ' —— 设备一重启那些改动就没了。**代价是每次备份多取一份配置,时间大约翻倍**' },
 
   // ---- 防火墙策略 ----
   { key: 'policy_sync_enabled', label: '同步防火墙策略', type: 'switch', full: true,

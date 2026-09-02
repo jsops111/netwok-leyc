@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
-import { NButton, NDataTable, NModal, NSpace, NTag, useMessage } from 'naive-ui'
+import { NButton, NDataTable, NModal, NSelect, NSpace, NTag, useMessage } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
@@ -62,8 +62,20 @@ const stats = computed(() => {
     failed: list.filter((d) => d.last_backup_status === 'failed').length,
     never: list.filter((d) => d.last_backup_status === 'never').length,
     off: devices.value.length - list.length,
+    // 有未保存改动的台数。**只数 true** —— null 是"没检查过或不支持",
+    // 把它算进"已保存"是在替设备做一个我们没验证过的保证
+    unsaved: list.filter((d) => d.config_unsaved === true).length,
   }
 })
+
+// running vs startup 的差异明细
+const unsavedOpen = ref(false)
+const unsavedDevice = ref<DeviceRow | null>(null)
+
+function showUnsaved(device: DeviceRow) {
+  unsavedDevice.value = device
+  unsavedOpen.value = true
+}
 
 async function loadDevices() {
   loading.value = true
@@ -124,20 +136,47 @@ async function testChannel(device: DeviceRow) {
   }
 }
 
+// 当前正在看 diff 的版本,和对比基准 —— **基准可以换**:
+// "和上一版比"回答"这次改了什么","和三个月前那版比"回答
+// "从那次故障之后这台设备被动过什么",后者是复盘时真正要问的
+const diffVersion = ref<BackupVersion | null>(null)
+const diffAgainst = ref<number | null>(null)
+
+/** 可选的对比基准:同一台设备里**比当前版本早**的那些。 */
+const againstOptions = computed(() => {
+  if (!diffVersion.value) return []
+  const cur = diffVersion.value
+  return versions.value
+    .filter((v) => v.id !== cur.id && new Date(v.ts).getTime() <= new Date(cur.ts).getTime())
+    .map((v) => ({
+      label: `${dateTimeOf(v.ts)} · ${v.short_hash}${v.is_first ? '(基线)' : ''}`,
+      value: v.id,
+    }))
+})
+
 async function showDiff(version: BackupVersion, against?: number) {
   diffOpen.value = true
   diffLoading.value = true
   diff.value = null
+  diffVersion.value = version
+  diffAgainst.value = against ?? null
   diffTitle.value = `${currentDevice.value?.name || ''} · ${version.short_hash} 的变更`
   try {
     const { data } = await api.backupDiff(version.id, against)
     diff.value = data
+    // 后端在 against 留空时自己找上一版,把它回填到选择框里,
+    // 否则那个框是空的而下面明明显示着一份 diff
+    if (against === undefined && data.from) diffAgainst.value = data.from
   } catch (e) {
     message.error(errText(e))
     diffOpen.value = false
   } finally {
     diffLoading.value = false
   }
+}
+
+function changeBase(id: number) {
+  if (diffVersion.value) void showDiff(diffVersion.value, id)
 }
 
 async function showText(version: BackupVersion) {
@@ -184,6 +223,28 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
         h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
           r.last_backup_at ? ago(r.last_backup_at) : '还没跑过'),
       ])
+    } },
+  { title: '配置已保存?', key: 'config_unsaved', width: 128,
+    render: (r) => {
+      // 三态。**null 显示「未检查」,不显示「已保存」** ——
+      // 后者是一个我们没验证过的保证
+      if (r.config_unsaved === null) {
+        const why = !r.profile_supports?.unsaved_check
+          ? '这款型号没有「启动配置」的概念(FortiOS 改完即存)'
+          : !r.backup_check_unsaved
+            ? '这台设备关掉了未保存检查'
+            : '还没检查过,或者上次检查没成功'
+        return h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)', title: why }, '未检查')
+      }
+      if (!r.config_unsaved) {
+        return h('span', { style: `font-size:11px;color:${STATE.up}`, title: 'running 和 startup 一致' },
+          '已保存')
+      }
+      return h(NButton, {
+        size: 'tiny', ghost: true, type: 'warning',
+        title: '点开看 running 和 startup 差了哪些行',
+        onClick: () => showUnsaved(r),
+      }, () => `未保存 ${r.config_unsaved_lines ?? '?'} 行`)
     } },
   { title: '间隔', key: 'backup_interval_hours', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.backup_interval_hours}h`) },
@@ -276,6 +337,8 @@ const versionColumns: DataTableColumns<BackupVersion> = [
                 foot="一个悄悄坏掉的备份等于没有备份" />
       <StatTile label="从未备份" :value="stats.never" unit="台" :color="STATE.unknown"
                 foot="刚开启,还没到第一个周期" />
+      <StatTile label="配置未保存" :value="stats.unsaved" unit="台" :color="STATE.degraded"
+                foot="改了但没 write memory —— 设备一重启就丢" />
       <StatTile
         label="当前设备版本数"
         :value="selected === null ? null : versions.length"
@@ -296,7 +359,7 @@ const versionColumns: DataTableColumns<BackupVersion> = [
       </template>
       <NDataTable
         :columns="deviceColumns" :data="backupDevices" :loading="loading"
-        size="small" :bordered="false" :single-line="false" :scroll-x="1120"
+        size="small" :bordered="false" :single-line="false" :scroll-x="1260"
         :pagination="{ pageSize: 10 }"
       />
       <div v-if="!backupDevices.length && !loading" class="cy-empty">
@@ -349,6 +412,16 @@ const versionColumns: DataTableColumns<BackupVersion> = [
           </template>
           <span v-else>{{ diff.detail }}</span>
         </div>
+        <!-- 换基准:和上一版比是"这次改了什么",和更早的版本比是
+             "从那时候起这台设备被动过什么" —— 复盘时问的是后者 -->
+        <div v-if="againstOptions.length" class="base-pick">
+          <span class="bp-label">对比基准</span>
+          <NSelect
+            :value="diffAgainst" :options="againstOptions" size="small"
+            style="width: 300px" @update:value="changeBase"
+          />
+          <span class="bp-hint">选更早的版本 → 看"从那时起这台设备被动过什么"</span>
+        </div>
         <!-- 比对的是**清洗过**的文本:每次导出都变的时间戳/字节数行已经去掉了,
              否则每个 diff 的头几行都是噪声,真改动藏在后面 -->
         <div class="diff-note">
@@ -364,6 +437,40 @@ const versionColumns: DataTableColumns<BackupVersion> = [
       <template #footer>
         <NSpace justify="end">
           <NButton size="small" @click="diffOpen = false">关闭</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- ============ 未保存的配置 ============ -->
+    <NModal
+      v-model:show="unsavedOpen" preset="card" :bordered="false"
+      :title="`${unsavedDevice?.name || ''} · 未保存的配置`"
+      style="width: min(1000px, 95vw)"
+    >
+      <template v-if="unsavedDevice">
+        <div class="diff-head">
+          <span>
+            running-config 和 startup-config 相差
+            <b class="del">{{ unsavedDevice.config_unsaved_lines }}</b> 行
+          </span>
+          <span class="counts">检查于 {{ dateTimeOf(unsavedDevice.config_checked_at) }}</span>
+        </div>
+        <div class="diff-note">
+          设备**一重启这些改动就没了**。登上去执行
+          <code>write memory</code>(或 <code>copy running-config startup-config</code>)。<br>
+          如果这里长期显示"未保存"而你确认已经保存过,那是 running 和 startup 之间
+          天生的无害差异 —— 把那几行的正则加到型号画像的
+          <code>backup_volatile</code> 里,**不要把这个检查关掉**。
+        </div>
+        <pre v-if="unsavedDevice.unsaved_diff?.length" class="diff"><code
+          v-for="(line, i) in unsavedDevice.unsaved_diff" :key="i"
+          :class="diffClass(line)"
+        >{{ line }}</code></pre>
+        <div v-else class="cy-empty">这次没有留下 diff 明细(下一个备份周期会补上)</div>
+      </template>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton size="small" @click="unsavedOpen = false">关闭</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -413,6 +520,16 @@ const versionColumns: DataTableColumns<BackupVersion> = [
 .counts { margin-left: auto; display: flex; gap: 8px; font-size: 11.5px; }
 .counts .add { color: var(--cy-up); }
 .counts .del { color: var(--cy-down); }
+
+.base-pick {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 9px 0 4px;
+  flex-wrap: wrap;
+}
+.bp-label { font-size: 11px; color: var(--cy-ink-3); letter-spacing: 0.05em; }
+.bp-hint { font-size: 10px; color: var(--cy-ink-3); }
 
 .diff-note {
   font-size: 10.5px;

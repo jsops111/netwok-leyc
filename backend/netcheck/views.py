@@ -460,6 +460,110 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
         iface.save(update_fields=["monitored"])
         return Response({"id": iface.pk, "monitored": iface.monitored})
 
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """
+        接口清单导出 CSV。**巡检和交维时要的就是这张表。**
+
+        「速率成色」那一列是这份表格里最容易被忽略但最要紧的:
+        退回 32 位计数器算出来的速率不可信(48 口千兆满速时 32 位计数器
+        约 34 秒回绕一次),导出的时候必须跟着走,否则表格出了这个系统
+        就再也看不出哪几行的数字是噪声。
+        """
+
+        import csv
+        import io as _io
+
+        from django.http import HttpResponse
+
+        queryset = self.filter_queryset(self.get_queryset()).order_by("device_id", "if_index")
+
+        buf = _io.StringIO()
+        buf.write("\ufeff")
+        writer = csv.writer(buf)
+        writer.writerow([
+            "设备", "ifIndex", "接口名", "描述", "类型", "MAC", "协商速率",
+            "管理状态", "运行状态", "入向", "出向", "入向利用率%", "出向利用率%",
+            "入向错包增量", "出向错包增量", "速率成色", "纳入监控", "最后状态变化", "更新时间",
+        ])
+        def bps_text(v):
+            if v is None:
+                return "未知"
+            for unit, div in (("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)):
+                if v >= div:
+                    return f"{v / div:.2f} {unit}"
+            return f"{v:.0f} bps"
+
+        count = 0
+        for i in queryset.iterator(chunk_size=500):
+            writer.writerow([
+                i.device.name, i.if_index, i.if_name, i.if_alias, i.if_type, i.mac,
+                bps_text(i.speed_bps) if i.speed_bps else "未知",
+                "up" if i.admin_up else ("down" if i.admin_up is False else "未知"),
+                "up" if i.oper_up else ("down" if i.oper_up is False else "未知"),
+                bps_text(i.in_bps), bps_text(i.out_bps),
+                "未知" if i.util_in_pct is None else i.util_in_pct,
+                "未知" if i.util_out_pct is None else i.util_out_pct,
+                "未知" if i.in_err_delta is None else i.in_err_delta,
+                "未知" if i.out_err_delta is None else i.out_err_delta,
+                "32 位计数器,速率不可信" if (i.meta or {}).get("counter_32bit") else "64 位",
+                "是" if i.monitored else "否",
+                timezone.localtime(i.last_change).strftime("%Y-%m-%d %H:%M:%S") if i.last_change else "",
+                timezone.localtime(i.updated_at).strftime("%Y-%m-%d %H:%M:%S"),
+            ])
+            count += 1
+
+        response = HttpResponse(buf.getvalue(), content_type="text/csv; charset=utf-8")
+        stamp = timezone.localtime(timezone.now()).strftime("%Y%m%d-%H%M%S")
+        response["Content-Disposition"] = f'attachment; filename="interfaces-{stamp}.csv"'
+        log.info("导出接口清单 CSV:%d 行", count)
+        return response
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """
+        接口页顶部那几块数字,按设备一行。
+
+        `counter_32bit` 那一项单独给出来:它不是故障,但它决定**这台设备的
+        速率数字能不能信**。不显式说出来的话没人会想到去怀疑一个看着正常的数。
+        """
+
+        devices = list(Device.objects.filter(enabled=True).order_by("order", "id"))
+        rows = (
+            DeviceInterface.objects.filter(device__in=devices)
+            .values("device_id")
+            .annotate(
+                total=Count("id"),
+                up=Count("id", filter=Q(oper_up=True)),
+                problem=Count("id", filter=Q(admin_up=True, oper_up=False)),
+                errors=Count("id", filter=Q(in_err_delta__gt=0) | Q(out_err_delta__gt=0)),
+                unmonitored=Count("id", filter=Q(monitored=False)),
+            )
+        )
+        stats = {r["device_id"]: r for r in rows}
+        # counter_32bit 在 meta 里,SQL 里筛 JSON 不如直接数 —— 接口总数
+        # 是几十到几百,一次取出来在 Python 里数完全够
+        legacy: dict[int, int] = {}
+        for iface in DeviceInterface.objects.filter(device__in=devices).only("device_id", "meta"):
+            if (iface.meta or {}).get("counter_32bit"):
+                legacy[iface.device_id] = legacy.get(iface.device_id, 0) + 1
+
+        payload = []
+        for device in devices:
+            row = stats.get(device.pk, {})
+            payload.append({
+                "device_id": device.pk, "device_name": device.name,
+                "mgmt_ip": device.mgmt_ip, "kind": device.kind, "state": device.state,
+                "model_label": device.get_model_display(),
+                "collect_interfaces": device.collect_interfaces,
+                "last_collected_at": device.last_collected_at,
+                "total": row.get("total", 0), "up": row.get("up", 0),
+                "problem": row.get("problem", 0), "errors": row.get("errors", 0),
+                "unmonitored": row.get("unmonitored", 0),
+                "counter_32bit": legacy.get(device.pk, 0),
+            })
+        return Response({"generated_at": timezone.now(), "devices": payload})
+
     @action(detail=True, methods=["get"])
     def series(self, request, pk=None):
         iface = self.get_object()

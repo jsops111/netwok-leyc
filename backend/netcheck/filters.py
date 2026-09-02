@@ -59,10 +59,33 @@ class DeviceInterfaceFilter(filters.FilterSet):
         model = DeviceInterface
         fields = ["device", "oper_up", "admin_up", "monitored"]
 
+    # 只看有问题的口:**admin up 但链路 down**,或者本周期新增了错包。
+    # 这是巡检时唯一真正要看的那一列 —— 48 口交换机上一半是空的,
+    # 而 admin down 是人为关的、不是故障
+    problem = filters.BooleanFilter(method="filter_problem", label="仅异常接口")
+    keyword = filters.CharFilter(method="filter_keyword", label="接口名或描述")
+
     def filter_active(self, queryset, name, value):
         if value:
             return queryset.filter(oper_up=True)
         return queryset
+
+    def filter_problem(self, queryset, name, value):
+        from django.db.models import Q
+
+        if value is None:
+            return queryset
+        cond = (
+            Q(admin_up=True, oper_up=False)
+            | Q(in_err_delta__gt=0)
+            | Q(out_err_delta__gt=0)
+        )
+        return queryset.filter(cond) if value else queryset.exclude(cond)
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(Q(if_name__icontains=value) | Q(if_alias__icontains=value))
 
 
 class ServerFilter(filters.FilterSet):

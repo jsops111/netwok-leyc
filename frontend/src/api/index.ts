@@ -189,6 +189,13 @@ export interface DeviceRow {
   last_backup_at: string | null
   last_backup_status: string
   last_backup_error: string
+  backup_check_unsaved: boolean
+  /** 三态:true=有未保存的改动 / false=已保存 / null=**没检查过或不支持** */
+  config_unsaved: boolean | null
+  config_unsaved_lines: number | null
+  config_checked_at: string | null
+  unsaved_diff: string[]
+  profile_supports: { backup: boolean; policy: boolean; unsaved_check: boolean }
   policy_sync_enabled: boolean
   policy_sync_interval_minutes: number
   last_policy_sync_at: string | null
@@ -483,6 +490,50 @@ export interface PolicyAudit {
   }>
 }
 
+export interface InterfaceRow {
+  id: number
+  device: number
+  device_name: string
+  if_index: number
+  if_name: string
+  if_alias: string
+  if_type: string
+  mac: string
+  speed_bps: number | null
+  admin_up: boolean | null
+  oper_up: boolean | null
+  last_change: string | null
+  monitored: boolean
+  in_bps: number | null
+  out_bps: number | null
+  in_err_delta: number | null
+  out_err_delta: number | null
+  util_in_pct: number | null
+  util_out_pct: number | null
+  /** 退回了 32 位计数器 → **这一行的速率不可信** */
+  counter_32bit: boolean
+  /** admin up 但链路 down —— 真正要看的那一类口 */
+  link_problem: boolean
+  updated_at: string
+}
+
+export interface InterfaceSummaryRow {
+  device_id: number
+  device_name: string
+  mgmt_ip: string
+  kind: string
+  state: string
+  model_label: string
+  collect_interfaces: boolean
+  last_collected_at: string | null
+  total: number
+  up: number
+  problem: number
+  errors: number
+  unmonitored: number
+  counter_32bit: number
+}
+
 export interface EventRow {
   id: number
   source_type: string
@@ -742,6 +793,19 @@ export const api = {
   deviceProfiles: () => http.get('/devices/profiles/'),
   deviceInterfaces: (id: number, active = false) =>
     http.get(`/devices/${id}/interfaces/`, { params: { active: active ? 'true' : undefined } }),
+  interfaces: (params?: object) => http.get<Paged<InterfaceRow>>('/interfaces/', { params }),
+  interfaceSummary: () =>
+    http.get<{ generated_at: string; devices: InterfaceSummaryRow[] }>('/interfaces/summary/'),
+  toggleInterfaceMonitor: (id: number) =>
+    http.post<{ id: number; monitored: boolean }>(`/interfaces/${id}/toggle_monitor/`),
+  interfaceExportUrl: (params: Record<string, any> = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') q.set(k, String(v))
+    }
+    const qs = q.toString()
+    return `/api/interfaces/export/${qs ? `?${qs}` : ''}`
+  },
   deviceSeries: (id: number, hours = 6) => http.get(`/devices/${id}/series/`, { params: { hours } }),
 
   // 服务器(SSH 采集)
