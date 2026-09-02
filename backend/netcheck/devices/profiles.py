@@ -152,6 +152,16 @@ class Profile:
     cli: dict[str, str] = field(default_factory=dict)
     # 进 CLI 后是否需要 enable
     cli_needs_enable: bool = False
+    # 配置备份用的命令。**留空 = 这款型号不支持备份**,不要拿 cli["version"]
+    # 之类的凑 —— 备份出一份不是配置的文本比没有备份糟得多:页面上看着有
+    # 版本记录,真要回滚时才发现里面是 show version 的输出
+    backup_cli: str = ""
+    # 备份文本里**每次导出都会变但没有意义**的行。不去掉的话每次备份都被判成
+    # "配置变更过",变更历史就退化成一天一条噪声(见 devices/backup.py 的
+    # sanitize())。正则,按行匹配
+    backup_volatile: tuple[str, ...] = ()
+    # 防火墙策略的 SSH 命令。同样留空 = 不支持
+    policy_cli: str = ""
     notes: str = ""
 
 
@@ -180,6 +190,25 @@ _CISCO_CAT9K_CLI = {
     "if_status": "show ip interface brief",
 }
 
+# Cisco 的 running-config。**需要 enable**(特权模式),普通 exec 模式下
+# 这条命令直接报 "Invalid input detected"。
+_CISCO_BACKUP_CLI = "show running-config"
+
+# 每次导出都不一样的行:
+#   ! Last configuration change at 12:00:01 CST Mon Sep 1 2025 by admin
+#   ! NVRAM config last updated at ...
+#   Current configuration : 24817 bytes
+#   ntp clock-period 17179869      ← 这个每几分钟自己就变一次
+# 不去掉的话每天备份都是"变更过",而真正被人改了配置的那一天混在里面看不出来
+_CISCO_VOLATILE = (
+    r"^\s*!\s*Last configuration change",
+    r"^\s*!\s*NVRAM config last updated",
+    r"^\s*Current configuration\s*:\s*\d+\s*bytes",
+    r"^\s*Building configuration",
+    r"^\s*ntp clock-period\s+\d+",
+    r"^\s*!\s*Time:",
+)
+
 PROFILES: dict[str, Profile] = {
     # ---- 需求点名必须支持的四款 ----
     DeviceModel.C9300_48T: Profile(
@@ -189,6 +218,8 @@ PROFILES: dict[str, Profile] = {
         metrics=dict(_CISCO_CAT9K_METRICS),
         cli=dict(_CISCO_CAT9K_CLI),
         cli_needs_enable=True,
+        backup_cli=_CISCO_BACKUP_CLI,
+        backup_volatile=_CISCO_VOLATILE,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes=(
             "48 个千兆电口。**必须用 ifHC* 64 位计数器**:48 口满速时 32 位的 "
@@ -203,6 +234,8 @@ PROFILES: dict[str, Profile] = {
         metrics=dict(_CISCO_CAT9K_METRICS),
         cli=dict(_CISCO_CAT9K_CLI),
         cli_needs_enable=True,
+        backup_cli=_CISCO_BACKUP_CLI,
+        backup_volatile=_CISCO_VOLATILE,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes="和 C9300-48T 同一套采集,区别只是口数。",
     ),
@@ -213,6 +246,8 @@ PROFILES: dict[str, Profile] = {
         metrics=dict(_CISCO_CAT9K_METRICS),
         cli=dict(_CISCO_CAT9K_CLI),
         cli_needs_enable=True,
+        backup_cli=_CISCO_BACKUP_CLI,
+        backup_volatile=_CISCO_VOLATILE,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         # 温度和电源在 C9200L 上经常采不到:它是固定配置的入门款,
         # 入风口传感器和内置电源不一定注册进 ENVMON MIB。
@@ -252,6 +287,17 @@ PROFILES: dict[str, Profile] = {
             "ha": "get system ha status",
             "interfaces": "diagnose netlink brief",
         },
+        # **用 `show` 而不是 `show full-configuration`。**后者把所有默认值也
+        # 打出来,401F 上是几 MB、十几万行 —— 走 SSH 读完要好几分钟,而且
+        # diff 里全是默认值的噪声。`show` 只输出偏离默认的部分,那才是
+        # "这台设备被配成了什么样"。
+        # 配了 API Token 时备份会**优先走 API**(见 devices/backup.py):
+        # config/backup 端点给的是能直接回灌的备份文件,CLI 输出不是。
+        backup_cli="show",
+        # #conf_file_ver 每次导出都变(它带时间戳性质的序号)。
+        # buildno / vdom 那几行**要留着** —— 固件升级本身就是该被记录的变更
+        backup_volatile=(r"^\s*#conf_file_ver=",),
+        policy_cli="show firewall policy",
         optional={"temp_c", "vpn_tunnels_up"},
         notes=(
             "FortiOS 7.x。**推荐 collect_method=api、fallback=snmp**:"
@@ -270,6 +316,8 @@ PROFILES: dict[str, Profile] = {
         metrics=dict(_CISCO_CAT9K_METRICS),
         cli=dict(_CISCO_CAT9K_CLI),
         cli_needs_enable=True,
+        backup_cli=_CISCO_BACKUP_CLI,
+        backup_volatile=_CISCO_VOLATILE,
         optional={"temp_c", "psu_state", "fan_state"},
         notes="没在册的 Cisco 设备。能采到的照采,采不到的留空,不因为型号不认识就整台不采。",
     ),
@@ -289,6 +337,9 @@ PROFILES: dict[str, Profile] = {
             "performance": "get system performance status",
             "ha": "get system ha status",
         },
+        backup_cli="show",
+        backup_volatile=(r"^\s*#conf_file_ver=",),
+        policy_cli="show firewall policy",
         optional={"temp_c", "vpn_tunnels_up", "session_rate"},
         notes="没在册的 FortiGate 型号。",
     ),
@@ -299,7 +350,15 @@ PROFILES: dict[str, Profile] = {
         metrics={"uptime_s": MetricSpec([SYS["sysUpTime"]], scale=0.01)},
         optional={"cpu_pct", "mem_pct", "temp_c"},
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
-        notes="只采 RFC1213 + IF-MIB 通用部分:通断、接口流量、运行时长。CPU/内存是厂商私有 MIB,通用画像拿不到。",
+        # backup_cli 故意留空:不知道是什么设备就不知道该敲什么命令,
+        # 而随便敲一条命令把输出当配置存起来是在制造一份假备份
+        notes=(
+            "只采 RFC1213 + IF-MIB 通用部分:通断、接口流量、运行时长。"
+            "CPU/内存是厂商私有 MIB,通用画像拿不到。**不支持配置备份和策略同步** ——"
+            "备份命令因厂商而异,认不出型号时随便敲一条命令存下来的是假备份。"
+            "华为/H3C 之类要用备份功能的话,在这个文件里加一款画像("
+            "display current-configuration / display current-configuration)。"
+        ),
     ),
 }
 

@@ -7,14 +7,16 @@ API 视图。
     /api/dashboard/overview/    顶部那排统计(断线/丢包/延迟/抖动/异常 次数)
     /api/dashboard/charts/      按监控类分组的图表数据,一个监控类一块
     /api/dashboard/devices/     设备卡片(交换机/防火墙)
+    /api/dashboard/servers/     服务器卡片(基本信息 + 流量趋势)
 
-原则:**大屏的一次刷新只打这三个接口**,不是每条线路一个请求。
-几十条线路 × 每 5 秒刷新,后者会把 gunicorn 打满。
+原则:**大屏的一次刷新只打这三个接口**(服务器页面单独一个),
+不是每条线路一个请求。几十条线路 × 每 5 秒刷新,后者会把 gunicorn 打满。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timedelta
 
 from django.db.models import Count, Q
@@ -27,32 +29,41 @@ from rest_framework.response import Response
 from core.pagination import SampleCursorPagination
 from netcheck import scheduler
 from netcheck.filters import (
+    DeviceBackupFilter,
     DeviceFilter,
     DeviceInterfaceFilter,
     EventFilter,
+    FirewallPolicyFilter,
     NotifierFilter,
     ProbeTargetFilter,
+    ServerFilter,
 )
 from netcheck.models import (
+    BackupStatus,
     CollectMethod,
     Device,
+    DeviceBackup,
     DeviceInterface,
     DeviceKind,
     DeviceModel,
     DeviceSample,
     Event,
     EventKind,
+    FirewallPolicy,
     InterfaceSample,
     LinkState,
     Notifier,
     NotifierKind,
     NotifyLog,
+    PolicyAction,
     ProbeGroup,
     ProbeRollup,
     ProbeSample,
     ProbeTarget,
     Protocol,
     RollupBucket,
+    Server,
+    ServerSample,
     Severity,
     SnmpSecLevel,
     SnmpVersion,
@@ -60,10 +71,14 @@ from netcheck.models import (
     Vendor,
 )
 from netcheck.serializers import (
+    DeviceBackupDetailSerializer,
+    DeviceBackupSerializer,
     DeviceInterfaceSerializer,
     DeviceSampleSerializer,
     DeviceSerializer,
     EventSerializer,
+    FirewallPolicyDetailSerializer,
+    FirewallPolicySerializer,
     InterfaceSampleSerializer,
     NotifierSerializer,
     NotifyLogSerializer,
@@ -71,6 +86,9 @@ from netcheck.serializers import (
     ProbeRollupSerializer,
     ProbeSampleSerializer,
     ProbeTargetSerializer,
+    ServerInterfaceSerializer,
+    ServerSampleSerializer,
+    ServerSerializer,
 )
 
 log = logging.getLogger("netcheck.api")
@@ -336,10 +354,92 @@ class DeviceViewSet(viewsets.ModelViewSet):
                 "optional": sorted(p.optional),
                 "absent": sorted(p.absent),
                 "cli_commands": p.cli,
+                # 前端据此决定「启用配置备份」这个开关要不要禁掉:
+                # 画像里没有备份命令的型号,开了也备不了
+                "backup_cli": p.backup_cli,
+                "policy_cli": p.policy_cli,
+                "supports_backup": bool(p.backup_cli),
+                "supports_policy": bool(p.policy_cli),
                 "notes": p.notes,
             }
             for p in PROFILES.values()
         ])
+
+    # ---- 配置备份 ----
+
+    @action(detail=True, methods=["post"])
+    def test_backup(self, request, pk=None):
+        """
+        测备份通道:取一份配置回来看看,**但不存成版本**。
+
+        存起来的话每点一次测试就多一个版本,而版本数有上限 ——
+        连点五次就把真实的变更历史挤掉五个。
+        """
+
+        from netcheck.devices import backup as backup_mod
+
+        device = self.get_object()
+        try:
+            ok, detail = backup_mod.test_backup(device)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("设备 %s 备份通道测试异常", device.name)
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        return Response({"ok": ok, "detail": detail})
+
+    @action(detail=True, methods=["post"])
+    def backup_now(self, request, pk=None):
+        """
+        立刻备份一次(走正式流程:存版本、判变更、记事件)。
+
+        排进到期表而不是同步执行:一份 running-config 走 SSH 要几十秒,
+        而 HTTP 请求撑不了那么久 —— 同步做的话页面上会看到一个超时,
+        而备份其实成功了。
+        """
+
+        device = self.get_object()
+        if not device.enabled:
+            return Response({"detail": "设备已停用"}, status=status.HTTP_400_BAD_REQUEST)
+        if not device.backup_enabled:
+            return Response(
+                {"detail": "这台设备没有开启配置备份 —— 先在配置里打开"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        scheduler.schedule_now("backup", device.pk)
+        return Response({"detail": "已排入备份队列,一份大配置可能要一两分钟"})
+
+    @action(detail=True, methods=["get"])
+    def backups(self, request, pk=None):
+        """这台设备的版本列表(不带全文)。"""
+
+        device = self.get_object()
+        versions = device.backups.order_by("-ts")[:200]
+        return Response({
+            "device": device.name,
+            "enabled": device.backup_enabled,
+            "interval_hours": device.backup_interval_hours,
+            "keep": device.backup_keep,
+            "last_backup_at": device.last_backup_at,
+            "last_backup_status": device.last_backup_status,
+            "last_backup_error": device.last_backup_error,
+            "versions": DeviceBackupSerializer(versions, many=True).data,
+        })
+
+    # ---- 防火墙策略 ----
+
+    @action(detail=True, methods=["post"])
+    def sync_policies_now(self, request, pk=None):
+        device = self.get_object()
+        if device.kind != DeviceKind.FIREWALL:
+            return Response(
+                {"detail": "策略同步只对防火墙有意义"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if not device.policy_sync_enabled:
+            return Response(
+                {"detail": "这台设备没有开启策略同步 —— 先在配置里打开"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        scheduler.schedule_now("policy", device.pk)
+        return Response({"detail": "已排入同步队列"})
 
 
 class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
@@ -372,6 +472,318 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({"points": len(rows), "series": rows, "speed_bps": iface.speed_bps})
 
 
+class ServerViewSet(viewsets.ModelViewSet):
+    """
+    服务器 CRUD + 测试 / 立即采集 / 时序 / 网卡。
+
+    和 DeviceViewSet 的形状一样,区别是**没有通道概念** —— 服务器只走 SSH。
+    """
+
+    serializer_class = ServerSerializer
+    filterset_class = ServerFilter
+    search_fields = ["name", "host", "hostname", "os_name"]
+    ordering_fields = ["name", "state", "last_collected_at", "order"]
+
+    def get_queryset(self):
+        # order_by 要**显式写**:annotate 之后 Meta.ordering 不一定还在,
+        # 而分页接口拿到一个无序 queryset 会让第 2 页和第 1 页出现重复行
+        # (DRF 会为此打 UnorderedObjectListWarning)
+        return (
+            Server.objects.prefetch_related("interfaces")
+            .annotate(
+                interface_count_ann=Count("interfaces", distinct=True),
+                open_event_count_ann=Count(
+                    "events", filter=Q(events__resolved_at__isnull=True), distinct=True
+                ),
+            )
+            .order_by("order", "id")
+        )
+
+    def perform_create(self, serializer):
+        server = serializer.save()
+        if server.enabled:
+            scheduler.schedule_now("server", server.pk)
+
+    def perform_update(self, serializer):
+        server = serializer.save()
+        if server.enabled:
+            scheduler.schedule_now("server", server.pk)
+        else:
+            scheduler.unschedule("server", server.pk)
+            from netcheck.events.engine import force_resolve
+
+            for event in server.events.filter(resolved_at__isnull=True):
+                force_resolve(event, "服务器已停用")
+
+    def perform_destroy(self, instance):
+        scheduler.unschedule("server", instance.pk)
+        instance.delete()
+
+    @action(detail=True, methods=["post"])
+    def test(self, request, pk=None):
+        """连上去读一遍基本信息。**不写库、不开事件。**"""
+
+        from netcheck.servers import collector
+
+        server = self.get_object()
+        try:
+            ok, detail = collector.test_connection(server)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("服务器 %s 测试异常", server.name)
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        return Response({"ok": ok, "detail": detail})
+
+    @action(detail=True, methods=["post"])
+    def collect_now(self, request, pk=None):
+        server = self.get_object()
+        if not server.enabled:
+            return Response({"detail": "服务器已停用"}, status=status.HTTP_400_BAD_REQUEST)
+        scheduler.schedule_now("server", server.pk)
+        return Response({"detail": "已排入下一拍"})
+
+    @action(detail=True, methods=["get"])
+    def series(self, request, pk=None):
+        """
+        指标时序。**和设备一样不做降采样** —— 最快 15 秒一拍,
+        一天最多 5760 行。所以能看的跨度受原始样本保留期约束(默认 48 小时),
+        要看更久得先在「系统信息」里把保留期调大。
+        """
+
+        server = self.get_object()
+        hours = min(float(request.query_params.get("hours", 6)), 720)
+        since = timezone.now() - timedelta(hours=hours)
+        rows = list(
+            server.samples.filter(ts__gte=since).order_by("ts")
+            .values("ts", "reachable", "cpu_pct", "cpu_iowait_pct", "mem_pct", "swap_pct",
+                    "disk_pct", "load1", "load5", "load15",
+                    "net_in_bps", "net_out_bps", "tcp_established", "process_count")[:5000]
+        )
+        return Response({
+            "points": len(rows), "interval": server.interval_seconds, "series": rows,
+        })
+
+    @action(detail=True, methods=["get"])
+    def interfaces(self, request, pk=None):
+        server = self.get_object()
+        queryset = server.interfaces.all()
+        if request.query_params.get("physical") == "true":
+            # 只看物理口。主网卡即使名字像虚拟口(br0 这种)也要留下 ——
+            # 它是这台机器真正的对外出口
+            queryset = queryset.filter(Q(is_virtual=False) | Q(is_primary=True))
+        return Response(ServerInterfaceSerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=["get"])
+    def detail_info(self, request, pk=None):
+        """
+        「基本信息」面板的数据源:最近一条样本里的挂载点明细、进程 Top、网卡。
+
+        单独一个接口是因为这些东西**只看最新一条就够**,不需要时序 ——
+        塞进 series 会让每个点都带上一份挂载点数组,响应大十几倍。
+        """
+
+        server = self.get_object()
+        latest = server.samples.order_by("-ts").first()
+        extra = (latest.extra if latest else {}) or {}
+        return Response({
+            "server": ServerSerializer(server).data,
+            "ts": latest.ts if latest else None,
+            "reachable": latest.reachable if latest else None,
+            "uptime_s": latest.uptime_s if latest else None,
+            "mounts": extra.get("mounts") or [],
+            "top_processes": extra.get("top_processes") or [],
+            "primary_interface": extra.get("primary_interface") or "",
+            "interfaces": ServerInterfaceSerializer(server.interfaces.all(), many=True).data,
+            "current": {
+                "cpu": latest.cpu_pct if latest else None,
+                "iowait": latest.cpu_iowait_pct if latest else None,
+                "mem": latest.mem_pct if latest else None,
+                "swap": latest.swap_pct if latest else None,
+                "disk": latest.disk_pct if latest else None,
+                "load1": latest.load1 if latest else None,
+                "load5": latest.load5 if latest else None,
+                "load15": latest.load15 if latest else None,
+                "net_in_bps": latest.net_in_bps if latest else None,
+                "net_out_bps": latest.net_out_bps if latest else None,
+                "tcp_established": latest.tcp_established if latest else None,
+                "process_count": latest.process_count if latest else None,
+            },
+            # 采集失败或指标算不出来的原因,页面上要能直接看到,
+            # 不然"CPU 是 —"这件事只能靠猜
+            "error": latest.error if latest else "",
+            "cpu_pending": extra.get("cpu_pending", ""),
+            "notes": [
+                v for v in (extra.get("interface_error"), extra.get("stderr")) if v
+            ],
+        })
+
+
+class DeviceBackupViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    配置版本只读 —— 它是备份产物。写入只有一条路:定时任务或「立即备份」。
+
+    列表**不返回全文**(见 DeviceBackupSerializer),要全文用 retrieve、
+    要文件用 download、要看改了什么用 diff。
+    """
+
+    filterset_class = DeviceBackupFilter
+    ordering_fields = ["ts", "size_bytes", "line_count"]
+
+    def get_queryset(self):
+        return DeviceBackup.objects.select_related("device")
+
+    def get_serializer_class(self):
+        # 列表用不带 content 的,单条用带 content 的
+        if self.action == "retrieve":
+            return DeviceBackupDetailSerializer
+        return DeviceBackupSerializer
+
+    @action(detail=True, methods=["get"])
+    def download(self, request, pk=None):
+        """
+        原样下载。**给的是原始文本,不是清洗后的** ——
+        清洗只用于比对,下载下来的东西要能直接回灌到设备上。
+        """
+
+        from django.http import HttpResponse
+
+        version = self.get_object()
+        # 文件名里只留安全字符:设备名可能带中文、空格、斜杠,
+        # 而带斜杠的 filename 在某些浏览器上会被当成路径
+        safe_name = re.sub(r"[^\w.\-]", "_", version.device.name)[:48]
+        filename = f"{safe_name}-{timezone.localtime(version.ts):%Y%m%d-%H%M%S}-{version.short_hash}.cfg"
+        response = HttpResponse(version.content, content_type="text/plain; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    @action(detail=True, methods=["get"])
+    def diff(self, request, pk=None):
+        """
+        和另一个版本的差异。`against` 留空则和**这台设备上更早的那一个版本**比。
+
+        比对的是清洗后的文本(见 devices/backup.py 的 sanitize):
+        比原始文本的话每次 diff 的头几行都是时间戳,人要在噪声里找真改动。
+        """
+
+        from netcheck.devices import backup as backup_mod
+
+        version = self.get_object()
+        against_id = request.query_params.get("against")
+        if against_id:
+            older = DeviceBackup.objects.filter(
+                pk=against_id, device_id=version.device_id
+            ).first()
+            if older is None:
+                return Response(
+                    {"detail": "对比版本不存在,或不属于同一台设备"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # "上一个版本"按 (ts, id) 比,不只按 ts:同一秒里有两个版本时,
+            # 只比 ts 会一个都找不到(ts__lt 排除了同一秒的那个),
+            # 于是页面上显示"这是最早的版本"——而它明明不是
+            older = (
+                DeviceBackup.objects.filter(device_id=version.device_id)
+                .filter(Q(ts__lt=version.ts) | Q(ts=version.ts, pk__lt=version.pk))
+                .order_by("-ts", "-pk").first()
+            )
+        if older is None:
+            return Response({
+                "detail": "这是最早的一个版本,没有可比的上一版",
+                "lines": [], "from": None, "to": version.pk,
+            })
+
+        lines = backup_mod.unified_diff(older, version)
+        return Response({
+            "from": older.pk, "to": version.pk,
+            "from_ts": older.ts, "to_ts": version.ts,
+            "lines_added": version.lines_added, "lines_removed": version.lines_removed,
+            "lines": lines,
+        })
+
+
+class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    防火墙策略只读快照。写入只有一条路:同步任务。
+
+    **默认按设备 + 策略顺序排**,不按命中数 —— 防火墙是先匹配先生效的,
+    顺序本身是语义。要按命中数排就显式传 ordering=-hit_count。
+    """
+
+    filterset_class = FirewallPolicyFilter
+    search_fields = ["name", "comments"]
+    ordering_fields = ["seq", "policy_id", "hit_count", "bytes_count", "sessions", "last_hit_at"]
+
+    def get_queryset(self):
+        return FirewallPolicy.objects.select_related("device")
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return FirewallPolicyDetailSerializer
+        return FirewallPolicySerializer
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """
+        策略页顶部那几块数字:按设备一行。
+
+        `has_hit_stats` 是这里最重要的一个字段:**它决定"从未命中"那一列
+        能不能被当成结论**。SSH 通道同步来的策略没有命中计数,
+        那时候页面上必须说"这批数据没有命中统计",而不是显示一片 0。
+        """
+
+        devices = list(
+            Device.objects.filter(kind=DeviceKind.FIREWALL, policy_sync_enabled=True)
+            .order_by("order", "id")
+        )
+        # 一次聚合出所有设备的分布,不是每台一个查询
+        rows = (
+            FirewallPolicy.objects.filter(device__in=devices)
+            .values("device_id", "action", "enabled")
+            .annotate(count=Count("id"))
+        )
+        stats: dict[int, dict] = {}
+        for row in rows:
+            bucket = stats.setdefault(row["device_id"], {"total": 0, "accept": 0, "deny": 0, "disabled": 0})
+            bucket["total"] += row["count"]
+            if row["action"] == PolicyAction.ACCEPT:
+                bucket["accept"] += row["count"]
+            elif row["action"] == PolicyAction.DENY:
+                bucket["deny"] += row["count"]
+            if not row["enabled"]:
+                bucket["disabled"] += row["count"]
+
+        hit_rows = (
+            FirewallPolicy.objects.filter(device__in=devices)
+            .values("device_id")
+            .annotate(
+                with_stats=Count("id", filter=Q(hit_count__isnull=False)),
+                never=Count("id", filter=Q(hit_count=0)),
+            )
+        )
+        hits = {r["device_id"]: r for r in hit_rows}
+
+        payload = []
+        for device in devices:
+            bucket = stats.get(device.pk, {"total": 0, "accept": 0, "deny": 0, "disabled": 0})
+            hit = hits.get(device.pk, {"with_stats": 0, "never": 0})
+            payload.append({
+                "device_id": device.pk,
+                "device_name": device.name,
+                "mgmt_ip": device.mgmt_ip,
+                "vdom": device.api_vdom or "root",
+                "state": device.state,
+                "synced_at": device.last_policy_sync_at,
+                "error": device.last_policy_error,
+                "interval_minutes": device.policy_sync_interval_minutes,
+                **bucket,
+                "has_hit_stats": hit["with_stats"] > 0,
+                # 没有命中统计时**给 None 而不是 0** —— 0 会被读成
+                # "所有规则都命中过",而真相是我们不知道
+                "never_hit": hit["never"] if hit["with_stats"] else None,
+            })
+        return Response({"generated_at": timezone.now(), "devices": payload})
+
+
 class EventViewSet(viewsets.ReadOnlyModelViewSet):
     """
     事件只读 —— 它是采集产物。可写的只有"认领"和"备注"两个动作。
@@ -384,7 +796,7 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return Event.objects.select_related(
-            "target", "target__group", "device", "interface", "interface__device"
+            "target", "target__group", "device", "interface", "interface__device", "server"
         )
 
     @action(detail=True, methods=["post"])
@@ -447,6 +859,12 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
             .annotate(count=Count("id"))
             .order_by("-count")[:10]
         )
+        by_server = list(
+            queryset.filter(server__isnull=False)
+            .values("server_id", "server__name", "server__host")
+            .annotate(count=Count("id"))
+            .order_by("-count")[:10]
+        )
 
         resolved = queryset.filter(resolved_at__isnull=False)
         durations = list(resolved.values_list("duration_s", flat=True))
@@ -464,6 +882,7 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
             "by_severity": by_severity,
             "top_targets": by_target,
             "top_devices": by_device,
+            "top_servers": by_server,
             "duration": {
                 "total_s": sum(durations),
                 "avg_s": round(sum(durations) / len(durations)) if durations else 0,
@@ -537,6 +956,8 @@ def dashboard_overview(request):
     state_counts = dict(targets.values_list("state").annotate(c=Count("id")))
     devices = Device.objects.filter(enabled=True)
     device_state_counts = dict(devices.values_list("state").annotate(c=Count("id")))
+    servers = Server.objects.filter(enabled=True)
+    server_state_counts = dict(servers.values_list("state").annotate(c=Count("id")))
 
     # 全局可用率:所有线路累计成功次数 / 累计检测次数。
     # 用累计值而不是时间窗内重算 —— 后者要扫样本表,那是这个接口最贵的部分,
@@ -555,6 +976,7 @@ def dashboard_overview(request):
             "open": open_events.count(),
             "critical_open": open_events.filter(severity=Severity.CRITICAL).count(),
             "device_total": events.filter(source_type__in=[SourceType.DEVICE, SourceType.INTERFACE]).count(),
+            "server_total": events.filter(source_type=SourceType.SERVER).count(),
         },
         "probes": {
             "total": targets.count(),
@@ -572,6 +994,24 @@ def dashboard_overview(request):
             "down": device_state_counts.get(LinkState.DOWN, 0),
             "switches": devices.filter(kind=DeviceKind.SWITCH).count(),
             "firewalls": devices.filter(kind=DeviceKind.FIREWALL).count(),
+        },
+        "servers": {
+            "total": servers.count(),
+            "up": server_state_counts.get(LinkState.UP, 0),
+            "degraded": server_state_counts.get(LinkState.DEGRADED, 0),
+            "down": server_state_counts.get(LinkState.DOWN, 0),
+            "unknown": server_state_counts.get(LinkState.UNKNOWN, 0),
+        },
+        # 备份的健康度放在顶部统计里:**一个悄悄坏掉的备份等于没有备份**,
+        # 而这件事不会有任何症状 —— 只有主动把它显示出来才有人看见
+        "backup": {
+            "enabled": Device.objects.filter(enabled=True, backup_enabled=True).count(),
+            "failed": Device.objects.filter(
+                enabled=True, backup_enabled=True, last_backup_status=BackupStatus.FAILED
+            ).count(),
+            "never": Device.objects.filter(
+                enabled=True, backup_enabled=True, last_backup_status=BackupStatus.NEVER
+            ).count(),
         },
         # 调度健康度:overdue 长期不为 0 说明 worker 数量不够,
         # 而那时候图上的点会变稀 —— 有这个数字才不会去怀疑线路
@@ -777,6 +1217,88 @@ def dashboard_devices(request):
 
 
 @api_view(["GET"])
+def dashboard_servers(request):
+    """
+    服务器卡片:基本信息 + 流量/负载趋势,一次全给。
+
+    和 dashboard_devices 同一条原则:**一次请求带回所有服务器的时序**,
+    不是每台一个请求。几十台 × 每 30 秒会把 gunicorn 打满。
+
+    趋势里带的是画图要的四条线(CPU / 内存 / 入向 / 出向),
+    挂载点明细和进程 Top **不在这里** —— 它们只在展开某一台时才需要,
+    每台每个点都带一份的话响应会大十几倍(走 /servers/{id}/detail_info/)。
+    """
+
+    hours = min(float(request.query_params.get("hours", 3)), 168)
+    since = timezone.now() - timedelta(hours=hours)
+    servers = list(
+        Server.objects.filter(enabled=True)
+        .prefetch_related("interfaces")
+        .annotate(open_events=Count("events", filter=Q(events__resolved_at__isnull=True)))
+        .order_by("order", "id")
+    )
+    server_ids = [srv.pk for srv in servers]
+
+    trends: dict[int, list] = {srv.pk: [] for srv in servers}
+    rows = (
+        ServerSample.objects.filter(server_id__in=server_ids, ts__gte=since)
+        .order_by("ts")
+        .values("server_id", "ts", "cpu_pct", "mem_pct", "disk_pct", "load1",
+                "net_in_bps", "net_out_bps", "reachable")
+    )
+    for row in rows.iterator(chunk_size=2000):
+        trends[row["server_id"]].append({
+            "ts": row["ts"], "cpu": row["cpu_pct"], "mem": row["mem_pct"],
+            "disk": row["disk_pct"], "load1": row["load1"],
+            "net_in": row["net_in_bps"], "net_out": row["net_out_bps"],
+            "up": row["reachable"],
+        })
+
+    def card(server):
+        latest = trends[server.pk][-1] if trends[server.pk] else {}
+        primary = next((i for i in server.interfaces.all() if i.is_primary), None)
+        return {
+            "id": server.pk, "name": server.name, "host": server.host,
+            "hostname": server.hostname, "site": server.site, "role": server.role,
+            "os_name": server.os_name, "kernel": server.kernel,
+            "cpu_cores": server.cpu_cores, "mem_total_bytes": server.mem_total_bytes,
+            "state": server.state,
+            "interval": server.interval_seconds,
+            "last_collected_at": server.last_collected_at,
+            "last_error": server.last_error,
+            "open_events": server.open_events,
+            "cpu": latest.get("cpu"), "mem": latest.get("mem"),
+            "disk": latest.get("disk"), "load1": latest.get("load1"),
+            "net_in_bps": latest.get("net_in"), "net_out_bps": latest.get("net_out"),
+            "primary_interface": primary.if_name if primary else "",
+            "thresholds": {
+                "cpu_warn": server.cpu_warn_pct, "cpu_crit": server.cpu_crit_pct,
+                "mem_warn": server.mem_warn_pct, "mem_crit": server.mem_crit_pct,
+                "disk_warn": server.disk_warn_pct, "disk_crit": server.disk_crit_pct,
+                "load_warn": server.load_warn, "load_crit": server.load_crit,
+            },
+            # 每核负载 —— 绝对值没有可比性,64 核的 load 8 很闲。
+            # 前端不自己算是为了和阈值判定用同一个口径(见 servers/collector.py)
+            "load_per_core": (
+                round(latest["load1"] / server.cpu_cores, 2)
+                if latest.get("load1") is not None and server.cpu_cores else None
+            ),
+            "trend": trends[server.pk],
+        }
+
+    cards = [card(srv) for srv in servers]
+    return Response({
+        "window_hours": hours,
+        "generated_at": timezone.now(),
+        "total": len(cards),
+        "up": sum(1 for c in cards if c["state"] == LinkState.UP),
+        "degraded": sum(1 for c in cards if c["state"] == LinkState.DEGRADED),
+        "down": sum(1 for c in cards if c["state"] == LinkState.DOWN),
+        "servers": cards,
+    })
+
+
+@api_view(["GET"])
 def meta_choices(request):
     """
     所有枚举。**前端不许硬编码中文枚举标签** —— 那是两边漂移的起点。
@@ -800,6 +1322,8 @@ def meta_choices(request):
         "notifier_kind": pack(NotifierKind),
         "rollup_bucket": pack(RollupBucket),
         "notify_status": pack(NotifyLog.Status),
+        "backup_status": pack(BackupStatus),
+        "policy_action": pack(PolicyAction),
         # 顶部统计的顺序,前端照这个渲染
         "top_kinds": [
             {"value": k, "label": EventKind(k).label} for k in TOP_KINDS
@@ -833,15 +1357,29 @@ def health(request):
     ][:20]
     never_run = enabled.filter(last_checked_at=None).count()
 
+    # 服务器采集也可能悄悄停掉,判定口径和线路一致(超过 10 个周期没数据)。
+    # **这里只给计数,名字要登录后才给** —— 服务器名和主机名同样是拓扑信息,
+    # 不该在登录页上就能读到
+    servers_enabled = Server.objects.filter(enabled=True)
+    servers_stale = [
+        {"id": srv.pk, "name": srv.name, "last": srv.last_collected_at,
+         "interval": srv.interval_seconds}
+        for srv in servers_enabled.exclude(last_collected_at=None)
+        if (now - srv.last_collected_at).total_seconds() > srv.interval_seconds * 10
+    ][:20]
+
     payload = {
-        "status": "degraded" if (stale or never_run) else "ok",
+        "status": "degraded" if (stale or never_run or servers_stale) else "ok",
         "time": now,
         "probes_enabled": enabled.count(),
         "probes_never_run": never_run,
         # 计数始终给 —— 顶栏那个指示灯在登录页上也要能亮
         "probes_stale_count": len(stale),
+        "servers_enabled": servers_enabled.count(),
+        "servers_stale_count": len(servers_stale),
     }
     if request.user.is_authenticated:
         payload["probes_stale"] = stale
+        payload["servers_stale"] = servers_stale
         payload["scheduler"] = _safe_scheduler_stats()
     return Response(payload)

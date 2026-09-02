@@ -391,7 +391,16 @@ def system_info(request):
     """
 
     from netcheck import scheduler
-    from netcheck.models import Device, Event, Notifier, ProbeTarget, RetentionPolicy
+    from netcheck.models import (
+        Device,
+        DeviceBackup,
+        Event,
+        FirewallPolicy,
+        Notifier,
+        ProbeTarget,
+        RetentionPolicy,
+        Server,
+    )
 
     policy = RetentionPolicy.load()
     info: dict = {
@@ -440,8 +449,14 @@ def system_info(request):
             "probes": ProbeTarget.objects.count(),
             "probes_enabled": ProbeTarget.objects.filter(enabled=True).count(),
             "devices": Device.objects.count(),
+            "servers": Server.objects.count(),
+            "servers_enabled": Server.objects.filter(enabled=True).count(),
             "notifiers": Notifier.objects.count(),
             "events": Event.objects.count(),
+            # 配置版本是**全文**存的,一份几十 KB 到几 MB —— 它是这张表
+            # 里最占地方的东西,而"占了多少"在下面的 tables 里能看到
+            "device_backups": DeviceBackup.objects.count(),
+            "firewall_policies": FirewallPolicy.objects.count(),
             # **样本表不做 count(\*)。**Postgres 的精确计数要全表扫描,
             # 这张表上千万行时一次几秒钟,而这一页恰恰是磁盘告急时才会打开的
             "samples": _estimated_rows("netcheck_probesample"),

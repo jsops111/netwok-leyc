@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import { NButton, NButtonGroup, NSelect, NTooltip } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
@@ -162,6 +163,20 @@ const schedulerWarning = computed(() => {
           </span>
         </div>
         <div class="strip-item">
+          <span class="k">服务器</span>
+          <span class="v cy-mono">{{ overview.data.value?.servers.total ?? '—' }}</span>
+          <span class="chips">
+            <i class="chip" :style="{ '--c': STATE.up }">正常 {{ overview.data.value?.servers.up ?? 0 }}</i>
+            <i v-if="overview.data.value?.servers.degraded" class="chip" :style="{ '--c': STATE.degraded }">
+              劣化 {{ overview.data.value?.servers.degraded }}
+            </i>
+            <i v-if="overview.data.value?.servers.down" class="chip" :style="{ '--c': STATE.down }">
+              失联 {{ overview.data.value?.servers.down }}
+            </i>
+            <RouterLink to="/servers" class="chip-link">明细 →</RouterLink>
+          </span>
+        </div>
+        <div class="strip-item">
           <span class="k">事件</span>
           <span class="v cy-mono">{{ overview.data.value?.events.total ?? '—' }}</span>
           <span class="chips">
@@ -177,6 +192,16 @@ const schedulerWarning = computed(() => {
           </span>
         </div>
         <div v-if="schedulerWarning" class="sched-warn">⚠ {{ schedulerWarning }}</div>
+        <!-- **一个悄悄坏掉的备份等于没有备份**,而这件事没有任何别的症状:
+             页面照常打开、版本列表照常有内容,只是最新那个版本是三个月前的。
+             所以它必须在大屏上占一行 -->
+        <RouterLink
+          v-if="overview.data.value?.backup.failed"
+          to="/backups"
+          class="sched-warn as-link"
+        >
+          ⚠ {{ overview.data.value.backup.failed }} 台设备的配置备份失败 —— 点这里看原因
+        </RouterLink>
       </div>
     </section>
 
@@ -410,6 +435,21 @@ const schedulerWarning = computed(() => {
   border: 1px solid color-mix(in srgb, var(--c) 34%, transparent);
   background: color-mix(in srgb, var(--c) 9%, transparent);
 }
+.chip-link {
+  font-size: 10.5px;
+  color: var(--cy-cyan);
+  text-decoration: none;
+  letter-spacing: 0.04em;
+}
+.chip-link:hover { text-decoration: underline; }
+
+.sched-warn.as-link {
+  text-decoration: none;
+  display: block;
+  transition: background 0.15s ease;
+}
+.sched-warn.as-link:hover { background: rgba(var(--cy-degraded-rgb), 0.12); }
+
 .sched-warn {
   font-size: 11px;
   color: var(--cy-degraded);

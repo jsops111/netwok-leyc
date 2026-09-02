@@ -51,6 +51,9 @@ async function logout() {
 
 const NAV = [
   { to: '/', label: '监控大屏' },
+  { to: '/servers', label: '服务器' },
+  { to: '/backups', label: '配置备份' },
+  { to: '/policies', label: '防火墙策略' },
   { to: '/events', label: '事件记录' },
   { to: '/config', label: '配置中心' },
   { to: '/manage', label: '管理后台' },
@@ -79,10 +82,12 @@ const healthState = computed(() => {
   if (h.status === 'ok') return { level: 'up', text: `采集正常 · ${h.probes_enabled} 条线路` }
   const parts: string[] = []
   if (h.probes_never_run) parts.push(`${h.probes_never_run} 条从未执行`)
-  // 未登录时后端只给计数、不给线路名(线路名是网络拓扑,不该在登录页上读到),
-  // 所以这里用 count 而不是列表长度
+  // 未登录时后端只给计数、不给名字(线路名和服务器名都是网络拓扑,
+  // 不该在登录页上读到),所以这里用 count 而不是列表长度
   const stale = h.probes_stale_count ?? h.probes_stale?.length ?? 0
-  if (stale) parts.push(`${stale} 条采集停滞`)
+  if (stale) parts.push(`${stale} 条线路采集停滞`)
+  const serverStale = h.servers_stale_count ?? h.servers_stale?.length ?? 0
+  if (serverStale) parts.push(`${serverStale} 台服务器采集停滞`)
   return { level: 'degraded', text: parts.join(' · ') || '采集异常' }
 })
 
@@ -228,7 +233,15 @@ const DOT_COLORS: Record<string, string> = {
   padding-left: 24px;
 }
 
-.nav { display: flex; align-items: center; gap: 22px; margin-left: 14px; }
+/* 七个页签,窄屏上必须能换行 —— 不换行会把右边的状态栏挤出屏幕 */
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: 14px;
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
 
 .status {
   margin-left: auto;

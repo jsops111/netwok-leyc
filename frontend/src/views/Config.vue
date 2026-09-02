@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
 import {
-  NButton, NDataTable, NInput, NModal, NPopconfirm, NSelect, NSpace, NSwitch,
+  NButton, NDataTable, NModal, NPopconfirm, NSpace, NSwitch,
   NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
@@ -10,13 +10,13 @@ import StateDot from '@/components/cyber/StateDot.vue'
 import SchemaForm from '@/components/SchemaForm.vue'
 import type { FieldSpec } from '@/components/SchemaForm.vue'
 import { api, errText } from '@/api'
-import type { DeviceRow, NotifierRow, ProbeGroup, ProbeTarget } from '@/api'
+import type { DeviceRow, NotifierRow, ProbeGroup, ProbeTarget, ServerRow } from '@/api'
 import { useMetaStore } from '@/stores/meta'
-import { ago, endpoint, ms, pct, timeOf } from '@/composables/useFormat'
+import { ago, bytes, endpoint, ms, pct } from '@/composables/useFormat'
 import { STATE } from '@/theme'
 
 /**
- * 配置中心。四个 tab:监控类 / 检测线路 / 网络设备 / 通知渠道。
+ * 配置中心。五个 tab:检测线路 / 监控类 / 网络设备 / 服务器 / 通知渠道。
  *
  * 表单靠 SchemaForm 从 `fields` 数组生成 —— 手写四份表单模板的话,
  * 加一个字段要改四处而表单是最容易漏的那处(见 SchemaForm 的注释)。
@@ -36,20 +36,23 @@ const loading = ref(false)
 const groups = ref<ProbeGroup[]>([])
 const probes = ref<ProbeTarget[]>([])
 const devices = ref<DeviceRow[]>([])
+const servers = ref<ServerRow[]>([])
 const notifiers = ref<NotifierRow[]>([])
 
 async function loadAll() {
   loading.value = true
   try {
-    const [g, p, d, n] = await Promise.all([
+    const [g, p, d, s, n] = await Promise.all([
       api.groups({ page_size: 200 }),
       api.probes({ page_size: 500, ordering: 'group__order,order' }),
       api.devices({ page_size: 200, ordering: 'order' }),
+      api.servers({ page_size: 200, ordering: 'order' }),
       api.notifiers({ page_size: 100 }),
     ])
     groups.value = g.data.results
     probes.value = p.data.results
     devices.value = d.data.results
+    servers.value = s.data.results
     notifiers.value = n.data.results
   } catch (e) {
     message.error(errText(e))
@@ -64,7 +67,7 @@ onMounted(async () => {
 })
 
 // ---- 编辑弹窗 ----
-type EntityKind = 'group' | 'probe' | 'device' | 'notifier'
+type EntityKind = 'group' | 'probe' | 'device' | 'server' | 'notifier'
 const modal = ref(false)
 const editing = ref<EntityKind>('probe')
 const form = ref<Record<string, any>>({})
@@ -97,6 +100,17 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
     temp_warn_c: 55, temp_crit_c: 68, session_warn: 0, if_util_warn_pct: 80,
     fail_threshold: 2, recover_threshold: 2,
     collect_interfaces: true, enabled: true, order: 0,
+    backup_enabled: false, backup_interval_hours: 24, backup_keep: 20,
+    policy_sync_enabled: false, policy_sync_interval_minutes: 30,
+  },
+  server: {
+    name: '', host: '', ssh_port: 22, ssh_username: '', ssh_password: '',
+    ssh_private_key: '', ssh_key_passphrase: '', site: '', role: '',
+    interval_seconds: 60, timeout_ms: 8000, net_interface: '',
+    cpu_warn_pct: 80, cpu_crit_pct: 92, mem_warn_pct: 85, mem_crit_pct: 95,
+    disk_warn_pct: 80, disk_crit_pct: 90, load_warn: 1.5, load_crit: 3,
+    fail_threshold: 2, recover_threshold: 2,
+    collect_processes: true, enabled: true, order: 0,
   },
   notifier: {
     name: '', kind: 'telegram', enabled: true,
@@ -128,7 +142,7 @@ async function save() {
     for (const key of [
       'snmp_community', 'snmp_v3_auth_key', 'snmp_v3_priv_key',
       'ssh_password', 'ssh_private_key', 'ssh_enable_password',
-      'api_token', 'telegram_bot_token',
+      'ssh_key_passphrase', 'api_token', 'telegram_bot_token',
     ]) {
       if (body[key] === '' || body[key] === undefined) delete body[key]
     }
@@ -140,6 +154,8 @@ async function save() {
       isNew.value ? await api.createProbe(body) : await api.updateProbe(body.id, body)
     } else if (kind === 'device') {
       isNew.value ? await api.createDevice(body) : await api.updateDevice(body.id, body)
+    } else if (kind === 'server') {
+      isNew.value ? await api.createServer(body) : await api.updateServer(body.id, body)
     } else {
       isNew.value ? await api.createNotifier(body) : await api.updateNotifier(body.id, body)
     }
@@ -168,6 +184,7 @@ async function remove(kind: EntityKind, id: number) {
     if (kind === 'group') await api.deleteGroup(id)
     else if (kind === 'probe') await api.deleteProbe(id)
     else if (kind === 'device') await api.deleteDevice(id)
+    else if (kind === 'server') await api.deleteServer(id)
     else await api.deleteNotifier(id)
     message.success('已删除')
     await loadAll()
@@ -181,6 +198,7 @@ async function toggleEnabled(kind: EntityKind, row: any) {
     const body = { enabled: !row.enabled }
     if (kind === 'probe') await api.updateProbe(row.id, body)
     else if (kind === 'device') await api.updateDevice(row.id, body)
+    else if (kind === 'server') await api.updateServer(row.id, body)
     else if (kind === 'group') await api.updateGroup(row.id, body)
     else await api.updateNotifier(row.id, body)
     await loadAll()
@@ -232,6 +250,34 @@ async function testDevice(row: DeviceRow, method?: string) {
     }
   } catch (e) {
     testResult.value = { title: `${row.name} 测试失败`, ok: false, lines: [errText(e)] }
+  } finally {
+    testing.value = 0
+  }
+}
+
+async function testServer(row: ServerRow) {
+  testing.value = row.id
+  try {
+    const { data } = await api.testServer(row.id)
+    testResult.value = { title: `${row.name} SSH 连通性`, ok: data.ok, lines: data.detail.split(' | ') }
+  } catch (e) {
+    testResult.value = { title: `${row.name} 测试失败`, ok: false, lines: [errText(e)] }
+  } finally {
+    testing.value = 0
+  }
+}
+
+/**
+ * 测备份通道。**取一份配置回来但不存版本** —— 存的话每点一次测试就多一个
+ * 版本,而版本数有上限,连点五次就把真实的变更历史挤掉五个。
+ */
+async function testBackup(row: DeviceRow) {
+  testing.value = row.id
+  try {
+    const { data } = await api.testDeviceBackup(row.id)
+    testResult.value = { title: `${row.name} 备份通道`, ok: data.ok, lines: [data.detail] }
+  } catch (e) {
+    testResult.value = { title: `${row.name} 备份测试失败`, ok: false, lines: [errText(e)] }
   } finally {
     testing.value = 0
   }
@@ -393,6 +439,74 @@ const deviceFields: FieldSpec[] = [
   { key: 'recover_threshold', label: '连续正常关事件', type: 'number', min: 1, suffix: '次' },
   { key: 'collect_interfaces', label: '采集接口明细', type: 'switch',
     hint: '48 口设备一次要走近百个 OID;只看整机指标可以关掉' },
+
+  // ---- 配置备份 ----
+  // **和采集通道无关**:采指标可以走 SNMP,但 SNMP 拿不到配置文本。
+  // 备份走 SSH(FortiGate 有 API Token 时优先走 API 的 config/backup 端点)
+  { key: 'backup_enabled', label: '启用配置备份', type: 'switch', full: true,
+    hint: '需要 SSH 用户名 + 密码/私钥(FortiGate 也可只填 API Token)。'
+      + '和上面的采集通道无关 —— SNMP 拿不到配置文本' },
+  { key: 'backup_interval_hours', label: '备份间隔', type: 'number', min: 1, max: 8760, suffix: '小时',
+    show: (m) => m.backup_enabled,
+    hint: '配置不是时序数据,一天一次足够。改完配置想立刻留档用页面上的「立即备份」' },
+  { key: 'backup_keep', label: '保留版本数', type: 'number', min: 1, max: 500, suffix: '个',
+    show: (m) => m.backup_enabled,
+    hint: '只数「变更过的版本」—— 配置没变不会新增版本,所以 20 个够回溯很久' },
+
+  // ---- 防火墙策略 ----
+  { key: 'policy_sync_enabled', label: '同步防火墙策略', type: 'switch', full: true,
+    show: (m) => m.kind === 'firewall',
+    hint: '仅防火墙。**强烈建议配 API Token** —— 只有 REST API 拿得到命中计数,'
+      + '而「这条规则从来没命中过」是策略页面最有价值的结论' },
+  { key: 'policy_sync_interval_minutes', label: '策略同步间隔', type: 'number', min: 5, max: 1440,
+    suffix: '分钟', show: (m) => m.kind === 'firewall' && m.policy_sync_enabled,
+    hint: '策略表几百条起,一次同步要拉两个端点;5 分钟以下没有意义' },
+
+  { key: 'enabled', label: '启用', type: 'switch' },
+  { key: 'order', label: '排序', type: 'number', min: 0 },
+]
+
+const serverFields: FieldSpec[] = [
+  { key: 'name', label: '服务器名称', type: 'text', required: true, placeholder: '如:app-node-01' },
+  { key: 'host', label: '地址', type: 'text', required: true, placeholder: 'IP 或域名' },
+  { key: 'ssh_port', label: 'SSH 端口', type: 'number', min: 1, max: 65535 },
+  { key: 'ssh_username', label: 'SSH 用户名', type: 'text', required: true,
+    hint: '不需要 root —— 采集只读 /proc 和跑 df / ps' },
+  { key: 'ssh_password', label: 'SSH 密码', type: 'password',
+    hint: '密码和私钥填一个即可;编辑时留空表示不修改' },
+  { key: 'ssh_private_key', label: 'SSH 私钥', type: 'textarea', rows: 4,
+    hint: '无人值守场景更适合私钥' },
+  { key: 'ssh_key_passphrase', label: '私钥口令', type: 'password',
+    hint: '私钥带口令时填。不填而私钥有口令的话,报错会指向"密钥格式不对",很难查' },
+  { key: 'site', label: '机房位置', type: 'text' },
+  { key: 'role', label: '用途', type: 'text', placeholder: '如 应用 / 数据库 / 网关',
+    hint: '只用于展示分组' },
+
+  { key: 'interval_seconds', label: '采集频率', type: 'number', min: 15, max: 86400, suffix: '秒',
+    hint: '每次采集是一次完整的 SSH 握手,最小 15 秒' },
+  { key: 'timeout_ms', label: '超时', type: 'number', min: 1000, max: 60000, suffix: '毫秒' },
+  { key: 'net_interface', label: '流量统计网卡', type: 'text', full: true,
+    placeholder: '留空 = 自动取默认路由那块',
+    hint: '**不要指望把所有网卡加起来** —— docker0 / veth / br- 这些虚拟口会把'
+      + '同一份流量数两三遍。留空时取默认路由那块(虚拟机宿主机上常常是 br0,那是对的)' },
+
+  { key: 'cpu_warn_pct', label: 'CPU 警告线', type: 'number', min: 0, max: 100, suffix: '%' },
+  { key: 'cpu_crit_pct', label: 'CPU 严重线', type: 'number', min: 0, max: 100, suffix: '%' },
+  { key: 'mem_warn_pct', label: '内存警告线', type: 'number', min: 0, max: 100, suffix: '%',
+    hint: '按 MemAvailable 算,页缓存不算已用 —— 否则任何一台干活的 Linux 都是 90%+' },
+  { key: 'mem_crit_pct', label: '内存严重线', type: 'number', min: 0, max: 100, suffix: '%' },
+  { key: 'disk_warn_pct', label: '磁盘警告线', type: 'number', min: 0, max: 100, suffix: '%',
+    hint: '判的是**占用率最高的那个挂载点**,不是根分区' },
+  { key: 'disk_crit_pct', label: '磁盘严重线', type: 'number', min: 0, max: 100, suffix: '%' },
+  { key: 'load_warn', label: '负载警告线', type: 'number', min: 0, step: 0.1, suffix: '/核',
+    hint: '判的是 load1 ÷ 核数。1.0 = 刚好跑满。绝对值没有可比性:'
+      + '64 核的机器 load 8 很闲,2 核的 load 8 已经跑不动了' },
+  { key: 'load_crit', label: '负载严重线', type: 'number', min: 0, step: 0.1, suffix: '/核' },
+
+  { key: 'fail_threshold', label: '连续失败开事件', type: 'number', min: 1, suffix: '次' },
+  { key: 'recover_threshold', label: '连续正常关事件', type: 'number', min: 1, suffix: '次' },
+  { key: 'collect_processes', label: '采集进程 Top', type: 'switch',
+    hint: '多一条 ps 命令,换来「是谁在吃 CPU」这个答案' },
   { key: 'enabled', label: '启用', type: 'switch' },
   { key: 'order', label: '排序', type: 'number', min: 0 },
 ]
@@ -439,7 +553,10 @@ const notifierFields: FieldSpec[] = [
 ]
 
 const currentFields = computed(() => {
-  const map = { group: groupFields, probe: probeFields, device: deviceFields, notifier: notifierFields }
+  const map = {
+    group: groupFields, probe: probeFields, device: deviceFields,
+    server: serverFields, notifier: notifierFields,
+  }
   return map[editing.value]
 })
 
@@ -554,23 +671,98 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
         ? h('span', { style: 'font-size:10.5px;color:var(--cy-down)' }, '未配置') : null,
     ]) },
   { title: '接口', key: 'interface_count', width: 66, className: 'num' },
+  { title: '备份 / 策略', key: 'extras', width: 138,
+    render: (r) => h('div', { style: 'display:flex;flex-direction:column;gap:2px' }, [
+      r.backup_enabled
+        ? h('span', {
+            // 备份结果三态:成功 / 失败 / 还没跑过。**失败必须显眼** ——
+            // 一个悄悄坏掉的备份等于没有备份,而它没有任何别的症状
+            style: 'font-size:10.5px;color:'
+              + (r.last_backup_status === 'failed' ? STATE.down
+                : r.last_backup_status === 'ok' ? STATE.up : STATE.unknown),
+          }, `备份 ${meta.label('backup_status', r.last_backup_status)} · 每 ${r.backup_interval_hours}h`)
+        : h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '备份未开启'),
+      r.kind === 'firewall'
+        ? h('span', {
+            style: `font-size:10.5px;color:${r.policy_sync_enabled ? 'var(--cy-ink-2)' : 'var(--cy-ink-3)'}`,
+          }, r.policy_sync_enabled
+            ? `策略 ${r.policy_count} 条 · ${ago(r.last_policy_sync_at)}`
+            : '策略未同步')
+        : null,
+    ]) },
   { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
   { title: '最后采集', key: 'last_collected_at', width: 96,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('device', r) }) },
-  { title: '操作', key: 'act', width: 208, fixed: 'right',
+  { title: '操作', key: 'act', width: 274, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testDevice(r) }, () => '测主通道'),
       r.fallback_method
         ? h(NButton, { size: 'tiny', ghost: true, onClick: () => testDevice(r, r.fallback_method) }, () => '测降级')
         : null,
+      r.backup_enabled
+        ? h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
+            onClick: () => testBackup(r) }, () => '测备份')
+        : null,
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('device', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('device', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
         default: () => '确认删除?接口和历史样本会一起删掉',
+      }),
+    ]) },
+]
+
+const serverColumns: DataTableColumns<ServerRow> = [
+  { title: '状态', key: 'state', width: 78,
+    render: (r) => h(StateDot, { state: r.state, label: true }) },
+  { title: '服务器', key: 'name', minWidth: 168,
+    render: (r) => h('div', [
+      h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
+      h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
+        `${r.host}:${r.ssh_port} · ${r.ssh_username}`),
+    ]) },
+  { title: '系统', key: 'os_name', minWidth: 168,
+    render: (r) => h('div', [
+      // 这几项是**首次采集后自动回填**的,新建时是空的 —— 显示"待采集"
+      // 而不是空白,否则看着像采集出了问题
+      h('div', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.os_name || '待采集'),
+      h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
+        [r.kernel, r.cpu_cores ? `${r.cpu_cores} 核` : '',
+         r.mem_total_bytes ? bytes(r.mem_total_bytes) : ''].filter(Boolean).join(' · ') || '—'),
+    ]) },
+  { title: '凭据', key: 'creds', width: 82,
+    render: (r) => r.has_credential
+      ? h(NTag, { size: 'tiny', bordered: false }, () => (r.uses_key ? '私钥' : '密码'))
+      : h('span', { style: `font-size:10.5px;color:${STATE.down}` }, '未配置'),
+  },
+  { title: '网卡', key: 'primary_interface', width: 108,
+    render: (r) => h('div', [
+      h('div', { style: "font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)" },
+        r.primary_interface || r.net_interface || '自动'),
+      h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, `共 ${r.interface_count} 块`),
+    ]) },
+  { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
+    render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
+  { title: '阈值', key: 'thresholds', width: 176,
+    render: (r) => h('span', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
+      `CPU ${r.cpu_warn_pct}/${r.cpu_crit_pct}% · 内存 ${r.mem_warn_pct}/${r.mem_crit_pct}%`
+      + ` · 盘 ${r.disk_warn_pct}/${r.disk_crit_pct}% · 载 ${r.load_warn}/${r.load_crit}`) },
+  { title: '最后采集', key: 'last_collected_at', width: 96,
+    render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
+  { title: '启用', key: 'enabled', width: 66,
+    render: (r) => h(NSwitch, { value: r.enabled, size: 'small',
+      onUpdateValue: () => toggleEnabled('server', r) }) },
+  { title: '操作', key: 'act', width: 172, fixed: 'right',
+    render: (r) => h(NSpace, { size: 4 }, () => [
+      h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
+        onClick: () => testServer(r) }, () => '测试'),
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('server', r) }, () => '编辑'),
+      h(NPopconfirm, { onPositiveClick: () => remove('server', r.id) }, {
+        trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
+        default: () => '删除后历史样本和事件也会一起删掉,确认?',
       }),
     ]) },
 ]
@@ -617,7 +809,8 @@ const notifierColumns: DataTableColumns<NotifierRow> = [
 ]
 
 const MODAL_TITLES: Record<EntityKind, string> = {
-  group: '监控类', probe: '检测线路', device: '网络设备', notifier: '通知渠道',
+  group: '监控类', probe: '检测线路', device: '网络设备',
+  server: '服务器', notifier: '通知渠道',
 }
 
 /** 当前编辑的设备型号画像说明 —— 让人知道这款型号能采到什么。 */
@@ -682,6 +875,31 @@ const profileNote = computed(() => {
           <div v-if="!devices.length && !loading" class="cy-empty">
             还没有设备。在册型号:C9300-48T / C9300-24T / C9200L-24T-4G / FortiGate-401F,
             不在册的选「通用」画像也能采到通断、接口流量和运行时长。
+          </div>
+        </CyberPanel>
+      </NTabPane>
+
+      <!-- ============ 服务器 ============ -->
+      <NTabPane name="servers" tab="服务器">
+        <CyberPanel
+          title="服务器"
+          :subtitle="`${servers.length} 台 · 通过 SSH 采集,不装 agent`"
+          flush
+        >
+          <template #actions>
+            <NButton size="small" type="primary" ghost @click="openEdit('server')">新建服务器</NButton>
+            <NButton size="small" ghost :loading="loading" @click="loadAll()">刷新</NButton>
+          </template>
+          <NDataTable
+            :columns="serverColumns" :data="servers" :loading="loading"
+            size="small" :bordered="false" :single-line="false" :scroll-x="1290"
+            :pagination="{ pageSize: 20 }"
+          />
+          <div v-if="!servers.length && !loading" class="cy-empty">
+            还没有服务器。只要一个能登录的 SSH 账号就行,<b>不用在机器上装任何东西</b>
+            —— 采集读的是 <code>/proc</code> 和 <code>df</code>,不解析 top/free 的输出
+            (那些格式随发行版和 locale 变)。<br>
+            <b>只支持 Linux / 类 Unix。</b>Windows 要走 WinRM,那是另一条通道,这里没有实现。
           </div>
         </CyberPanel>
       </NTabPane>

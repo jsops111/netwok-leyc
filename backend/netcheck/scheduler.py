@@ -12,6 +12,10 @@ tick 查 Redis 里的"下次该跑的时间"表,把到期的目标派发给 work
 Redis 用 ZSET:member 是目标 id,score 是下次该跑的 unix 时间戳。
 取到期项就是一次 ZRANGEBYSCORE —— 无论多少条线路都是一次查询。
 
+调度五类东西(见 _ZSETS):拨测线路、网络设备、服务器、配置备份、策略同步。
+后两类的周期是小时/分钟级,但机制完全一样 —— 每台设备自己的间隔用
+crontab 表达不出来,而"每台一个 beat 条目"正是这个文件一开始要避免的东西。
+
 **不追赶。**如果 worker 堵了三十秒,到期的目标只跑一次,不会为了补上
 错过的三十拍连发三十次 —— 那只会把 worker 彻底打死,而且补出来的数据点
 时间戳全是"现在",在图上是一根垂直线,没有意义。
@@ -27,8 +31,21 @@ from django.conf import settings
 
 log = logging.getLogger("netcheck.scheduler")
 
-_ZSET_PROBE = "netcheck:sched:probe"
-_ZSET_DEVICE = "netcheck:sched:device"
+# 每一类被调度的东西一张到期表。**加一类要在这里补一行** ——
+# 拿不认识的 kind 去查会抛 KeyError,那比静默共用一张表好:
+# 共用的话两类的 id 会互相覆盖(线路 3 和服务器 3 是同一个 member)。
+_ZSETS = {
+    "probe": "netcheck:sched:probe",
+    "device": "netcheck:sched:device",
+    "server": "netcheck:sched:server",
+    # 配置备份和策略同步也走同一套到期表。它们的周期是**小时/分钟级**,
+    # 和采集不是一个量级,但机制完全一样:一张 ZSET + 一次 ZRANGEBYSCORE。
+    # 单独做一套定时器(或者塞进 beat 的 crontab)只会多一处要维护的东西,
+    # 而且 crontab 表达不出"每台设备自己的间隔"
+    "backup": "netcheck:sched:backup",
+    "policy": "netcheck:sched:policy",
+}
+
 # 正在执行的目标,防止上一拍还没跑完就又派一次(慢线路 + 高频率的组合)。
 # 值是开始时间,用来清理僵尸锁。
 _HASH_INFLIGHT = "netcheck:sched:inflight"
@@ -44,7 +61,13 @@ def _client() -> redis.Redis:
 
 
 def _zset(kind: str) -> str:
-    return _ZSET_PROBE if kind == "probe" else _ZSET_DEVICE
+    try:
+        return _ZSETS[kind]
+    except KeyError:
+        raise ValueError(
+            f"未知的调度类别 {kind!r},可用:{sorted(_ZSETS)}。"
+            "加一类要在 scheduler._ZSETS 里补一行"
+        ) from None
 
 
 def take_due(kind: str, limit: int = 500) -> list[int]:
@@ -159,12 +182,14 @@ def stats() -> dict:
     client = _client()
     now = time.time()
     out = {}
-    for kind in ("probe", "device"):
-        key = _zset(kind)
+    for kind, key in _ZSETS.items():
+        # 迟到的判定按类别分开:拨测迟到 3 秒就该说话(它可能是每秒一拍),
+        # 而备份是小时级的,迟到 3 秒毫无意义 —— 用同一个阈值会让
+        # 「调度健康度」上永远挂着几条备份"迟到",把真正的告警淹掉
+        grace = 3 if kind in ("probe", "device", "server") else 300
         out[kind] = {
             "scheduled": client.zcard(key),
-            # 迟到 3 秒以上的:worker 跟不上了
-            "overdue": client.zcount(key, "-inf", now - 3),
+            "overdue": client.zcount(key, "-inf", now - grace),
         }
     out["inflight"] = client.hlen(_HASH_INFLIGHT)
     return out

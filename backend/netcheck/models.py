@@ -1,11 +1,14 @@
 """
 network-check 数据模型。
 
-分四组:
+分六组:
 
     线路拨测   ProbeGroup → ProbeTarget → ProbeSample(原始秒级) → ProbeRollup(降采样)
     设备采集   Device → DeviceSample / DeviceInterface → InterfaceSample
-    事件       Event —— 拨测和设备共用一张事件表,靠 source_type 区分
+    服务器采集 Server → ServerSample / ServerInterface(只走 SSH,不装 agent)
+    配置备份   Device → DeviceBackup(**一行一个配置版本**,不是一行一次备份)
+    防火墙策略 Device → FirewallPolicy(只读快照,全量替换式同步)
+    事件       Event —— 拨测/设备/服务器共用一张事件表,靠 source_type 区分
     通知       Notifier → NotifyLog
 
 时序数据的取舍(见 CLAUDE.md「时序存储」):原始秒级点只保留
@@ -76,12 +79,21 @@ class EventKind(models.TextChoices):
     HA_CHANGE = "ha_change", "HA 状态切换"
     SESSION_HIGH = "session_high", "会话数过高"
     PSU_FAULT = "psu_fault", "电源异常"
+    # 服务器侧(SSH 采集)
+    SERVER_DOWN = "server_down", "服务器失联"
+    DISK_HIGH = "disk_high", "磁盘空间不足"
+    LOAD_HIGH = "load_high", "负载过高"
+    # 配置备份 —— 这两个是**瞬时事件**,不走连续次数的开/关流程,
+    # 见 events/engine.py 的 record_point_event()
+    BACKUP_FAILED = "backup_failed", "配置备份失败"
+    CONFIG_CHANGED = "config_changed", "配置发生变更"
 
 
 class SourceType(models.TextChoices):
     PROBE = "probe", "线路拨测"
     DEVICE = "device", "设备"
     INTERFACE = "interface", "设备接口"
+    SERVER = "server", "服务器"
 
 
 class DeviceKind(models.TextChoices):
@@ -146,6 +158,27 @@ class RollupBucket(models.TextChoices):
 class NotifierKind(models.TextChoices):
     TELEGRAM = "telegram", "Telegram"
     WEBHOOK = "webhook", "Webhook"
+
+
+class BackupStatus(models.TextChoices):
+    """一次配置备份的结果。NEVER 是"还没备过",和"备份失败"要分得开。"""
+
+    NEVER = "never", "从未备份"
+    OK = "ok", "成功"
+    FAILED = "failed", "失败"
+
+
+class PolicyAction(models.TextChoices):
+    """
+    防火墙策略动作。**归一化过**:FortiOS 的 deny 和某些型号报的 drop
+    是同一件事,页面上不该出现两个看着不一样的"拒绝"。认不出的落到 OTHER,
+    原始字符串留在 raw 里 —— 不认识的动作宁可显示"其它"也不要猜成"允许"。
+    """
+
+    ACCEPT = "accept", "允许"
+    DENY = "deny", "拒绝"
+    IPSEC = "ipsec", "IPsec"
+    OTHER = "other", "其它"
 
 
 # =========================================================================
@@ -486,6 +519,47 @@ class Device(BaseModel):
         "接口带宽警告线(%)", default=80, help_text="出/入方向任一超过即记饱和事件"
     )
 
+    # ---- 配置备份 ----
+    # 备份**不走 collect_method**:采指标可以用 SNMP,但 SNMP 拿不到配置文本。
+    # 备份通道是 SSH(Cisco `show running-config` / FortiOS `show`),
+    # FortiGate 配了 API token 时优先走 API 的 config/backup 端点(拿到的是
+    # 可直接回灌的备份文件,CLI 输出不是)。见 devices/backup.py。
+    backup_enabled = models.BooleanField(
+        "启用配置备份", default=False,
+        help_text="需要 SSH 凭据(FortiGate 也可用 API Token)。型号画像里没定义备份命令的型号开了也备不了",
+    )
+    backup_interval_hours = models.IntegerField(
+        "备份间隔(小时)", default=24,
+        validators=[MinValueValidator(1), MaxValueValidator(8760)],
+        help_text="配置不是时序数据,一天一次足够。改配置后想立刻留档用页面上的「立即备份」",
+    )
+    backup_keep = models.IntegerField(
+        "保留版本数", default=20, validators=[MinValueValidator(1), MaxValueValidator(500)],
+        help_text="**只数「变更过的版本」**:配置没变不会新增版本,所以 20 个版本通常够回溯很久",
+    )
+    last_backup_at = models.DateTimeField("最后备份时间", null=True, blank=True)
+    last_backup_status = models.CharField(
+        "最后备份结果", max_length=8, choices=BackupStatus.choices, default=BackupStatus.NEVER
+    )
+    last_backup_error = models.CharField("最后备份错误", max_length=255, blank=True)
+
+    # ---- 防火墙策略同步 ----
+    # 只对 kind=firewall 有意义。同步是**全量替换**:设备上删掉的策略
+    # 在这边也要消失,否则页面上会留着一条现实中已经不存在的规则 ——
+    # 那比没有这个页面更危险。
+    policy_sync_enabled = models.BooleanField(
+        "同步防火墙策略", default=False,
+        help_text="仅防火墙。FortiGate 走 API(带命中计数)或 SSH(只有配置,没有命中数)",
+    )
+    policy_sync_interval_minutes = models.IntegerField(
+        "策略同步间隔(分钟)", default=30,
+        validators=[MinValueValidator(5), MaxValueValidator(1440)],
+        help_text="策略表几百条起,一次同步要拉两个端点;5 分钟以下没有意义",
+    )
+    last_policy_sync_at = models.DateTimeField("最后策略同步时间", null=True, blank=True)
+    last_policy_error = models.CharField("最后策略同步错误", max_length=255, blank=True)
+    policy_count = models.IntegerField("策略条数", default=0)
+
     fail_threshold = models.IntegerField("连续失败次数开事件", default=2, validators=[MinValueValidator(1)])
     recover_threshold = models.IntegerField("连续正常次数关事件", default=2, validators=[MinValueValidator(1)])
 
@@ -544,6 +618,43 @@ class Device(BaseModel):
                 errors["api_token"] = "API 采集必须填 Token"
             if self.vendor != Vendor.FORTINET:
                 errors["collect_method"] = "REST API 通道目前只实现了 FortiGate(FortiOS)"
+
+        # 备份和策略同步**不看 collect_method** —— 它们各有自己的通道要求:
+        # 一台 SNMP 采指标的交换机想备份配置,仍然要 SSH 凭据(SNMP 拿不到配置)。
+        # 不在这里拦住的话,开关能打开、任务每天跑一次、每次都失败,
+        # 而人要到「配置备份」页面上才看得见。
+        has_ssh = bool(self.ssh_username and (self.ssh_password or self.ssh_private_key))
+        has_api = bool(self.api_token and self.vendor == Vendor.FORTINET)
+        if self.backup_enabled:
+            if not (has_ssh or has_api):
+                errors["backup_enabled"] = (
+                    "配置备份需要 SSH 用户名 + 密码/私钥(FortiGate 也可只填 API Token)"
+                    " —— SNMP 拿不到配置文本"
+                )
+            else:
+                # 型号画像里没有备份命令 = 这款型号不支持备份。**在这里拦住**,
+                # 否则开关能打开、任务每天跑一次、每次都失败,而人要到
+                # 「配置备份」页面上才看得见
+                from netcheck.devices.profiles import get_profile
+
+                profile = get_profile(self.model, self.vendor)
+                if not profile.backup_cli and not has_api:
+                    errors["backup_enabled"] = (
+                        f"型号「{self.get_model_display()}」的采集画像里没有定义备份命令,"
+                        "开了也备不了。选一个在册型号,或在 devices/profiles.py 里"
+                        "给这款型号补一条 backup_cli"
+                    )
+        if self.policy_sync_enabled:
+            if self.kind != DeviceKind.FIREWALL:
+                errors["policy_sync_enabled"] = "策略同步只对防火墙有意义"
+            elif self.vendor != Vendor.FORTINET:
+                errors["policy_sync_enabled"] = (
+                    "策略同步目前只实现了 FortiGate(FortiOS)。"
+                    "加别的厂商在 devices/policies.py 里补一个解析器"
+                )
+            elif not (has_api or has_ssh):
+                errors["policy_sync_enabled"] = "策略同步需要 API Token(推荐,带命中计数)或 SSH 凭据"
+
         if errors:
             raise ValidationError(errors)
 
@@ -670,6 +781,401 @@ class InterfaceSample(models.Model):
 
 
 # =========================================================================
+# 服务器采集(SSH,端口 22)
+# =========================================================================
+
+
+class Server(BaseModel):
+    """
+    一台被监控的服务器。**只走 SSH**,不装 agent。
+
+    为什么不装 agent:这个平台的定位是"从外面看",加装 agent 意味着要为
+    每台机器做安装、升级、防火墙放行三件事,而 SSH 是这些机器本来就开着的
+    唯一入口。代价是采集频率不能太高(每次一个 SSH 握手),所以最小 15 秒。
+
+    **只支持 Linux / 类 Unix。**采集全部读 `/proc` 和 `df`,不解析 `top`
+    的输出 —— `top` 的格式随发行版和 locale 变,而 `/proc` 的格式是内核 ABI,
+    十年没变过。Windows 要走 WinRM,那是另一条通道,这里没有实现。
+
+    CPU 使用率是**两次采集之间的平均值**(靠 /proc/stat 的 jiffies 差值),
+    不是某一瞬间的值:
+      - 瞬时值要在设备上 sleep 1 秒再读一次,每次采集多挂一秒
+      - 而且瞬时值在趋势图上噪声很大,和 load 对不上
+    代价是**刚加进来的第一拍没有 CPU 数据**(没有上一次的计数器可减),
+    第二拍开始才有。这是有意的,不要填 0 —— 0 是"CPU 空闲"的意思。
+    """
+
+    name = models.CharField("服务器名称", max_length=128, unique=True)
+    host = models.CharField("地址", max_length=255, help_text="IP 或域名")
+    ssh_port = models.IntegerField(
+        "SSH 端口", default=22, validators=[MinValueValidator(1), MaxValueValidator(65535)]
+    )
+    ssh_username = models.CharField("SSH 用户名", max_length=64)
+    ssh_password = EncryptedTextField("SSH 密码", blank=True, default="")
+    ssh_private_key = EncryptedTextField(
+        "SSH 私钥", blank=True, default="", help_text="和密码填一个即可;私钥更适合无人值守"
+    )
+    ssh_key_passphrase = EncryptedTextField(
+        "私钥口令", blank=True, default="", help_text="私钥带口令时填"
+    )
+    site = models.CharField("机房/位置", max_length=64, blank=True)
+    role = models.CharField(
+        "用途", max_length=64, blank=True, help_text="如 应用 / 数据库 / 网关。只用于展示分组"
+    )
+
+    interval_seconds = models.IntegerField(
+        "采集频率(秒)",
+        default=60,
+        validators=[MinValueValidator(15), MaxValueValidator(86400)],
+        help_text="每次采集是一次完整的 SSH 握手 + 一批 /proc 读取,最小 15 秒",
+    )
+    timeout_ms = models.IntegerField(
+        "超时(毫秒)", default=8000, validators=[MinValueValidator(1000), MaxValueValidator(60000)]
+    )
+    net_interface = models.CharField(
+        "流量统计网卡",
+        max_length=32,
+        blank=True,
+        help_text=(
+            "留空 = 自动取默认路由那块网卡。**不要把所有网卡加起来** —— "
+            "docker0 / veth / br- 这些虚拟口会把同一份流量数两三遍"
+        ),
+    )
+
+    # ---- 阈值 ----
+    cpu_warn_pct = models.IntegerField("CPU 警告线(%)", default=80)
+    cpu_crit_pct = models.IntegerField("CPU 严重线(%)", default=92)
+    mem_warn_pct = models.IntegerField("内存警告线(%)", default=85)
+    mem_crit_pct = models.IntegerField("内存严重线(%)", default=95)
+    disk_warn_pct = models.IntegerField(
+        "磁盘警告线(%)", default=80, help_text="按**占用率最高的那个挂载点**判,不是根分区"
+    )
+    disk_crit_pct = models.IntegerField("磁盘严重线(%)", default=90)
+    # 负载按**每核**判。绝对值没有可比性:一台 64 核的机器 load 8 很闲,
+    # 一台 2 核的 load 8 已经跑不动了 —— 用同一个绝对阈值必然错一边。
+    load_warn = models.FloatField(
+        "负载警告线(每核)", default=1.5, help_text="判的是 load1 ÷ 核数。1.0 = 刚好跑满"
+    )
+    load_crit = models.FloatField("负载严重线(每核)", default=3.0)
+
+    fail_threshold = models.IntegerField("连续失败次数开事件", default=2, validators=[MinValueValidator(1)])
+    recover_threshold = models.IntegerField("连续正常次数关事件", default=2, validators=[MinValueValidator(1)])
+
+    collect_processes = models.BooleanField(
+        "采集进程 Top", default=True, help_text="多一条 ps 命令,换来「是谁在吃 CPU」这个答案"
+    )
+    enabled = models.BooleanField("启用", default=True, db_index=True)
+    order = models.IntegerField("排序", default=0)
+
+    # ---- 运行时状态(采集器回写) ----
+    state = models.CharField(
+        "当前状态", max_length=12, choices=LinkState.choices, default=LinkState.UNKNOWN, db_index=True
+    )
+    last_collected_at = models.DateTimeField("最后采集时间", null=True, blank=True)
+    last_error = models.CharField("最后错误", max_length=255, blank=True)
+    consecutive_fail = models.IntegerField("连续失败次数", default=0)
+    consecutive_ok = models.IntegerField("连续正常次数", default=0)
+    # 首次采集回填,不用手填
+    hostname = models.CharField("主机名", max_length=128, blank=True)
+    os_name = models.CharField("操作系统", max_length=128, blank=True)
+    kernel = models.CharField("内核版本", max_length=64, blank=True)
+    cpu_cores = models.IntegerField("CPU 核数", null=True, blank=True)
+    mem_total_bytes = models.BigIntegerField("内存总量(字节)", null=True, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "服务器"
+        ordering = ["order", "id"]
+        indexes = [models.Index(fields=["enabled", "state"])]
+        constraints = [
+            # 同一个地址 + 端口只允许一台 —— 重复添加会让同一台机器被采两遍,
+            # 图上是两条一模一样的线,而且事件也会开两条
+            models.UniqueConstraint(fields=["host", "ssh_port"], name="uniq_server_endpoint"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name}({self.host})"
+
+    def clean(self):
+        """
+        跨字段校验。**镜像在 ServerSerializer.validate() 里,两边一起改**
+        —— DRF 不调用 full_clean()。
+        """
+
+        from django.core.exceptions import ValidationError
+
+        errors = {}
+        if not self.ssh_password and not self.ssh_private_key:
+            errors["ssh_password"] = "SSH 采集需要密码或私钥"
+        for warn_field, crit_field, label in (
+            ("cpu_warn_pct", "cpu_crit_pct", "CPU"),
+            ("mem_warn_pct", "mem_crit_pct", "内存"),
+            ("disk_warn_pct", "disk_crit_pct", "磁盘"),
+            ("load_warn", "load_crit", "负载"),
+        ):
+            warn, crit = getattr(self, warn_field), getattr(self, crit_field)
+            if crit and warn and warn > crit:
+                errors[warn_field] = f"{label}警告线不能高于严重线"
+        if errors:
+            raise ValidationError(errors)
+
+
+class ServerSample(models.Model):
+    """
+    一台服务器一次采集的结果。
+
+    和 DeviceSample 一样是**原始点直接存,不做降采样** —— 服务器采集频率
+    最快 15 秒,一天最多 5760 行,和秒级拨测不是一个量级。代价是能看的
+    历史跨度受原始样本保留期(默认 48 小时)约束,要看更久得先调大它。
+
+    `net_in_bps` / `net_out_bps` 只统计**一块网卡**(Server.net_interface,
+    留空则默认路由那块)。把所有网卡加起来会把同一份流量数好几遍:
+    容器机上 eth0 的包会同时出现在 docker0 和一堆 veth 上。
+    """
+
+    server = models.ForeignKey(
+        Server, on_delete=models.CASCADE, related_name="samples", verbose_name="服务器"
+    )
+    ts = models.DateTimeField("采样时间", db_index=True)
+    reachable = models.BooleanField("可达", default=True)
+    latency_ms = models.FloatField("采集耗时(ms)", null=True, blank=True)
+
+    cpu_pct = models.FloatField("CPU 使用率(%)", null=True, blank=True)
+    cpu_iowait_pct = models.FloatField(
+        "iowait(%)", null=True, blank=True,
+        help_text="CPU 不高但系统很卡时看它 —— 那是在等磁盘,不是在算",
+    )
+    mem_pct = models.FloatField("内存使用率(%)", null=True, blank=True)
+    swap_pct = models.FloatField("Swap 使用率(%)", null=True, blank=True)
+    disk_pct = models.FloatField(
+        "磁盘使用率(%)", null=True, blank=True, help_text="占用率最高的那个挂载点"
+    )
+    load1 = models.FloatField("1 分钟负载", null=True, blank=True)
+    load5 = models.FloatField("5 分钟负载", null=True, blank=True)
+    load15 = models.FloatField("15 分钟负载", null=True, blank=True)
+    uptime_s = models.BigIntegerField("运行时长(秒)", null=True, blank=True)
+    process_count = models.IntegerField("进程数", null=True, blank=True)
+    tcp_established = models.IntegerField("ESTABLISHED 连接数", null=True, blank=True)
+
+    net_in_bps = models.FloatField("入向速率(bps)", null=True, blank=True)
+    net_out_bps = models.FloatField("出向速率(bps)", null=True, blank=True)
+
+    # 挂载点明细、进程 Top、网卡明细都在这里 —— 它们是"一次一个形状"的东西,
+    # 拆成列意味着挂载点多一个就要改表
+    extra = models.JSONField("其它指标", default=dict, blank=True)
+    error = models.CharField("错误信息", max_length=255, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "服务器样本"
+        ordering = ["-ts"]
+        indexes = [models.Index(fields=["server", "-ts"], name="idx_srvsample_ts")]
+
+    def __str__(self) -> str:
+        return f"{self.server_id}@{self.ts:%H:%M:%S}"
+
+
+class ServerInterface(BaseModel):
+    """
+    服务器的一块网卡,**当前状态表**(每台每块一行,原地更新)。
+
+    历史流量不在这里 —— 那在 ServerSample 的 net_in_bps / net_out_bps 里,
+    只统计主网卡。这里存的是"这台机器上有哪些网卡、现在各跑多少",
+    给服务器详情页的网卡列表用。为每块网卡都存一张时序表的话,
+    一台容器宿主机能有几十个 veth,那张表会比拨测样本还大。
+
+    上一次的字节计数器存在 meta 里(和 DeviceInterface 同一套做法),
+    速率由差值算,计数器回绕/重启时丢弃这一拍(不取绝对值,见 _rate)。
+    """
+
+    server = models.ForeignKey(
+        Server, on_delete=models.CASCADE, related_name="interfaces", verbose_name="服务器"
+    )
+    if_name = models.CharField("网卡名", max_length=32)
+    is_primary = models.BooleanField(
+        "主网卡", default=False, help_text="默认路由走的那块,ServerSample 的流量统计用它"
+    )
+    is_virtual = models.BooleanField(
+        "虚拟口", default=False,
+        help_text="docker0 / veth* / br-* / lo 之类。**不计入总流量**,否则同一份流量被数几遍",
+    )
+    in_bps = models.FloatField("入向速率(bps)", null=True, blank=True)
+    out_bps = models.FloatField("出向速率(bps)", null=True, blank=True)
+    in_err_delta = models.BigIntegerField("入向错包增量", null=True, blank=True)
+    out_err_delta = models.BigIntegerField("出向错包增量", null=True, blank=True)
+    in_octets = models.BigIntegerField("入向字节计数", null=True, blank=True)
+    out_octets = models.BigIntegerField("出向字节计数", null=True, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "服务器网卡"
+        ordering = ["server_id", "-is_primary", "if_name"]
+        constraints = [
+            models.UniqueConstraint(fields=["server", "if_name"], name="uniq_server_ifname")
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.server_id}:{self.if_name}"
+
+
+# =========================================================================
+# 设备配置备份
+# =========================================================================
+
+
+class DeviceBackup(models.Model):
+    """
+    一个**配置版本**,不是一次备份动作。
+
+    这个区别是整张表的设计要点:交换机的配置一年可能只改三次,而备份一天
+    跑一次 —— 按"每次备份一行"存,一年三百多行里只有三行是有信息的,
+    而且想回答"这台设备的配置什么时候被改过"要自己去比对相邻行。
+
+    所以:**配置文本和上一版一样时不新增行**,只把最新那行的
+    `last_seen_at` 往后推、`seen_count` 加一。于是这张表天然就是一份
+    变更历史,行数 = 真实变更次数。
+
+    比对用的是**清洗过**的文本(sanitize):Cisco 的
+    `! Last configuration change ...` 和 FortiOS 的 `#conf_file_ver=` 每次
+    导出都不一样,不去掉的话每次备份都"变更过",这张表就退化成一天一行,
+    而且变更历史全是噪声。**存的是原始文本**(下载要能直接回灌),
+    只有哈希和 diff 走清洗后的版本。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="backups", verbose_name="设备"
+    )
+    ts = models.DateTimeField("首次出现时间", db_index=True, help_text="这个版本第一次被备份到的时间")
+    last_seen_at = models.DateTimeField("最后确认时间", help_text="最近一次备份确认配置仍是这个版本的时间")
+    seen_count = models.IntegerField("确认次数", default=1)
+
+    method = models.CharField("备份通道", max_length=8, help_text="ssh / api")
+    content = models.TextField("配置文本", blank=True)
+    size_bytes = models.IntegerField("字节数", default=0)
+    line_count = models.IntegerField("行数", default=0)
+    # 清洗后文本的 sha256。**唯一键的一半** —— 判"配置变了没有"就看它
+    content_hash = models.CharField("内容哈希", max_length=64, db_index=True)
+
+    # 和上一个版本相比增删了多少行。页面上"这次改了什么"先看这两个数字,
+    # 要看细节再点 diff —— 存下来是因为算 diff 要把两份全文都读出来,
+    # 列表页不该为了显示"+3 -1"去读两份几 MB 的文本
+    lines_added = models.IntegerField("新增行数", null=True, blank=True)
+    lines_removed = models.IntegerField("删除行数", null=True, blank=True)
+    is_first = models.BooleanField("首个版本", default=False)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "配置备份"
+        # **按 (ts, id) 排,不只按 ts。**同一秒里出现两个版本时,只按 ts
+        # 排序的结果是不确定的 —— 而"上一个版本是哪个"直接决定 diff 给出
+        # 的是什么,拿到一个随机的顺序会让 diff 时正时反
+        ordering = ["-ts", "-id"]
+        indexes = [models.Index(fields=["device", "-ts"], name="idx_backup_device_ts")]
+
+    def __str__(self) -> str:
+        return f"{self.device_id}@{self.ts:%Y-%m-%d %H:%M} ({self.content_hash[:8]})"
+
+    @property
+    def short_hash(self) -> str:
+        return self.content_hash[:12]
+
+
+# =========================================================================
+# 防火墙策略(只读快照)
+# =========================================================================
+
+
+class FirewallPolicy(models.Model):
+    """
+    防火墙上的一条策略,**快照**。
+
+    为什么存快照而不是每次打开页面去设备上现拉:
+
+      1. 现拉一次要 2~5 秒(FortiGate 上策略表几百条 + 命中计数是第二个端点),
+         而这个页面是要被翻、被筛、被排序的
+      2. 设备连不上的时候页面要**还能看**,只是标明"数据截止于什么时候" ——
+         防火墙不通恰恰是最需要查规则的时候
+
+    同步是**全量替换**(在一个事务里删掉旧的写入新的):设备上被删掉的策略
+    必须在这边也消失。留着一条现实中已经不存在的规则比没有这个页面更危险
+    —— 有人会照着它去判断"这个访问是被允许的"。
+
+    `hit_count` / `bytes` 只有 API 通道拿得到(FortiOS 的 monitor 端点);
+    SSH 通道只能拿到配置,命中计数是 null。**null 不要显示成 0** ——
+    "这条规则从没命中过"和"我们不知道它有没有命中"是两个结论,
+    前者可以拿去删规则,后者不行。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="policies", verbose_name="设备"
+    )
+    vdom = models.CharField("VDOM", max_length=64, blank=True, default="root")
+    policy_id = models.IntegerField("策略 ID", help_text="设备上的 policyid,不是这张表的主键")
+    seq = models.IntegerField(
+        "顺序", default=0,
+        help_text="策略表里的先后。**防火墙是先匹配先生效的**,顺序本身是语义",
+    )
+    name = models.CharField("名称", max_length=128, blank=True)
+
+    # 地址/接口/服务都是"一条策略可以有多个"的,存成 JSON 数组。
+    # 拆成关联表的话,页面上要展示一条策略得做四次 join,而这些值来自设备、
+    # 不参与本地的引用完整性
+    src_intf = models.JSONField("源接口", default=list, blank=True)
+    dst_intf = models.JSONField("目的接口", default=list, blank=True)
+    src_addr = models.JSONField("源地址", default=list, blank=True)
+    dst_addr = models.JSONField("目的地址", default=list, blank=True)
+    service = models.JSONField("服务", default=list, blank=True)
+    schedule = models.CharField("生效时间", max_length=64, blank=True)
+
+    action = models.CharField(
+        "动作", max_length=10, choices=PolicyAction.choices, default=PolicyAction.OTHER
+    )
+    enabled = models.BooleanField("已启用", default=True)
+    nat = models.BooleanField("NAT", default=False)
+    log_traffic = models.CharField("日志", max_length=16, blank=True)
+    comments = models.CharField("备注", max_length=255, blank=True)
+    uuid = models.CharField("UUID", max_length=64, blank=True)
+
+    # ---- 命中统计(只有 API 通道有;SSH 通道是 null,不是 0) ----
+    hit_count = models.BigIntegerField("命中次数", null=True, blank=True)
+    bytes_count = models.BigIntegerField("字节数", null=True, blank=True)
+    packets = models.BigIntegerField("包数", null=True, blank=True)
+    sessions = models.IntegerField("活动会话", null=True, blank=True)
+    first_hit_at = models.DateTimeField("首次命中", null=True, blank=True)
+    last_hit_at = models.DateTimeField("最后命中", null=True, blank=True)
+
+    # 设备原样返回的那条记录。页面上"查看原始"用它 —— FortiOS 的策略有
+    # 上百个字段,这里只提取了常看的十几个,剩下的不该丢
+    raw = models.JSONField("原始记录", default=dict, blank=True)
+    synced_at = models.DateTimeField("同步时间", db_index=True)
+    method = models.CharField("同步通道", max_length=8, blank=True, help_text="api / ssh")
+
+    class Meta:
+        verbose_name = verbose_name_plural = "防火墙策略"
+        ordering = ["device_id", "vdom", "seq", "policy_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "vdom", "policy_id"], name="uniq_policy_per_device_vdom"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["device", "seq"], name="idx_policy_device_seq"),
+            models.Index(fields=["device", "action"], name="idx_policy_device_action"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.device_id}#{self.policy_id} {self.name or ''}".strip()
+
+    @property
+    def never_hit(self) -> bool | None:
+        """
+        从来没命中过 —— 可以考虑删的规则。
+
+        **返回 None 表示"不知道"**(SSH 通道没有命中计数)。
+        把不知道当成"没命中"会让人删掉一条其实在用的规则。
+        """
+        if self.hit_count is None:
+            return None
+        return self.hit_count == 0
+
+
+# =========================================================================
 # 事件 —— 需求里的「事件报告」表
 # =========================================================================
 
@@ -685,7 +1191,9 @@ class Event(models.Model):
     filter(resolved_at__isnull=True)**,不要去比对最新一条日志的类型。
 
     同一个 (source, kind) 同时最多只有一条未恢复事件(见下面的唯一约束),
-    这保证了抖动的线路不会刷出几百条重复事件。
+    这保证了抖动的线路不会刷出几百条重复事件。**那条约束必须带
+    nulls_distinct=False** —— 四个来源外键里只有一个非空,默认的
+    "NULL != NULL" 语义会让它一行都挡不住。
     """
 
     source_type = models.CharField(
@@ -705,6 +1213,10 @@ class Event(models.Model):
     interface = models.ForeignKey(
         DeviceInterface, null=True, blank=True, on_delete=models.CASCADE,
         related_name="events", verbose_name="接口",
+    )
+    server = models.ForeignKey(
+        Server, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="events", verbose_name="服务器",
     )
 
     kind = models.CharField("事件类型", max_length=16, choices=EventKind.choices, db_index=True)
@@ -745,9 +1257,17 @@ class Event(models.Model):
             # 每个来源每种类型同时只允许一条未恢复事件。
             # Postgres 的部分唯一索引 —— resolved_at 非空的行不受约束,
             # 所以历史事件可以有任意多条。
+            # **nulls_distinct=False 是这条约束能生效的前提。**
+            # 四个来源外键里永远只有一个非空,而 PostgreSQL 默认认为
+            # NULL != NULL —— 也就是说带默认语义的话,任何一行只要有一个
+            # NULL 列就永远不会和别的行冲突,这条约束一行都挡不住
+            # (见 CLAUDE.md 第 2 条,ProbeTarget 的端点约束踩的是同一个坑,
+            #  那边用 Coalesce 折成 0,这边列是外键没法 Coalesce,
+            #  用 PG 15+ 的 NULLS NOT DISTINCT)。
             models.UniqueConstraint(
-                fields=["source_type", "target", "device", "interface", "kind"],
+                fields=["source_type", "target", "device", "interface", "server", "kind"],
                 condition=models.Q(resolved_at__isnull=True),
+                nulls_distinct=False,
                 name="uniq_open_event_per_source_kind",
             )
         ]
@@ -765,6 +1285,8 @@ class Event(models.Model):
             return f"{self.interface.device.name} / {self.interface.if_name}"
         if self.device_id and self.device:
             return self.device.name
+        if self.server_id and self.server:
+            return self.server.name
         if self.target_id and self.target:
             return self.target.name
         return "-"

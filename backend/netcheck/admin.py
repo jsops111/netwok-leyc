@@ -9,12 +9,16 @@ from django.contrib import admin
 
 from netcheck.models import (
     Device,
+    DeviceBackup,
     DeviceInterface,
     Event,
+    FirewallPolicy,
     Notifier,
     NotifyLog,
     ProbeGroup,
     ProbeTarget,
+    Server,
+    ServerInterface,
 )
 
 
@@ -77,3 +81,44 @@ class NotifyLogAdmin(admin.ModelAdmin):
     list_display = ("ts", "notifier", "phase", "status", "http_status", "duration_ms")
     list_filter = ("status", "phase", "notifier")
     date_hierarchy = "ts"
+
+
+@admin.register(Server)
+class ServerAdmin(admin.ModelAdmin):
+    list_display = ("name", "host", "ssh_port", "state", "os_name",
+                    "cpu_cores", "interval_seconds", "enabled")
+    list_filter = ("state", "enabled", "site", "role")
+    search_fields = ("name", "host", "hostname")
+    # 凭据字段不进 admin 表单 —— admin 没有前端那层 write_only 保护
+    exclude = ("ssh_password", "ssh_private_key", "ssh_key_passphrase")
+    readonly_fields = ("state", "last_collected_at", "last_error", "hostname",
+                       "os_name", "kernel", "cpu_cores", "mem_total_bytes")
+
+
+@admin.register(ServerInterface)
+class ServerInterfaceAdmin(admin.ModelAdmin):
+    list_display = ("server", "if_name", "is_primary", "is_virtual", "in_bps", "out_bps")
+    list_filter = ("server", "is_primary", "is_virtual")
+    search_fields = ("if_name",)
+
+
+@admin.register(DeviceBackup)
+class DeviceBackupAdmin(admin.ModelAdmin):
+    list_display = ("device", "ts", "last_seen_at", "seen_count", "method",
+                    "line_count", "size_bytes", "short_hash")
+    list_filter = ("device", "method", "is_first")
+    date_hierarchy = "ts"
+    # content 是几十 KB 到几 MB 的文本。admin 的列表页不该去读它,
+    # 编辑页把它渲染成一个巨大的 textarea 也没有意义 —— 看全文用前端页面
+    exclude = ("content",)
+    readonly_fields = ("device", "ts", "last_seen_at", "seen_count", "method",
+                       "size_bytes", "line_count", "content_hash",
+                       "lines_added", "lines_removed", "is_first")
+
+
+@admin.register(FirewallPolicy)
+class FirewallPolicyAdmin(admin.ModelAdmin):
+    list_display = ("device", "vdom", "policy_id", "seq", "name", "action",
+                    "enabled", "nat", "hit_count", "synced_at")
+    list_filter = ("device", "vdom", "action", "enabled", "method")
+    search_fields = ("name", "comments")

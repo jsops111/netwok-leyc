@@ -2,13 +2,21 @@
 Celery 任务。
 
 分四类:
-    派发      dispatch_due_probes / dispatch_due_devices —— beat 每拍调用
-    执行      run_probe / collect_device_task —— 一个目标一个任务
+    派发      dispatch_due_* —— beat 每拍调用,共五类:
+              线路 / 设备 / 服务器 / 配置备份 / 防火墙策略
+    执行      run_probe / collect_device_task / collect_server_task /
+              backup_device_task / sync_policies_task —— 一个目标一个任务
     聚合清理  rollup_1m / rollup_5m_1h / purge_raw_samples
     通知      send_notification / retry_pending_notifications
 
 **执行任务必须是"单目标"的**:一个任务里循环采所有线路的话,一条慢线路
 会拖住后面所有线路,而且失败重试会把已经成功的重跑一遍。
+
+**备份和策略同步不调 event_engine.process()。**process() 的语义是"这一拍
+观测到的全部问题",没出现在 problems 里的未恢复事件会被它当成已恢复 ——
+拿一个只含 backup_failed 的 problems 去调用,这台设备上正开着的
+cpu_high / device_down 会被一起关掉。它们用 record_point_event()
+记瞬时事件,见 events/engine.py 里那段说明。
 """
 
 from __future__ import annotations
@@ -23,13 +31,18 @@ from django.utils import timezone
 from netcheck import scheduler
 from netcheck.events import engine as event_engine
 from netcheck.models import (
+    BackupStatus,
     Device,
+    DeviceKind,
     Event,
+    EventKind,
     LinkState,
     ProbeRollup,
     ProbeSample,
     ProbeTarget,
     RollupBucket,
+    Server,
+    Severity,
 )
 from netcheck.probes import runner
 
@@ -67,6 +80,65 @@ def dispatch_due_devices() -> dict:
     for device_id in due:
         if scheduler.mark_inflight("device", device_id, ttl_seconds=600):
             collect_device_task.delay(device_id)
+            dispatched += 1
+    return {"due": len(due), "dispatched": dispatched, **sync}
+
+
+@shared_task(name="netcheck.dispatch_due_servers")
+def dispatch_due_servers() -> dict:
+    enabled_ids = list(Server.objects.filter(enabled=True).values_list("id", flat=True))
+    sync = scheduler.sync_schedule("server", enabled_ids)
+
+    due = scheduler.take_due("server", limit=200)
+    dispatched = 0
+    for server_id in due:
+        # 服务器采集是一次完整的 SSH 握手,慢的机器上要好几秒。
+        # inflight 的 ttl 给到 10 分钟 —— 比最坏情况宽裕得多,
+        # 而给短了会在上一拍还没结束时又派一次,同一台机器被并发登录
+        if scheduler.mark_inflight("server", server_id, ttl_seconds=600):
+            collect_server_task.delay(server_id)
+            dispatched += 1
+    return {"due": len(due), "dispatched": dispatched, **sync}
+
+
+@shared_task(name="netcheck.dispatch_due_backups")
+def dispatch_due_backups() -> dict:
+    """
+    配置备份的派发。**只看 backup_enabled,不看 collect_method** ——
+    一台走 SNMP 采指标的交换机照样可以备份配置(备份走 SSH)。
+    """
+
+    enabled_ids = list(
+        Device.objects.filter(enabled=True, backup_enabled=True).values_list("id", flat=True)
+    )
+    sync = scheduler.sync_schedule("backup", enabled_ids)
+
+    due = scheduler.take_due("backup", limit=100)
+    dispatched = 0
+    for device_id in due:
+        # 一份 running-config 走 SSH 读完可能几十秒,大配置更久 ——
+        # ttl 给 30 分钟。给短了会让同一台设备被两个 worker 同时备份,
+        # 而那会在同一秒产生两个"新版本"(第二个的 diff 是空的)
+        if scheduler.mark_inflight("backup", device_id, ttl_seconds=1800):
+            backup_device_task.delay(device_id)
+            dispatched += 1
+    return {"due": len(due), "dispatched": dispatched, **sync}
+
+
+@shared_task(name="netcheck.dispatch_due_policies")
+def dispatch_due_policies() -> dict:
+    enabled_ids = list(
+        Device.objects.filter(
+            enabled=True, policy_sync_enabled=True, kind=DeviceKind.FIREWALL
+        ).values_list("id", flat=True)
+    )
+    sync = scheduler.sync_schedule("policy", enabled_ids)
+
+    due = scheduler.take_due("policy", limit=100)
+    dispatched = 0
+    for device_id in due:
+        if scheduler.mark_inflight("policy", device_id, ttl_seconds=900):
+            sync_policies_task.delay(device_id)
             dispatched += 1
     return {"due": len(due), "dispatched": dispatched, **sync}
 
@@ -158,6 +230,167 @@ def collect_device_task(self, device_id: int) -> dict:
     finally:
         scheduler.clear_inflight("device", device_id)
         scheduler.reschedule("device", device_id, device.interval_seconds)
+
+
+@shared_task(name="netcheck.collect_server", bind=True, max_retries=0)
+def collect_server_task(self, server_id: int) -> dict:
+    """
+    采一台服务器。
+
+    `max_retries=0` 和拨测同一个理由:**采集失败本身就是要记录的结果**。
+    重试会污染数据 —— 一次 SSH 超时重试三次成功,记下来的是"可达",
+    而真实情况是这台机器当时登不上去。
+    """
+
+    from netcheck.servers import collector
+
+    try:
+        server = Server.objects.get(pk=server_id, enabled=True)
+    except Server.DoesNotExist:
+        scheduler.unschedule("server", server_id)
+        return {"skipped": "服务器不存在或已停用"}
+
+    try:
+        sample = collector.collect_server(server)
+        return {
+            "server": server.name, "reachable": sample.reachable,
+            "cpu": sample.cpu_pct, "mem": sample.mem_pct, "disk": sample.disk_pct,
+            "load1": sample.load1,
+        }
+    finally:
+        # 少一个这条服务器就此停摆 —— 和 run_probe 的 finally 同一条规矩
+        scheduler.clear_inflight("server", server_id)
+        scheduler.reschedule("server", server_id, server.interval_seconds)
+
+
+# =========================================================================
+# 配置备份 / 策略同步
+# =========================================================================
+
+# 备份失败后多久重试。**不用整个备份间隔**:间隔通常是 24 小时,
+# 一次网络抖动就意味着这台设备一天没有备份 —— 那正是备份最不该有的性质。
+# 也不做 Celery 的 retry:那条链路在 worker 重启后就断了,而"下次什么时候
+# 再试"这件事本来就该由到期表来管。
+_BACKUP_RETRY_SECONDS = 1800
+# 同一台设备的备份失败事件的去重窗口。一台配置错误的设备会每 30 分钟失败
+# 一次,不去重就是一天 48 条一模一样的事件
+_BACKUP_EVENT_DEDUPE = 6 * 3600
+
+
+@shared_task(name="netcheck.backup_device", bind=True, max_retries=0)
+def backup_device_task(self, device_id: int) -> dict:
+    """
+    备份一台设备的配置。
+
+    成功后**只有配置真的变了**才记一条 config_changed 事件(info 级) ——
+    每天一条"配置没变"的事件毫无信息量,而事件表是要被人读的。
+    失败记 backup_failed(warning 级,默认会被推送):
+    一个悄悄坏掉的备份等于没有备份,而这件事只有告警能让人知道。
+    """
+
+    from netcheck.devices import backup as backup_mod
+    from netcheck.events import engine as engine_mod
+
+    try:
+        device = Device.objects.get(pk=device_id, enabled=True, backup_enabled=True)
+    except Device.DoesNotExist:
+        scheduler.unschedule("backup", device_id)
+        return {"skipped": "设备不存在、已停用或未开启备份"}
+
+    now = timezone.now()
+    next_interval = device.backup_interval_hours * 3600
+    try:
+        result = backup_mod.backup_device(device)
+
+        device.last_backup_at = now
+        device.last_backup_status = BackupStatus.OK
+        device.last_backup_error = ""
+        device.save(update_fields=["last_backup_at", "last_backup_status", "last_backup_error"])
+
+        if result["changed"] and not result.get("is_first"):
+            event = engine_mod.record_point_event(
+                engine_mod.EventSource.from_device(device),
+                EventKind.CONFIG_CHANGED,
+                # info 级:配置变更是**记录**,不是故障。默认渠道的最低级别是
+                # warning,所以它不会被推送出去 —— 想收推送就把渠道的
+                # 「最低级别」调到 info
+                Severity.INFO,
+                title=f"{device.name} 配置发生变更",
+                message=(
+                    f"新增 {result.get('lines_added')} 行 / 删除 {result.get('lines_removed')} 行"
+                    f"(通道 {result['method'].upper()},版本 {result['hash'][:12]})"
+                ),
+            )
+            if event is not None:
+                send_notification.delay(event.pk, "alert")
+
+        return {"device": device.name, **result}
+
+    except Exception as exc:  # noqa: BLE001 —— 备份失败要记录,不能让任务炸掉
+        error = str(exc) if isinstance(exc, backup_mod.BackupError) else f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, backup_mod.BackupError):
+            log.exception("设备 %s 备份异常", device.name)
+        else:
+            log.warning("设备 %s 备份失败: %s", device.name, error)
+
+        device.last_backup_status = BackupStatus.FAILED
+        device.last_backup_error = error[:255]
+        device.save(update_fields=["last_backup_status", "last_backup_error"])
+
+        event = engine_mod.record_point_event(
+            engine_mod.EventSource.from_device(device),
+            EventKind.BACKUP_FAILED, Severity.WARNING,
+            title=f"{device.name} 配置备份失败",
+            message=error[:500],
+            dedupe_seconds=_BACKUP_EVENT_DEDUPE,
+        )
+        if event is not None:
+            send_notification.delay(event.pk, "alert")
+
+        # 失败就换成短间隔重试,不等下一个整周期
+        next_interval = min(next_interval, _BACKUP_RETRY_SECONDS)
+        return {"device": device.name, "error": error}
+    finally:
+        scheduler.clear_inflight("backup", device_id)
+        scheduler.reschedule("backup", device_id, next_interval)
+
+
+@shared_task(name="netcheck.sync_policies", bind=True, max_retries=0)
+def sync_policies_task(self, device_id: int) -> dict:
+    """
+    同步一台防火墙的策略快照。
+
+    失败**不记事件**:策略同步失败不是网络故障,而设备连不上这件事
+    device_down 已经报过了 —— 再记一条只是把同一件事说两遍。
+    失败原因写在 Device.last_policy_error 上,页面顶部会显示。
+    """
+
+    from netcheck.devices import policies
+
+    try:
+        device = Device.objects.get(pk=device_id, enabled=True, policy_sync_enabled=True)
+    except Device.DoesNotExist:
+        scheduler.unschedule("policy", device_id)
+        return {"skipped": "设备不存在、已停用或未开启策略同步"}
+
+    interval = device.policy_sync_interval_minutes * 60
+    try:
+        result = policies.sync_policies(device)
+        return {"device": device.name, **result}
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc) if isinstance(exc, policies.PolicyError) else f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, policies.PolicyError):
+            log.exception("设备 %s 策略同步异常", device.name)
+        else:
+            log.info("设备 %s 策略同步失败: %s", device.name, error)
+        # **不清空已有快照。**同步失败时页面上要还能看上一次的规则
+        # (标明"数据截止于什么时候")—— 防火墙连不上恰恰是最需要查规则的时候
+        device.last_policy_error = error[:255]
+        device.save(update_fields=["last_policy_error"])
+        return {"device": device.name, "error": error}
+    finally:
+        scheduler.clear_inflight("policy", device_id)
+        scheduler.reschedule("policy", device_id, interval)
 
 
 # =========================================================================
@@ -372,7 +605,14 @@ def purge_raw_samples() -> dict:
     它是审计材料而不是时序数据。
     """
 
-    from netcheck.models import DeviceSample, Event, InterfaceSample, NotifyLog, RetentionPolicy
+    from netcheck.models import (
+        DeviceSample,
+        Event,
+        InterfaceSample,
+        NotifyLog,
+        RetentionPolicy,
+        ServerSample,
+    )
 
     # 保留期以**库里的策略**为准,不是环境变量 —— 环境变量只在首次建行时当默认值。
     # 磁盘快满时改保留期这件事发生在半夜,那时候人只能开个页面(见 models.py)
@@ -384,6 +624,11 @@ def purge_raw_samples() -> dict:
         (ProbeSample, "probe_samples"),
         (InterfaceSample, "interface_samples"),
         (DeviceSample, "device_samples"),
+        # 服务器样本和设备样本同一个保留期。**它没有降采样表** ——
+        # 60 秒一拍的话一台机器一天 1440 行,和秒级拨测不是一个量级,
+        # 不值得为它建四张桶表。代价是能看的历史跨度就是 raw_hours,
+        # 要看更久的服务器趋势得先把原始保留期调大(见「系统信息」页)
+        (ServerSample, "server_samples"),
     ):
         total = 0
         while True:
@@ -450,7 +695,9 @@ def reap_stale_events() -> dict:
     stale_open = 0
     now = timezone.now()
 
-    for event in Event.objects.filter(resolved_at__isnull=True).select_related("target", "device"):
+    for event in Event.objects.filter(resolved_at__isnull=True).select_related(
+        "target", "device", "server"
+    ):
         source_disabled = False
         if event.target_id and event.target and not event.target.enabled:
             source_disabled = True
@@ -458,6 +705,9 @@ def reap_stale_events() -> dict:
         elif event.device_id and event.device and not event.device.enabled:
             source_disabled = True
             reason = "设备已停用"
+        elif event.server_id and event.server and not event.server.enabled:
+            source_disabled = True
+            reason = "服务器已停用"
 
         if source_disabled:
             event_engine.force_resolve(event, reason)
@@ -465,7 +715,7 @@ def reap_stale_events() -> dict:
             continue
 
         # 采集是否还在跑:最后采集时间距今超过 10 个周期就算停了
-        source = event.target or event.device
+        source = event.target or event.device or event.server
         if source is None:
             continue
         last = getattr(source, "last_checked_at", None) or getattr(source, "last_collected_at", None)

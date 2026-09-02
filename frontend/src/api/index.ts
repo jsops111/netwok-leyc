@@ -183,6 +183,17 @@ export interface DeviceRow {
   fail_threshold: number
   recover_threshold: number
   collect_interfaces: boolean
+  backup_enabled: boolean
+  backup_interval_hours: number
+  backup_keep: number
+  last_backup_at: string | null
+  last_backup_status: string
+  last_backup_error: string
+  policy_sync_enabled: boolean
+  policy_sync_interval_minutes: number
+  last_policy_sync_at: string | null
+  last_policy_error: string
+  policy_count: number
   enabled: boolean
   order: number
   state: string
@@ -195,6 +206,239 @@ export interface DeviceRow {
   has_api_token: boolean
   interface_count: number
   profile_notes: string
+}
+
+export interface ServerRow {
+  id: number
+  name: string
+  host: string
+  ssh_port: number
+  ssh_username: string
+  site: string
+  role: string
+  net_interface: string
+  interval_seconds: number
+  timeout_ms: number
+  cpu_warn_pct: number
+  cpu_crit_pct: number
+  mem_warn_pct: number
+  mem_crit_pct: number
+  disk_warn_pct: number
+  disk_crit_pct: number
+  load_warn: number
+  load_crit: number
+  fail_threshold: number
+  recover_threshold: number
+  collect_processes: boolean
+  enabled: boolean
+  order: number
+  state: string
+  state_label?: string
+  last_collected_at: string | null
+  last_error: string
+  hostname: string
+  os_name: string
+  kernel: string
+  cpu_cores: number | null
+  mem_total_bytes: number | null
+  has_credential: boolean
+  uses_key: boolean
+  interface_count: number
+  primary_interface: string
+  open_event_count: number
+}
+
+export interface ServerPoint {
+  ts: string
+  reachable?: boolean
+  cpu_pct: number | null
+  cpu_iowait_pct: number | null
+  mem_pct: number | null
+  swap_pct: number | null
+  disk_pct: number | null
+  load1: number | null
+  load5: number | null
+  load15: number | null
+  net_in_bps: number | null
+  net_out_bps: number | null
+  tcp_established: number | null
+  process_count: number | null
+}
+
+export interface ServerCard {
+  id: number
+  name: string
+  host: string
+  hostname: string
+  site: string
+  role: string
+  os_name: string
+  kernel: string
+  cpu_cores: number | null
+  mem_total_bytes: number | null
+  state: string
+  interval: number
+  last_collected_at: string | null
+  last_error: string
+  open_events: number
+  cpu: number | null
+  mem: number | null
+  disk: number | null
+  load1: number | null
+  net_in_bps: number | null
+  net_out_bps: number | null
+  load_per_core: number | null
+  primary_interface: string
+  thresholds: Record<string, number>
+  trend: Array<{
+    ts: string
+    cpu: number | null
+    mem: number | null
+    disk: number | null
+    load1: number | null
+    net_in: number | null
+    net_out: number | null
+    up: boolean
+  }>
+}
+
+export interface ServerMount {
+  mount: string
+  fs: string
+  total_bytes: number
+  used_bytes: number
+  pct: number | null
+}
+
+export interface ServerInterfaceRow {
+  id: number
+  server: number
+  if_name: string
+  is_primary: boolean
+  is_virtual: boolean
+  in_bps: number | null
+  out_bps: number | null
+  in_err_delta: number | null
+  out_err_delta: number | null
+}
+
+export interface ServerDetail {
+  server: ServerRow
+  ts: string | null
+  reachable: boolean | null
+  uptime_s: number | null
+  mounts: ServerMount[]
+  top_processes: Array<{ cpu: number; mem: number; name: string }>
+  primary_interface: string
+  interfaces: ServerInterfaceRow[]
+  current: {
+    cpu: number | null
+    iowait: number | null
+    mem: number | null
+    swap: number | null
+    disk: number | null
+    load1: number | null
+    load5: number | null
+    load15: number | null
+    net_in_bps: number | null
+    net_out_bps: number | null
+    tcp_established: number | null
+    process_count: number | null
+  }
+  error: string
+  cpu_pending: string
+  notes: string[]
+}
+
+export interface BackupVersion {
+  id: number
+  device: number
+  device_name?: string
+  ts: string
+  last_seen_at: string
+  seen_count: number
+  method: string
+  size_bytes: number
+  line_count: number
+  content_hash: string
+  short_hash: string
+  lines_added: number | null
+  lines_removed: number | null
+  is_first: boolean
+  content?: string
+}
+
+export interface DeviceBackupInfo {
+  device: string
+  enabled: boolean
+  interval_hours: number
+  keep: number
+  last_backup_at: string | null
+  last_backup_status: string
+  last_backup_error: string
+  versions: BackupVersion[]
+}
+
+export interface BackupDiff {
+  detail?: string
+  from: number | null
+  to: number
+  from_ts?: string
+  to_ts?: string
+  lines_added?: number | null
+  lines_removed?: number | null
+  lines: string[]
+}
+
+export interface PolicyRow {
+  id: number
+  device: number
+  device_name: string
+  vdom: string
+  policy_id: number
+  seq: number
+  name: string
+  src_intf: string[]
+  dst_intf: string[]
+  src_addr: string[]
+  dst_addr: string[]
+  service: string[]
+  schedule: string
+  action: string
+  action_label: string
+  enabled: boolean
+  nat: boolean
+  log_traffic: string
+  comments: string
+  uuid: string
+  hit_count: number | null
+  bytes_count: number | null
+  packets: number | null
+  sessions: number | null
+  first_hit_at: string | null
+  last_hit_at: string | null
+  /** 三态:true=从未命中 / false=命中过 / null=**不知道**(SSH 通道没有计数) */
+  never_hit: boolean | null
+  synced_at: string
+  method: string
+  raw?: Record<string, any>
+}
+
+export interface PolicySummaryRow {
+  device_id: number
+  device_name: string
+  mgmt_ip: string
+  vdom: string
+  state: string
+  synced_at: string | null
+  error: string
+  interval_minutes: number
+  total: number
+  accept: number
+  deny: number
+  disabled: number
+  has_hit_stats: boolean
+  never_hit: number | null
 }
 
 export interface EventRow {
@@ -302,6 +546,8 @@ export interface Overview {
     total: number; up: number; degraded: number; down: number
     switches: number; firewalls: number
   }
+  servers: { total: number; up: number; degraded: number; down: number; unknown: number }
+  backup: { enabled: number; failed: number; never: number }
   scheduler: Record<string, any>
 }
 
@@ -455,6 +701,47 @@ export const api = {
   deviceInterfaces: (id: number, active = false) =>
     http.get(`/devices/${id}/interfaces/`, { params: { active: active ? 'true' : undefined } }),
   deviceSeries: (id: number, hours = 6) => http.get(`/devices/${id}/series/`, { params: { hours } }),
+
+  // 服务器(SSH 采集)
+  servers: (params?: object) => http.get<Paged<ServerRow>>('/servers/', { params }),
+  createServer: (body: Partial<ServerRow>) => http.post<ServerRow>('/servers/', body),
+  updateServer: (id: number, body: Partial<ServerRow>) => http.patch<ServerRow>(`/servers/${id}/`, body),
+  deleteServer: (id: number) => http.delete(`/servers/${id}/`),
+  testServer: (id: number) => http.post<{ ok: boolean; detail: string }>(`/servers/${id}/test/`),
+  collectServerNow: (id: number) => http.post(`/servers/${id}/collect_now/`),
+  serverSeries: (id: number, hours = 6) =>
+    http.get<{ points: number; interval: number; series: ServerPoint[] }>(
+      `/servers/${id}/series/`, { params: { hours } },
+    ),
+  serverDetail: (id: number) => http.get<ServerDetail>(`/servers/${id}/detail_info/`),
+  serverCards: (hours = 3) =>
+    http.get<{
+      total: number; up: number; degraded: number; down: number
+      generated_at: string; servers: ServerCard[]
+    }>('/dashboard/servers/', { params: { hours } }),
+
+  // 配置备份
+  deviceBackupInfo: (id: number) => http.get<DeviceBackupInfo>(`/devices/${id}/backups/`),
+  backupNow: (id: number) => http.post<{ detail: string }>(`/devices/${id}/backup_now/`),
+  testDeviceBackup: (id: number) => http.post<{ ok: boolean; detail: string }>(`/devices/${id}/test_backup/`),
+  backupVersion: (id: number) => http.get<BackupVersion>(`/backups/${id}/`),
+  backupDiff: (id: number, against?: number) =>
+    http.get<BackupDiff>(`/backups/${id}/diff/`, { params: { against } }),
+  /**
+   * 下载是**一个普通链接**,不走 axios。
+   *
+   * 走 axios 的话要把整份配置读进内存、造一个 Blob、再造一个隐藏的 <a> 点它 ——
+   * 一份几 MB 的配置这么走一遍毫无必要,而且丢掉了后端设的文件名。
+   * 会话是 cookie,浏览器直接开这个地址就带上了。
+   */
+  backupDownloadUrl: (id: number) => `/api/backups/${id}/download/`,
+
+  // 防火墙策略
+  policies: (params?: object) => http.get<Paged<PolicyRow>>('/firewall-policies/', { params }),
+  policy: (id: number) => http.get<PolicyRow>(`/firewall-policies/${id}/`),
+  policySummary: () =>
+    http.get<{ generated_at: string; devices: PolicySummaryRow[] }>('/firewall-policies/summary/'),
+  syncPoliciesNow: (id: number) => http.post<{ detail: string }>(`/devices/${id}/sync_policies_now/`),
 
   // 事件
   events: (params?: object) => http.get<Paged<EventRow>>('/events/', { params }),

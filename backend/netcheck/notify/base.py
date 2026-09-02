@@ -65,8 +65,8 @@ def should_send(notifier: Notifier, event: Event, phase: str) -> tuple[bool, str
     if kinds and event.kind not in kinds:
         return False, f"类型 {event.kind} 不在该渠道的推送范围"
 
-    # 监控类过滤只对线路事件生效 —— 设备不属于任何监控类,
-    # 拿"没选中"去挡设备事件会让设备告警在配了分组的渠道上静默消失
+    # 监控类过滤只对线路事件生效 —— 设备和服务器不属于任何监控类,
+    # 拿"没选中"去挡它们的事件会让设备/服务器告警在配了分组的渠道上静默消失
     if event.source_type == SourceType.PROBE and event.target_id:
         allowed = list(notifier.groups.values_list("id", flat=True))
         if allowed and event.target.group_id not in allowed:

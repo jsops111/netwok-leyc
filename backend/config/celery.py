@@ -34,6 +34,21 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(
         10.0, dispatch_devices.s(), name="设备采集派发(每 10s)", expires=10
     )
+    # 服务器采集派发器:最快 15s 一拍(每次一个完整 SSH 握手),
+    # 10 秒敲一次派发足够,和设备同一档
+    sender.add_periodic_task(
+        10.0, dispatch_servers.s(), name="服务器采集派发(每 10s)", expires=10
+    )
+    # 配置备份派发器。备份间隔是**小时级**,所以派发器一分钟敲一次就够 ——
+    # 敲得更勤只是多几次 Redis 查询,而"最多迟一分钟"对一天一次的备份
+    # 完全无感。expires=55 保证 worker 堵住时这一拍会被丢掉而不是堆积
+    sender.add_periodic_task(
+        60.0, dispatch_backups.s(), name="配置备份派发(每 60s)", expires=55
+    )
+    # 防火墙策略同步派发器。同上,策略同步间隔最短 5 分钟
+    sender.add_periodic_task(
+        60.0, dispatch_policies.s(), name="防火墙策略同步派发(每 60s)", expires=55
+    )
     # 分钟级降采样:每分钟把上一分钟的原始点压成 1m 桶
     sender.add_periodic_task(
         crontab(minute="*"), rollup_minute.s(), name="1m 降采样", expires=55
@@ -66,6 +81,27 @@ def dispatch_devices():
     from netcheck.tasks import dispatch_due_devices
 
     return dispatch_due_devices()
+
+
+@app.task(name="netcheck.dispatch_servers")
+def dispatch_servers():
+    from netcheck.tasks import dispatch_due_servers
+
+    return dispatch_due_servers()
+
+
+@app.task(name="netcheck.dispatch_backups")
+def dispatch_backups():
+    from netcheck.tasks import dispatch_due_backups
+
+    return dispatch_due_backups()
+
+
+@app.task(name="netcheck.dispatch_policies")
+def dispatch_policies():
+    from netcheck.tasks import dispatch_due_policies
+
+    return dispatch_due_policies()
 
 
 @app.task(name="netcheck.rollup_minute")

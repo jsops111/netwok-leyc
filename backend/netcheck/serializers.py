@@ -17,9 +17,12 @@ from rest_framework import serializers
 from netcheck.models import (
     CollectMethod,
     Device,
+    DeviceBackup,
     DeviceInterface,
+    DeviceKind,
     DeviceSample,
     Event,
+    FirewallPolicy,
     InterfaceSample,
     Notifier,
     NotifierKind,
@@ -29,6 +32,9 @@ from netcheck.models import (
     ProbeSample,
     ProbeTarget,
     Protocol,
+    Server,
+    ServerInterface,
+    ServerSample,
     SnmpSecLevel,
     SnmpVersion,
     Vendor,
@@ -282,6 +288,46 @@ class DeviceSerializer(serializers.ModelSerializer):
             if crit and warn and warn > crit:
                 errors[warn_field] = f"{label}警告线不能高于严重线"
 
+        # ---- 配置备份 / 策略同步(Device.clean() 的镜像) ----
+        # 这两项**不看 collect_method**:采指标可以走 SNMP,但 SNMP 拿不到
+        # 配置文本,也拿不到策略表。不在这里拦住的话开关能打开、任务每天
+        # 跑一次、每次都失败,而人只有翻到「配置备份」页面才看得见
+        model = _merged(self, attrs, "model", "")
+        kind = _merged(self, attrs, "kind", "")
+        has_ssh = bool(
+            _merged(self, attrs, "ssh_username")
+            and (_merged(self, attrs, "ssh_password") or _merged(self, attrs, "ssh_private_key"))
+        )
+        has_api = bool(_merged(self, attrs, "api_token") and vendor == Vendor.FORTINET)
+
+        if _merged(self, attrs, "backup_enabled", False):
+            if not (has_ssh or has_api):
+                errors["backup_enabled"] = (
+                    "配置备份需要 SSH 用户名 + 密码/私钥(FortiGate 也可只填 API Token)"
+                    " —— SNMP 拿不到配置文本"
+                )
+            else:
+                from netcheck.devices.profiles import get_profile
+
+                if not get_profile(model, vendor).backup_cli and not has_api:
+                    errors["backup_enabled"] = (
+                        "这个型号的采集画像里没有定义备份命令,开了也备不了。"
+                        "选一个在册型号,或在 devices/profiles.py 里补一条 backup_cli"
+                    )
+
+        if _merged(self, attrs, "policy_sync_enabled", False):
+            if kind != DeviceKind.FIREWALL:
+                errors["policy_sync_enabled"] = "策略同步只对防火墙有意义"
+            elif vendor != Vendor.FORTINET:
+                errors["policy_sync_enabled"] = (
+                    "策略同步目前只实现了 FortiGate(FortiOS)。"
+                    "加别的厂商要在 devices/policies.py 里补一个解析器"
+                )
+            elif not (has_api or has_ssh):
+                errors["policy_sync_enabled"] = (
+                    "策略同步需要 API Token(推荐,只有 API 有命中计数)或 SSH 凭据"
+                )
+
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
@@ -328,6 +374,184 @@ class InterfaceSampleSerializer(serializers.ModelSerializer):
 
 
 # =========================================================================
+# 服务器
+# =========================================================================
+
+
+class ServerSerializer(serializers.ModelSerializer):
+    state_label = serializers.CharField(source="get_state_display", read_only=True)
+    # 凭据只回"填过没有",不回内容 —— 和设备那边同一条规矩
+    has_credential = serializers.SerializerMethodField()
+    uses_key = serializers.SerializerMethodField()
+    interface_count = serializers.SerializerMethodField()
+    primary_interface = serializers.SerializerMethodField()
+    open_event_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Server
+        fields = "__all__"
+        # **关掉自动生成的 UniqueTogetherValidator。**
+        # (host, ssh_port) 那条约束是"纯字段列表",所以 DRF 会自己给它生成
+        # 一个校验器 —— 而它报的是 non_field_errors:"字段 host, ssh_port
+        # 必须能构成唯一集合",既不指向输入框,也不说是**哪一台**已经占了
+        # 这个地址。下面 validate() 里那份手写的会说"已经作为「xxx」加过了",
+        # 那才是人看得懂的话。而且 run_validators() 跑在 validate() **之前**,
+        # 不关掉的话手写那份永远轮不到。
+        # 注意 name 的唯一性是**字段级**校验器(unique=True),不受这里影响。
+        validators: list = []
+        read_only_fields = [
+            "state", "last_collected_at", "last_error", "consecutive_fail", "consecutive_ok",
+            "hostname", "os_name", "kernel", "cpu_cores", "mem_total_bytes",
+        ]
+        extra_kwargs = {
+            "ssh_password": {"write_only": True, "required": False, "allow_blank": True},
+            "ssh_private_key": {"write_only": True, "required": False, "allow_blank": True},
+            "ssh_key_passphrase": {"write_only": True, "required": False, "allow_blank": True},
+        }
+
+    def get_has_credential(self, obj) -> bool:
+        return bool(obj.ssh_password or obj.ssh_private_key)
+
+    def get_uses_key(self, obj) -> bool:
+        return bool(obj.ssh_private_key)
+
+    def get_interface_count(self, obj) -> int:
+        return getattr(obj, "interface_count_ann", None) or obj.interfaces.count()
+
+    def get_primary_interface(self, obj) -> str:
+        iface = next((i for i in obj.interfaces.all() if i.is_primary), None)
+        return iface.if_name if iface else ""
+
+    def get_open_event_count(self, obj) -> int:
+        return getattr(obj, "open_event_count_ann", None) or obj.events.filter(
+            resolved_at__isnull=True
+        ).count()
+
+    def validate(self, attrs):
+        """Server.clean() 的镜像 —— 两边必须一起改。"""
+
+        errors = {}
+        if not _merged(self, attrs, "ssh_password") and not _merged(self, attrs, "ssh_private_key"):
+            errors["ssh_password"] = "SSH 采集需要密码或私钥"
+
+        for warn_field, crit_field, label in (
+            ("cpu_warn_pct", "cpu_crit_pct", "CPU"),
+            ("mem_warn_pct", "mem_crit_pct", "内存"),
+            ("disk_warn_pct", "disk_crit_pct", "磁盘"),
+            ("load_warn", "load_crit", "负载"),
+        ):
+            warn = _merged(self, attrs, warn_field, 0)
+            crit = _merged(self, attrs, crit_field, 0)
+            if crit and warn and warn > crit:
+                errors[warn_field] = f"{label}警告线不能高于严重线"
+
+        # 端点重复。**必须手写** —— 和 ProbeTarget 那条同一个理由:
+        # 撞了唯一约束会以 IntegrityError 冒成 500,页面上看到的是
+        # "服务器错误"而不是"这台机器已经加过了"
+        host = _merged(self, attrs, "host")
+        port = _merged(self, attrs, "ssh_port", 22)
+        if host:
+            clash = Server.objects.filter(host=host, ssh_port=port)
+            if self.instance is not None:
+                clash = clash.exclude(pk=self.instance.pk)
+            if existing := clash.first():
+                errors["host"] = (
+                    f"{host}:{port} 已经作为「{existing.name}」加过了。"
+                    "同一台机器加两遍会被采两遍,图上是两条一样的线、事件也开两条"
+                )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
+class ServerSampleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ServerSample
+        fields = [
+            "id", "server", "ts", "reachable", "latency_ms",
+            "cpu_pct", "cpu_iowait_pct", "mem_pct", "swap_pct", "disk_pct",
+            "load1", "load5", "load15", "uptime_s", "process_count", "tcp_established",
+            "net_in_bps", "net_out_bps", "extra", "error",
+        ]
+
+
+class ServerInterfaceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ServerInterface
+        fields = [
+            "id", "server", "if_name", "is_primary", "is_virtual",
+            "in_bps", "out_bps", "in_err_delta", "out_err_delta", "updated_at",
+        ]
+        read_only_fields = fields
+
+
+# =========================================================================
+# 配置备份
+# =========================================================================
+
+
+class DeviceBackupSerializer(serializers.ModelSerializer):
+    """
+    版本列表用。**不带 content** —— 一份配置几十 KB 到几 MB,
+    列表一页二十行就是几十 MB 的响应。全文走单独的 detail / download 接口。
+    """
+
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    short_hash = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = DeviceBackup
+        fields = [
+            "id", "device", "device_name", "ts", "last_seen_at", "seen_count",
+            "method", "size_bytes", "line_count", "content_hash", "short_hash",
+            "lines_added", "lines_removed", "is_first",
+        ]
+        read_only_fields = fields
+
+
+class DeviceBackupDetailSerializer(DeviceBackupSerializer):
+    """单个版本的全文。只在明确要看某一个版本时用。"""
+
+    class Meta(DeviceBackupSerializer.Meta):
+        fields = DeviceBackupSerializer.Meta.fields + ["content"]
+        read_only_fields = fields
+
+
+# =========================================================================
+# 防火墙策略
+# =========================================================================
+
+
+class FirewallPolicySerializer(serializers.ModelSerializer):
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    action_label = serializers.CharField(source="get_action_display", read_only=True)
+    # 三态:True / False / None(不知道)。**前端要区分 None 和 False** ——
+    # "从没命中过"能拿去删规则,"不知道有没有命中"不能
+    never_hit = serializers.BooleanField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = FirewallPolicy
+        fields = [
+            "id", "device", "device_name", "vdom", "policy_id", "seq", "name",
+            "src_intf", "dst_intf", "src_addr", "dst_addr", "service", "schedule",
+            "action", "action_label", "enabled", "nat", "log_traffic", "comments", "uuid",
+            "hit_count", "bytes_count", "packets", "sessions",
+            "first_hit_at", "last_hit_at", "never_hit",
+            "synced_at", "method",
+        ]
+        read_only_fields = fields
+
+
+class FirewallPolicyDetailSerializer(FirewallPolicySerializer):
+    """带 raw。策略有上百个字段,页面上只展示十几个,剩下的从这里看。"""
+
+    class Meta(FirewallPolicySerializer.Meta):
+        fields = FirewallPolicySerializer.Meta.fields + ["raw"]
+        read_only_fields = fields
+
+
+# =========================================================================
 # 事件
 # =========================================================================
 
@@ -346,7 +570,7 @@ class EventSerializer(serializers.ModelSerializer):
         model = Event
         fields = [
             "id", "source_type", "source_type_label", "source_name", "group_name",
-            "target", "device", "interface",
+            "target", "device", "interface", "server",
             "kind", "kind_label", "severity", "severity_label",
             "title", "message", "started_at", "resolved_at", "duration_s", "live_duration_s",
             "trigger_value", "threshold", "unit", "fail_count", "recovery_value",
@@ -354,7 +578,7 @@ class EventSerializer(serializers.ModelSerializer):
             "acknowledged_at", "acknowledged_by", "note", "is_open",
         ]
         read_only_fields = [
-            "source_type", "target", "device", "interface", "kind", "severity",
+            "source_type", "target", "device", "interface", "server", "kind", "severity",
             "title", "message", "started_at", "resolved_at", "duration_s",
             "trigger_value", "threshold", "unit", "fail_count", "recovery_value",
             "notified_alert", "notified_recover",

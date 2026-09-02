@@ -284,3 +284,152 @@ def test_connection(device: Device) -> tuple[bool, str]:
     hostname = results.get("hostname") or "?"
     elapsed = int((time.perf_counter() - started) * 1000)
     return True, f"{hostname} FortiOS {version} ({elapsed}ms)"
+
+
+# =========================================================================
+# 配置备份
+# =========================================================================
+
+
+def _request_raw(device: Device, path: str, params: dict | None = None) -> str:
+    """
+    要一个**纯文本**响应,不是 JSON。
+
+    config/backup 端点返回的是配置文件本身(Content-Type 是
+    application/octet-stream),`resp.json()` 在它上面必然抛 ValueError ——
+    所以不能复用 `_request()`。错误码的处理保持一致,因为那部分和响应
+    体的格式无关。
+    """
+
+    url = f"{_base_url(device)}{path}"
+    query = {"vdom": device.api_vdom or "root"}
+    if params:
+        query.update(params)
+
+    try:
+        resp = requests.get(
+            url,
+            params=query,
+            headers={"Authorization": f"Bearer {device.api_token}"},
+            # 配置文件可能几 MB,而备份不是高频操作 —— 给它比采集宽得多的时间。
+            # 用采集的 timeout(默认 5 秒)会让大配置永远备不下来
+            timeout=max(60.0, device.timeout_ms / 1000 * 10),
+            verify=device.api_verify_tls,
+        )
+    except requests.Timeout as exc:
+        raise FortiApiError(f"API 超时: {path}") from exc
+    except requests.RequestException as exc:
+        raise FortiApiError(f"API 请求失败: {str(exc)[:160]}") from exc
+
+    if resp.status_code == 401:
+        raise FortiApiError("API Token 无效或已过期(401)")
+    if resp.status_code == 403:
+        raise FortiApiError(
+            "API 拒绝访问(403)。备份配置需要 REST API 管理员的 profile 里给"
+            " 系统 → 配置 的读权限,只给 monitor 权限是不够的"
+        )
+    if resp.status_code >= 400:
+        raise FortiApiError(f"HTTP {resp.status_code}: {resp.text[:160]}")
+
+    return resp.text
+
+
+def fetch_config(device: Device) -> str:
+    """
+    整机配置备份。
+
+    **优先 scope=global。**它导出的是包含所有 VDOM 的完整配置,也就是
+    "这台设备的全部状态";scope=vdom 只有当前 VDOM 那一段,拿它当备份的话
+    真要重建设备时会发现缺了全局配置(接口、路由、管理员、HA)。
+
+    只给了 VDOM 级权限的 API 管理员要不到 global,那时退回 vdom ——
+    退回时在文本开头留一行标记,否则页面上看不出这份备份是不完整的。
+    """
+
+    try:
+        text = _request_raw(device, "/monitor/system/config/backup", {"scope": "global"})
+        if text.strip():
+            return text
+        raise FortiApiError("scope=global 返回了空内容")
+    except FortiApiError as exc:
+        log.info("设备 %s 全局配置备份失败(%s),退回 VDOM 级", device.name, exc)
+
+    vdom = device.api_vdom or "root"
+    text = _request_raw(device, "/monitor/system/config/backup", {"scope": "vdom", "vdom": vdom})
+    if not text.strip():
+        raise FortiApiError("配置备份返回空内容(检查 API 管理员的配置读权限)")
+    return f"# netcheck: 仅 VDOM {vdom} 级备份,拿不到全局配置(API 权限不足)\n{text}"
+
+
+# =========================================================================
+# 防火墙策略
+# =========================================================================
+
+
+def _as_names(value) -> list[str]:
+    """
+    FortiOS 把"多值"字段返回成 [{"name": "all"}, ...]。
+
+    但不是所有版本都一样:有的字段直接给字符串,有的给 [{"q_origin_key": ...}]。
+    三种都要认 —— 只认一种的话升级固件后策略页面上的源/目的地址会**变成空的**,
+    而空的地址栏看起来像"这条规则没限制",那是最危险的一种误读。
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, dict):
+        name = value.get("name") or value.get("q_origin_key")
+        return [str(name)] if name else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            out.extend(_as_names(item))
+        return out
+    return [str(value)]
+
+
+def fetch_policies(device: Device) -> list[dict]:
+    """
+    策略表(cmdb)。**顺序就是列表里的顺序** —— 防火墙先匹配先生效,
+    所以不能按 policyid 排序后再展示:policyid 只是编号,和顺序无关。
+    """
+
+    data = _request(device, "/cmdb/firewall/policy")
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise FortiApiError("策略响应形状不认识(results 不是数组)")
+    return results
+
+
+def fetch_policy_stats(device: Device) -> dict[int, dict]:
+    """
+    每条策略的命中统计,按 policyid 索引。
+
+    这是 SNMP 和 SSH 都拿不到的东西,也是这个页面最有价值的一列:
+    **"这条规则从来没命中过"是能直接拿去删规则的结论。**
+
+    端点不存在(权限不足 / 老版本)时返回空字典,让调用方把命中数留 None ——
+    **不要填 0**:"没命中过"和"不知道有没有命中"是两个结论,
+    把后者当成前者会让人删掉一条其实在用的规则。
+    """
+
+    data = _safe(device, "/monitor/firewall/policy")
+    if not data:
+        return {}
+    results = data.get("results") or []
+    if isinstance(results, dict):                 # 某些版本按 id 给字典
+        results = list(results.values())
+
+    out: dict[int, dict] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("policyid", item.get("id"))
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        out[pid] = item
+    return out

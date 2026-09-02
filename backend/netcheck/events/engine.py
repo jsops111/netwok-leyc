@@ -26,7 +26,16 @@ from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from netcheck.models import Device, DeviceInterface, Event, EventKind, ProbeTarget, Severity, SourceType
+from netcheck.models import (
+    Device,
+    DeviceInterface,
+    Event,
+    EventKind,
+    ProbeTarget,
+    Server,
+    Severity,
+    SourceType,
+)
 
 log = logging.getLogger("netcheck.events")
 
@@ -48,6 +57,7 @@ class EventSource:
     target: ProbeTarget | None = None
     device: Device | None = None
     interface: DeviceInterface | None = None
+    server: Server | None = None
     # 附加到事件标题上的限定词,如接口名
     qualifier: str = ""
 
@@ -66,6 +76,13 @@ class EventSource:
         )
 
     @classmethod
+    def from_server(cls, s: Server) -> "EventSource":
+        return cls(
+            source_type=SourceType.SERVER, name=f"{s.name}({s.host})", server=s,
+            fail_threshold=s.fail_threshold, recover_threshold=s.recover_threshold,
+        )
+
+    @classmethod
     def from_interface(cls, i: DeviceInterface, device: Device) -> "EventSource":
         # device 也一起填上:这样"这台设备相关的所有事件"一次能查出来,
         # 包含它的接口事件。唯一约束是四元组,填了不会影响去重。
@@ -78,8 +95,14 @@ class EventSource:
 
     @property
     def cache_key(self) -> str:
+        # source_type 已经把四类来源分开了,所以这里只需要"那一类里的哪一个"。
+        # 注意接口事件的 device 也是非空的(见 from_interface),
+        # 所以 interface 要**先判** —— 否则一台设备下所有接口会共用一份计数
         obj_id = (
-            self.target_id if self.target else (self.device_id if self.device else self.interface_id)
+            self.interface_id if self.interface else
+            self.target_id if self.target else
+            self.server_id if self.server else
+            self.device_id
         )
         return f"streak:{self.source_type}:{obj_id}"
 
@@ -95,12 +118,17 @@ class EventSource:
     def interface_id(self):
         return self.interface.pk if self.interface else None
 
+    @property
+    def server_id(self):
+        return self.server.pk if self.server else None
+
     def event_filter(self) -> dict:
         return {
             "source_type": self.source_type,
             "target_id": self.target_id,
             "device_id": self.device_id,
             "interface_id": self.interface_id,
+            "server_id": self.server_id,
         }
 
 
@@ -158,6 +186,66 @@ def process(source: EventSource, problems: list[dict]) -> EventOutcome:
 
     cache.set(key, streaks, _STREAK_TTL)
     return outcome
+
+
+def record_point_event(
+    source: EventSource,
+    kind: str,
+    severity: str,
+    title: str,
+    message: str,
+    dedupe_seconds: int = 0,
+) -> Event | None:
+    """
+    记一条**瞬时事件** —— 发生了就是发生了,没有"还在持续"这回事。
+
+    配置备份失败、配置发生变更属于这一类:它们不是"状态",而是"事件"。
+    所以这里 started_at == resolved_at、duration_s = 0,页面上照常显示一行,
+    但它永远不会出现在"未恢复"列表里。
+
+    ## 为什么不走 process()
+
+    **`process()` 会把没在 problems 里出现的未恢复事件当成"已恢复"。**
+    它的语义是"这一拍观测到的全部问题",所以调用方必须一次给全。
+    备份任务和采集任务跑在不同的拍子上:备份任务只知道备份的事,
+    拿一个只含 backup_failed 的 problems 去调 process(),这台设备上
+    正在开着的 cpu_high / device_down 会被一起"恢复"掉 —— 一条真实的告警
+    会因为一次成功的备份而消失,而且看不出是谁关的。
+
+    ## 为什么不复用那条部分唯一索引
+
+    瞬时事件 resolved_at 非空,不受 `uniq_open_event_per_source_kind` 约束,
+    所以同一来源同一类型可以有任意多条(配置被改过五次就该有五行)。
+    需要防重复的是"同一件事被记两遍"(比如备份任务被重复派发),
+    那由 dedupe_seconds 处理:窗口内已经有同类事件就不再记。
+    """
+
+    now = timezone.now()
+    if dedupe_seconds > 0:
+        recent = Event.objects.filter(
+            kind=kind,
+            started_at__gte=now - timezone.timedelta(seconds=dedupe_seconds),
+            **source.event_filter(),
+        ).exists()
+        if recent:
+            log.debug("瞬时事件 %s/%s 在去重窗口内,跳过", source.name, kind)
+            return None
+
+    event = Event.objects.create(
+        **source.event_filter(),
+        kind=kind,
+        severity=severity,
+        title=title[:200],
+        message=message,
+        started_at=now,
+        resolved_at=now,
+        duration_s=0,
+        fail_count=1,
+        # 恢复推送对瞬时事件没有意义(它"发生"的同时就"结束"了),
+        # 直接标成已推,免得被 retry_pending_notifications 反复重捞
+        notified_recover=True,
+    )
+    return event
 
 
 def _open_event(source: EventSource, kind: str, problem: dict, now, fail_count: int) -> Event | None:

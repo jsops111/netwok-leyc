@@ -254,6 +254,7 @@ const summary = computed(() => report.data.value || null)
 const kindRank = computed(() => summary.value?.by_kind?.slice(0, 6) || [])
 const targetRank = computed(() => summary.value?.top_targets || [])
 const deviceRank = computed(() => summary.value?.top_devices || [])
+const serverRank = computed(() => summary.value?.top_servers || [])
 </script>
 
 <template>
@@ -312,6 +313,19 @@ const deviceRank = computed(() => summary.value?.top_devices || [])
             <span class="rk-name" :title="item.device__mgmt_ip">{{ item.device__name }}</span>
             <span class="rk-bar">
               <i class="violet" :style="{ width: `${(item.count / (deviceRank[0]?.count || 1)) * 100}%` }" />
+            </span>
+            <span class="rk-num cy-mono">{{ item.count }}</span>
+          </div>
+        </div>
+        <!-- 服务器单独一档,不和设备混在一起排 —— 混着排的话
+             "是网络出问题还是机器出问题"这个分诊要自己一行行看名字 -->
+        <div class="rank-block">
+          <div class="rank-title">出事最多的服务器</div>
+          <div v-if="!serverRank.length" class="rank-empty">无</div>
+          <div v-for="item in serverRank.slice(0, 6)" :key="item.server_id" class="rank-row">
+            <span class="rk-name" :title="item.server__host">{{ item.server__name }}</span>
+            <span class="rk-bar">
+              <i class="warn" :style="{ width: `${(item.count / (serverRank[0]?.count || 1)) * 100}%` }" />
             </span>
             <span class="rk-num cy-mono">{{ item.count }}</span>
           </div>

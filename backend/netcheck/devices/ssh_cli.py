@@ -97,20 +97,25 @@ def _run_exec(client: paramiko.SSHClient, command: str, timeout: float) -> str:
 
 
 def _run_shell(client: paramiko.SSHClient, commands: list[str], timeout: float,
-               enable_password: str = "") -> dict[str, str]:
+               enable_password: str = "", hard_limit: float = 20.0) -> dict[str, str]:
     """
     交互式会话跑一批命令。返回 {命令: 输出}。
 
     读取靠"输出静默"判断结束,而不是等提示符正则 —— 网络设备的提示符会因为
     主机名、配置模式、告警插入而变化,靠正则匹配提示符是 bug 的温床。
     静默 0.4 秒没有新数据就认为这条命令输出完了。
+
+    `hard_limit` 是单条命令的输出上限时间。默认 20 秒对采集类命令够用,
+    但**配置备份必须调大**:`show running-config` 在 48 口交换机上有几千行,
+    走 SSH 逐块读要几十秒,20 秒会把配置**截断**在中间 —— 而截断的备份
+    看起来是一份正常的备份(有内容、有版本号),真要回滚时才发现少了一半。
     """
 
     shell = client.invoke_shell(width=200, height=1000)
     shell.settimeout(timeout)
     outputs: dict[str, str] = {}
 
-    def read_until_idle(idle: float = 0.4, hard_limit: float = 20.0) -> str:
+    def read_until_idle(idle: float = 0.4, hard_limit: float = hard_limit) -> str:
         buf, last_data = "", time.time()
         deadline = time.time() + hard_limit
         while time.time() < deadline:
@@ -128,7 +133,7 @@ def _run_shell(client: paramiko.SSHClient, commands: list[str], timeout: float,
                 time.sleep(0.05)
         return buf
 
-    read_until_idle(0.8)  # 吞掉登录 banner
+    read_until_idle(0.8, hard_limit=min(hard_limit, 20.0))  # 吞掉登录 banner
 
     if enable_password:
         shell.send("enable\n")
