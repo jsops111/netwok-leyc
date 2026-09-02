@@ -722,6 +722,170 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
         return FirewallPolicySerializer
 
     @action(detail=False, methods=["get"])
+    def audit(self, request):
+        """
+        规则审计 —— 防火墙评审时真正要回答的四个问题。
+
+            1. 有没有 any-any-any 的放行规则(等于这对接口之间没有防火墙)
+            2. 有没有放行但不记日志的规则(出事之后查不出来源)
+            3. 有没有从来没命中过的规则(可以清理的候选)
+            4. 有没有**永远匹配不到**的规则(被前面的规则挡住了)
+
+        前三项每条规则自己就能判(模型上的属性),第四项**必须看顺序** ——
+        防火墙是先匹配先生效的,所以要拿整张有序的表来算,这也是它只能在
+        这个接口里做、不能做成表格里一列的原因。
+
+        影子规则这里只判**最保守、绝不会误报的那一种**:某条 enabled 的
+        规则在它的接口对上是 any-any-any,那么同一接口对上排在它后面的规则
+        全都到不了。更一般的影子判定要做地址段和端口区间的包含运算
+        (10.0.0.0/8 盖住 10.1.2.0/24、服务组展开成端口区间),
+        那需要把地址对象和服务对象也同步过来 —— **没做,不猜**。
+        宁可漏报也不误报:告诉工程师"这条规则没用"而它其实在用,
+        比不告诉他糟得多。
+        """
+
+        device_id = request.query_params.get("device")
+        queryset = self.filter_queryset(self.get_queryset())
+        if device_id:
+            queryset = queryset.filter(device_id=device_id)
+        # 顺序是语义,按设备 + vdom + seq 取全量(几百条,一次查完)
+        policies = list(queryset.order_by("device_id", "vdom", "seq", "policy_id"))
+
+        def brief(p):
+            return {
+                "id": p.pk, "device_id": p.device_id, "device_name": p.device.name,
+                "vdom": p.vdom, "policy_id": p.policy_id, "seq": p.seq,
+                "name": p.name, "action": p.action, "enabled": p.enabled,
+                "src_addr": p.src_addr, "dst_addr": p.dst_addr, "service": p.service,
+                "hit_count": p.hit_count, "comments": p.comments,
+            }
+
+        wide_open, no_log, never_hit, shadowed = [], [], [], []
+
+        # ---- 前三项:逐条判 ----
+        for p in policies:
+            if p.permissive_level == "critical":
+                wide_open.append({**brief(p), "level": "critical"})
+            elif p.permissive_level == "warning":
+                wide_open.append({**brief(p), "level": "warning"})
+            if p.logging_off:
+                no_log.append(brief(p))
+            if p.never_hit:
+                never_hit.append(brief(p))
+
+        # ---- 第四项:按 (设备, vdom, 接口对) 分组,找 catch-all 之后的规则 ----
+        catch_all: dict = {}
+        for p in policies:
+            key = (p.device_id, p.vdom, p.intf_pair)
+            blocker = catch_all.get(key)
+            if blocker is not None:
+                shadowed.append({
+                    **brief(p),
+                    "shadowed_by": {"id": blocker.pk, "policy_id": blocker.policy_id,
+                                    "seq": blocker.seq, "name": blocker.name,
+                                    "action": blocker.action},
+                    "reason": (
+                        f"同一接口对上,顺序在它前面的 #{blocker.seq + 1}"
+                        f"(策略 {blocker.policy_id})是 any-any-any 的"
+                        f"{'放行' if blocker.action == PolicyAction.ACCEPT else '拒绝'}规则,"
+                        "这条永远匹配不到"
+                    ),
+                })
+                continue
+            # 任何动作的 any-any-any 都会挡住后面(拒绝的兜底规则同样如此,
+            # 而兜底规则本来就该放在最后 —— 它后面还有规则就是配错了)
+            if (p.enabled and p._is_any(p.src_addr) and p._is_any(p.dst_addr)
+                    and p._is_any(p.service)):
+                catch_all[key] = p
+
+        # 没有命中统计时,"从未命中"这一项没有意义 —— 明确说出来,
+        # 而不是给一个空列表让人以为"没有这种规则"
+        has_hit_stats = any(p.hit_count is not None for p in policies)
+
+        return Response({
+            "generated_at": timezone.now(),
+            "total": len(policies),
+            "has_hit_stats": has_hit_stats,
+            "findings": [
+                {"key": "wide_open", "label": "过宽的放行规则",
+                 "hint": "源/目的/服务都是任意的 accept —— 等于这对接口之间没有防火墙",
+                 "count": len(wide_open), "items": wide_open[:100]},
+                {"key": "shadowed", "label": "永远匹配不到的规则",
+                 "hint": "同一接口对上被前面的 any-any-any 规则挡住了。防火墙先匹配先生效",
+                 "count": len(shadowed), "items": shadowed[:100]},
+                {"key": "no_log", "label": "放行但不记日志",
+                 "hint": "出事之后查不出来源。放行规则恰恰是最需要留痕的一类",
+                 "count": len(no_log), "items": no_log[:100]},
+                {"key": "never_hit", "label": "从未命中过的规则",
+                 "hint": ("可以清理的候选" if has_hit_stats
+                          else "**这批数据没有命中统计**(SSH 通道),这一项无法判断"),
+                 "count": len(never_hit) if has_hit_stats else None,
+                 "items": never_hit[:100]},
+            ],
+        })
+
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """
+        导出 CSV。防火墙评审要把规则表交给安全/审计的人,而他们用 Excel。
+
+        两个细节:
+        - **带 UTF-8 BOM**,不然 Excel 打开中文是乱码(这是国内环境的常态)
+        - 命中数为空时导出「未知」而不是空单元格或 0 ——
+          交出去的表格同样不能让人把"不知道"读成"没命中"
+        """
+
+        import csv
+        import io as _io
+
+        from django.http import HttpResponse
+
+        queryset = self.filter_queryset(self.get_queryset()).order_by(
+            "device_id", "vdom", "seq", "policy_id")
+
+        buf = _io.StringIO()
+        buf.write("\ufeff")            # BOM
+        writer = csv.writer(buf)
+        writer.writerow([
+            "设备", "VDOM", "顺序", "策略ID", "名称", "源接口", "源地址",
+            "目的接口", "目的地址", "服务", "生效时间", "动作", "NAT", "状态",
+            "日志", "命中次数", "字节数", "最后命中", "风险", "备注", "同步通道", "同步时间",
+        ])
+        count = 0
+        for p in queryset.iterator(chunk_size=500):
+            risks = []
+            if p.permissive_level == "critical":
+                risks.append("过宽(any-any-any 放行)")
+            elif p.permissive_level == "warning":
+                risks.append("偏宽(服务任意)")
+            if p.logging_off:
+                risks.append("不记日志")
+            if p.never_hit:
+                risks.append("从未命中")
+            writer.writerow([
+                p.device.name, p.vdom, p.seq + 1, p.policy_id, p.name,
+                " ".join(p.src_intf or []), " ".join(p.src_addr or []),
+                " ".join(p.dst_intf or []), " ".join(p.dst_addr or []),
+                " ".join(p.service or []), p.schedule,
+                p.get_action_display(), "是" if p.nat else "否",
+                "启用" if p.enabled else "已停用",
+                p.log_traffic or "不记录",
+                "未知" if p.hit_count is None else p.hit_count,
+                "未知" if p.bytes_count is None else p.bytes_count,
+                timezone.localtime(p.last_hit_at).strftime("%Y-%m-%d %H:%M:%S") if p.last_hit_at else "",
+                " / ".join(risks),
+                p.comments, p.method.upper(),
+                timezone.localtime(p.synced_at).strftime("%Y-%m-%d %H:%M:%S") if p.synced_at else "",
+            ])
+            count += 1
+
+        response = HttpResponse(buf.getvalue(), content_type="text/csv; charset=utf-8")
+        stamp = timezone.localtime(timezone.now()).strftime("%Y%m%d-%H%M%S")
+        response["Content-Disposition"] = f'attachment; filename="firewall-policies-{stamp}.csv"'
+        log.info("导出防火墙策略 CSV:%d 条", count)
+        return response
+
+    @action(detail=False, methods=["get"])
     def summary(self, request):
         """
         策略页顶部那几块数字:按设备一行。
@@ -762,6 +926,24 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
         )
         hits = {r["device_id"]: r for r in hit_rows}
 
+        # 审计计数。**判定条件在 SQL 里重写了一遍**(模型属性数据库不认识),
+        # 和 filters.FirewallPolicyFilter 里那两个方法必须保持一致
+        svc_any = Q(service__icontains='"all"') | Q(service__icontains='"any"') | Q(service=[])
+        src_any = Q(src_addr__icontains='"all"') | Q(src_addr__icontains='"any"') | Q(src_addr=[])
+        dst_any = Q(dst_addr__icontains='"all"') | Q(dst_addr__icontains='"any"') | Q(dst_addr=[])
+        accept_on = Q(enabled=True, action=PolicyAction.ACCEPT)
+        audit_rows = (
+            FirewallPolicy.objects.filter(device__in=devices)
+            .values("device_id")
+            .annotate(
+                wide=Count("id", filter=accept_on & svc_any & src_any & dst_any),
+                nolog=Count("id", filter=accept_on & (
+                    Q(log_traffic="") | Q(log_traffic__iexact="disable")
+                    | Q(log_traffic__iexact="disabled"))),
+            )
+        )
+        audits = {r["device_id"]: r for r in audit_rows}
+
         payload = []
         for device in devices:
             bucket = stats.get(device.pk, {"total": 0, "accept": 0, "deny": 0, "disabled": 0})
@@ -780,6 +962,9 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
                 # 没有命中统计时**给 None 而不是 0** —— 0 会被读成
                 # "所有规则都命中过",而真相是我们不知道
                 "never_hit": hit["never"] if hit["with_stats"] else None,
+                # 审计:这两项不依赖命中统计,SSH 通道也能判
+                "wide_open": audits.get(device.pk, {}).get("wide", 0),
+                "no_log": audits.get(device.pk, {}).get("nolog", 0),
             })
         return Response({"generated_at": timezone.now(), "devices": payload})
 

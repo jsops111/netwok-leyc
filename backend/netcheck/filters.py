@@ -103,6 +103,12 @@ class FirewallPolicyFilter(filters.FilterSet):
     # (那是"不知道",不是"没命中"),所以这里显式排除 null
     never_hit = filters.BooleanFilter(method="filter_never_hit", label="从未命中")
     has_hits = filters.BooleanFilter(method="filter_has_hits", label="有命中统计")
+    # 审计筛选。**在 SQL 里重写一遍判定条件,不是拿属性去 filter** ——
+    # permissive_level / logging_off 是 Python 属性,数据库不认识它们。
+    # 两边的规则必须一致(和"模型 clean 要在序列化器里写第二遍"同一类问题),
+    # 改 models.py 里那几个属性时**这里要一起改**
+    permissive = filters.BooleanFilter(method="filter_permissive", label="过宽规则")
+    no_log = filters.BooleanFilter(method="filter_no_log", label="放行但不记日志")
 
     class Meta:
         model = FirewallPolicy
@@ -135,6 +141,35 @@ class FirewallPolicyFilter(filters.FilterSet):
         if value is None:
             return queryset
         return queryset.filter(hit_count__isnull=not value)
+
+    def filter_permissive(self, queryset, name, value):
+        """
+        过宽 = 启用 + 放行 + 服务任意 + (源或目的任意)。
+
+        JSON 数组里找 "all"/"any" 用 icontains 匹配文本形式 —— 精确匹配要
+        jsonb 的 contains 查询,而 `["all"]` 和 `["ALL"]` 大小写不统一,
+        icontains 反而更稳。代价是 `["all-servers"]` 这种名字会被误命中,
+        所以带引号一起匹配:`"all"` 而不是 `all`
+        """
+        from django.db.models import Q
+
+        if value is None:
+            return queryset
+        svc_any = Q(service__icontains='"all"') | Q(service__icontains='"any"') | Q(service=[])
+        src_any = Q(src_addr__icontains='"all"') | Q(src_addr__icontains='"any"') | Q(src_addr=[])
+        dst_any = Q(dst_addr__icontains='"all"') | Q(dst_addr__icontains='"any"') | Q(dst_addr=[])
+        cond = Q(enabled=True, action="accept") & svc_any & (src_any | dst_any)
+        return queryset.filter(cond) if value else queryset.exclude(cond)
+
+    def filter_no_log(self, queryset, name, value):
+        from django.db.models import Q
+
+        if value is None:
+            return queryset
+        cond = Q(enabled=True, action="accept") & (
+            Q(log_traffic="") | Q(log_traffic__iexact="disable") | Q(log_traffic__iexact="disabled")
+        )
+        return queryset.filter(cond) if value else queryset.exclude(cond)
 
 
 class EventFilter(filters.FilterSet):

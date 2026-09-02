@@ -529,6 +529,9 @@ class FirewallPolicySerializer(serializers.ModelSerializer):
     # 三态:True / False / None(不知道)。**前端要区分 None 和 False** ——
     # "从没命中过"能拿去删规则,"不知道有没有命中"不能
     never_hit = serializers.BooleanField(read_only=True, allow_null=True)
+    # 规则审计:过宽 / 不记日志。只对"启用且放行"的规则判(见 models.py)
+    permissive_level = serializers.CharField(read_only=True)
+    logging_off = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = FirewallPolicy
@@ -538,6 +541,7 @@ class FirewallPolicySerializer(serializers.ModelSerializer):
             "action", "action_label", "enabled", "nat", "log_traffic", "comments", "uuid",
             "hit_count", "bytes_count", "packets", "sessions",
             "first_hit_at", "last_hit_at", "never_hit",
+            "permissive_level", "logging_off",
             "synced_at", "method",
         ]
         read_only_fields = fields

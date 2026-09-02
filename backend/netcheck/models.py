@@ -1174,6 +1174,72 @@ class FirewallPolicy(models.Model):
             return None
         return self.hit_count == 0
 
+    # ---- 规则审计 ----
+    #
+    # 下面这几项是**防火墙评审时真正要回答的问题**,不是展示字段。
+    # 它们只依赖这一行自己(不需要看别的规则),所以做成属性由序列化器带出去;
+    # 需要看"前后顺序"的那一类(影子规则)算不出来,在 audit 接口里做。
+    #
+    # 判定一律**只对 enabled 且 action=accept 的规则**:一条停用的规则或者
+    # 一条拒绝规则写成 any-any-any 不是风险(前者不生效,后者是兜底拒绝,
+    # 那正是该有的写法)。把它们也标红会让真正的问题淹在噪声里。
+
+    # FortiOS 里"任意"有两种写法:地址是 all,服务是 ALL,接口是 any。
+    # 大小写不统一(实测两种都见过),所以一律折成小写比
+    _ANY = {"all", "any"}
+
+    def _is_any(self, values) -> bool:
+        if not values:
+            # 空数组也是"任意" —— 策略里没写这一维就等于不限制。
+            # 把空当成"已限制"是这里最危险的误判
+            return True
+        return any(str(v).strip().lower() in self._ANY for v in values)
+
+    @property
+    def permissive_level(self) -> str:
+        """
+        过宽规则。返回 "critical" / "warning" / ""。
+
+        `critical` = 源、目的、服务**三者全是任意**的放行规则,也就是
+        any-any-any allow。这是防火墙评审里第一条要挑出来的东西:
+        它等于在这对接口之间没有防火墙,而且它会让**它后面所有规则永远
+        匹配不到**(见 audit 接口的影子规则)。
+
+        `warning` = 服务是任意,且源或目的之一是任意。这类规则通常是
+        "先放开再说"留下来的,应该收窄。
+        """
+        if not self.enabled or self.action != PolicyAction.ACCEPT:
+            return ""
+        src_any = self._is_any(self.src_addr)
+        dst_any = self._is_any(self.dst_addr)
+        svc_any = self._is_any(self.service)
+        if src_any and dst_any and svc_any:
+            return "critical"
+        if svc_any and (src_any or dst_any):
+            return "warning"
+        return ""
+
+    @property
+    def logging_off(self) -> bool:
+        """
+        放行但不记日志。
+
+        出了事之后"这个访问是从哪儿来的"就查不出来了 —— 而放行规则恰恰
+        是最需要留痕的那一类。FortiOS 里 `set logtraffic disable`,
+        或者这一项根本没配(那也是不记)。
+        """
+        if not self.enabled or self.action != PolicyAction.ACCEPT:
+            return False
+        return str(self.log_traffic or "").strip().lower() in ("", "disable", "disabled")
+
+    @property
+    def intf_pair(self) -> tuple:
+        """(源接口集合, 目的接口集合) —— 影子规则判定要按接口对分组。"""
+        return (
+            frozenset(str(v).strip().lower() for v in (self.src_intf or ["any"])),
+            frozenset(str(v).strip().lower() for v in (self.dst_intf or ["any"])),
+        )
+
 
 # =========================================================================
 # 事件 —— 需求里的「事件报告」表

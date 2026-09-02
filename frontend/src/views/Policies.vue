@@ -8,7 +8,7 @@ import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
 import { api, errText } from '@/api'
-import type { PolicyRow, PolicySummaryRow } from '@/api'
+import type { PolicyAudit, PolicyRow, PolicySummaryRow } from '@/api'
 import { useMetaStore } from '@/stores/meta'
 import { ago, bytes, dateTimeOf, int } from '@/composables/useFormat'
 import { STATE } from '@/theme'
@@ -54,6 +54,16 @@ const ordering = ref('seq')
 const detailOpen = ref(false)
 const detail = ref<PolicyRow | null>(null)
 
+// 审计。**作为网络工程师真正要回答的问题**,不是展示字段:
+// 有没有 any-any-any 放行、有没有规则永远匹配不到、有没有放行不记日志、
+// 有没有从来没命中过的。前三项 SSH 通道也能判,最后一项要命中统计
+const audit = ref<PolicyAudit | null>(null)
+const auditLoading = ref(false)
+const auditOpen = ref(false)
+// 审计里点某条规则 → 把它筛到表格里
+const permissiveOnly = ref(false)
+const noLogOnly = ref(false)
+
 const current = computed(() => summary.value.find((s) => s.device_id === selected.value) || null)
 const totals = computed(() => {
   const list = summary.value
@@ -66,6 +76,9 @@ const totals = computed(() => {
     neverHit: list.some((s) => s.has_hit_stats)
       ? list.reduce((a, b) => a + (b.never_hit ?? 0), 0)
       : null,
+    // 这两项不依赖命中统计 —— SSH 通道同步来的策略也能判
+    wideOpen: list.reduce((a, b) => a + (b.wide_open ?? 0), 0),
+    noLog: list.reduce((a, b) => a + (b.no_log ?? 0), 0),
   }
 })
 
@@ -100,6 +113,8 @@ async function loadPolicies() {
       action: actionFilter.value || undefined,
       enabled: enabledFilter.value === null ? undefined : enabledFilter.value,
       never_hit: neverHitOnly.value ? true : undefined,
+      permissive: permissiveOnly.value ? true : undefined,
+      no_log: noLogOnly.value ? true : undefined,
     })
     policies.value = data.results
     total.value = data.count
@@ -110,17 +125,34 @@ async function loadPolicies() {
   }
 }
 
+async function loadAudit() {
+  if (selected.value === null) { audit.value = null; return }
+  auditLoading.value = true
+  try {
+    const { data } = await api.policyAudit(selected.value)
+    audit.value = data
+  } catch (e) {
+    message.error(errText(e))
+  } finally {
+    auditLoading.value = false
+  }
+}
+
 onMounted(async () => {
   await meta.load()
   await loadSummary()
   await loadPolicies()
+  await loadAudit()
 })
 
 // 换设备/换筛选都回到第一页 —— 停在第 7 页看另一台设备是没有意义的
-watch([selected, keyword, actionFilter, enabledFilter, neverHitOnly, ordering], () => {
+watch([selected, keyword, actionFilter, enabledFilter, neverHitOnly,
+       permissiveOnly, noLogOnly, ordering], () => {
   page.value = 1
   void loadPolicies()
 })
+// 换设备要重算审计 —— 审计是按设备算的(影子规则要看那台设备的完整顺序)
+watch(selected, () => void loadAudit())
 watch([page, pageSize], () => void loadPolicies())
 
 async function syncNow(deviceId: number) {
@@ -128,6 +160,7 @@ async function syncNow(deviceId: number) {
   try {
     const { data } = await api.syncPoliciesNow(deviceId)
     message.success(data.detail)
+    // 同步是异步跑的,这里不立刻刷 —— 提示里已经说了"已排入队列"
   } catch (e) {
     message.error(errText(e))
   } finally {
@@ -200,6 +233,16 @@ const summaryColumns: DataTableColumns<PolicySummaryRow> = [
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.disabled ? STATE.degraded : 'var(--cy-ink-3)'}`,
     }, r.disabled ? int(r.disabled) : '—') },
+  { title: '过宽', key: 'wide_open', width: 66, className: 'num',
+    render: (r) => h('span', {
+      style: `font-size:11.5px;font-weight:700;color:${r.wide_open ? STATE.down : 'var(--cy-ink-3)'}`,
+      title: 'any-any-any 的放行规则',
+    }, r.wide_open ? String(r.wide_open) : '—') },
+  { title: '无日志', key: 'no_log', width: 72, className: 'num',
+    render: (r) => h('span', {
+      style: `font-size:11.5px;color:${r.no_log ? STATE.degraded : 'var(--cy-ink-3)'}`,
+      title: '放行但不记日志',
+    }, r.no_log ? String(r.no_log) : '—') },
   { title: '从未命中', key: 'never_hit', width: 96, className: 'num',
     render: (r) => {
       // **null = 没有命中统计**(SSH 通道)。显示"无统计"而不是 0 ——
@@ -267,6 +310,36 @@ const policyColumns: DataTableColumns<PolicyRow> = [
     render: (r) => r.enabled
       ? h('span', { style: `font-size:11px;color:${STATE.up}` }, '启用')
       : h('span', { style: `font-size:11px;color:${STATE.degraded};font-weight:700` }, '已停用') },
+  { title: '风险', key: 'risk', width: 104,
+    render: (r) => {
+      // **只标"启用且放行"的规则**(判定在后端)。一条停用规则或者
+      // any-any-any 的**拒绝**规则不是风险 —— 后者正是兜底该有的写法,
+      // 把它也标红会让真正的问题淹在噪声里
+      const tags = []
+      if (r.permissive_level === 'critical') {
+        tags.push(h(NTag, {
+          size: 'tiny', bordered: false, style: `color:${STATE.down};border:1px solid ${STATE.down}`,
+          title: '源/目的/服务都是任意的放行规则 —— 等于这对接口之间没有防火墙',
+        }, () => '过宽'))
+      } else if (r.permissive_level === 'warning') {
+        tags.push(h(NTag, {
+          size: 'tiny', bordered: false,
+          style: `color:${STATE.degraded};border:1px solid ${STATE.degraded}`,
+          title: '服务是任意,且源或目的之一是任意 —— 应该收窄',
+        }, () => '偏宽'))
+      }
+      if (r.logging_off) {
+        tags.push(h(NTag, {
+          size: 'tiny', bordered: false,
+          style: `color:${STATE.degraded};border:1px solid ${STATE.degraded}`,
+          title: '放行但不记日志 —— 出事之后查不出来源',
+        }, () => '无日志'))
+      }
+      if (!tags.length) {
+        return h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, '—')
+      }
+      return h('div', { style: 'display:flex;gap:3px;flex-wrap:wrap' }, tags)
+    } },
   { title: '命中', key: 'hit_count', width: 112, className: 'num',
     render: (r) => {
       // 三态。**null 显示「未知」,不显示 0** —— 见文件头第 2 条
@@ -295,6 +368,36 @@ const actionOptions = computed(() => [
   { label: '全部动作', value: '' },
   ...meta.options('policy_action'),
 ])
+
+/** 导出 CSV 的地址 —— **带上当前所有筛选条件**,导出的就是你看到的那些行。 */
+const exportUrl = computed(() => api.policyExportUrl({
+  device: selected.value ?? undefined,
+  ordering: ordering.value,
+  keyword: keyword.value || undefined,
+  action: actionFilter.value || undefined,
+  enabled: enabledFilter.value === null ? undefined : enabledFilter.value,
+  never_hit: neverHitOnly.value ? true : undefined,
+  permissive: permissiveOnly.value ? true : undefined,
+  no_log: noLogOnly.value ? true : undefined,
+}))
+
+/** 审计发现里点一条 → 清掉别的筛选,只筛这一类 */
+function focusFinding(key: string) {
+  keyword.value = ''
+  actionFilter.value = null
+  enabledFilter.value = null
+  permissiveOnly.value = key === 'wide_open'
+  noLogOnly.value = key === 'no_log'
+  neverHitOnly.value = key === 'never_hit'
+  auditOpen.value = false
+}
+
+const FINDING_COLORS: Record<string, string> = {
+  wide_open: STATE.down,
+  shadowed: 'var(--cy-violet)',
+  no_log: STATE.degraded,
+  never_hit: STATE.degraded,
+}
 </script>
 
 <template>
@@ -304,8 +407,10 @@ const actionOptions = computed(() => [
       <StatTile label="防火墙" :value="totals.devices" unit="台" :dim-zero="false"
                 foot="已开启策略同步的" />
       <StatTile label="策略总数" :value="totals.policies" unit="条" :dim-zero="false" />
-      <StatTile label="已停用规则" :value="totals.disabled" unit="条" :color="STATE.degraded"
-                foot="留在设备上但不生效" />
+      <StatTile label="过宽的放行规则" :value="totals.wideOpen" unit="条" :color="STATE.down"
+                foot="any-any-any allow —— 等于没有防火墙" />
+      <StatTile label="放行但不记日志" :value="totals.noLog" unit="条" :color="STATE.degraded"
+                foot="出事之后查不出来源" />
       <StatTile
         label="从未命中"
         :value="totals.neverHit"
@@ -324,7 +429,7 @@ const actionOptions = computed(() => [
       </template>
       <NDataTable
         :columns="summaryColumns" :data="summary" :loading="loading"
-        size="small" :bordered="false" :single-line="false" :scroll-x="1000"
+        size="small" :bordered="false" :single-line="false" :scroll-x="1160"
       />
       <div v-if="!summary.length && !loading" class="cy-empty">
         还没有防火墙开启策略同步。到<b>配置中心 → 网络设备</b>编辑一台
@@ -332,6 +437,69 @@ const actionOptions = computed(() => [
         <b>强烈建议配 API Token</b>:只有 REST API 拿得到命中计数,而
         「这条规则从来没命中过」是这一页最有价值的结论 —— SSH 通道只能看到配置。
       </div>
+    </CyberPanel>
+
+    <!-- ============ 规则审计 ============ -->
+    <CyberPanel
+      v-if="current"
+      title="规则审计"
+      :subtitle="`${current.device_name} · 防火墙评审要回答的四个问题`"
+      :level="audit && audit.findings.some((f) => f.key === 'wide_open' && (f.count || 0) > 0)
+        ? 'critical' : 'normal'"
+    >
+      <template #actions>
+        <NButton size="tiny" ghost :loading="auditLoading" @click="loadAudit()">重新审计</NButton>
+        <NButton size="tiny" ghost @click="auditOpen = !auditOpen">
+          {{ auditOpen ? '收起明细' : '展开明细' }}
+        </NButton>
+      </template>
+
+      <div v-if="auditLoading && !audit" class="modal-loading">审计中…</div>
+      <template v-else-if="audit">
+        <div class="findings">
+          <button
+            v-for="f in audit.findings" :key="f.key"
+            class="finding"
+            :class="{ hit: (f.count || 0) > 0, na: f.count === null }"
+            :style="{ '--c': FINDING_COLORS[f.key] }"
+            :disabled="f.count === null || f.count === 0 || f.key === 'shadowed'"
+            :title="f.key === 'shadowed'
+              ? '影子规则在下面的明细里看 —— 它依赖顺序,没法做成表格筛选'
+              : '点一下把这一类筛到下面的规则表里'"
+            @click="focusFinding(f.key)"
+          >
+            <span class="f-num cy-mono">{{ f.count === null ? '?' : f.count }}</span>
+            <span class="f-label">{{ f.label }}</span>
+            <span class="f-hint">{{ f.hint }}</span>
+          </button>
+        </div>
+
+        <!-- 明细。影子规则只能在这里看:它依赖前后顺序,做不成表格里一列 -->
+        <div v-if="auditOpen" class="finding-detail">
+          <template v-for="f in audit.findings" :key="f.key">
+            <div v-if="f.items.length" class="fd-block">
+              <div class="fd-head" :style="{ color: FINDING_COLORS[f.key] }">
+                {{ f.label }}({{ f.count }})
+              </div>
+              <div v-for="it in f.items" :key="`${f.key}-${it.id}`" class="fd-row">
+                <span class="fd-seq cy-mono">#{{ it.seq + 1 }}</span>
+                <span class="fd-name">{{ it.name || '(未命名)' }}</span>
+                <span class="fd-addr cy-mono">
+                  {{ it.src_addr.join(',') || 'any' }} → {{ it.dst_addr.join(',') || 'any' }}
+                  · {{ it.service.join(',') || 'ALL' }}
+                </span>
+                <span v-if="it.reason" class="fd-reason">{{ it.reason }}</span>
+                <span v-else-if="it.comments" class="fd-reason dim">{{ it.comments }}</span>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div v-if="!audit.has_hit_stats" class="audit-note">
+          这批数据没有命中统计(SSH 通道),所以「从未命中」那一项**无法判断** ——
+          不是"没有这种规则"。要它就给这台设备配 API Token。
+        </div>
+      </template>
     </CyberPanel>
 
     <!-- ============ 规则表 ============ -->
@@ -371,11 +539,22 @@ const actionOptions = computed(() => [
           <NSwitch v-model:value="neverHitOnly" size="small" :disabled="!current.has_hit_stats" />
           <span>只看从未命中的</span>
         </label>
+        <label class="never-toggle">
+          <NSwitch v-model:value="permissiveOnly" size="small" />
+          <span>只看过宽的</span>
+        </label>
+        <label class="never-toggle">
+          <NSwitch v-model:value="noLogOnly" size="small" />
+          <span>只看无日志的</span>
+        </label>
+        <!-- 导出走普通链接:防火墙评审要把规则表交给安全/审计的人,而他们用 Excel。
+             带 UTF-8 BOM,否则中文是乱码 -->
+        <a :href="exportUrl" class="csv-link" download>导出 CSV(当前筛选)</a>
       </div>
 
       <NDataTable
         :columns="policyColumns" :data="policies" :loading="policiesLoading"
-        size="small" :bordered="false" :single-line="false" :scroll-x="1300"
+        size="small" :bordered="false" :single-line="false" :scroll-x="1420"
         :pagination="{
           page, pageSize, itemCount: total, showSizePicker: true, pageSizes: [25, 50, 100],
           onUpdatePage: (p: number) => (page = p),
@@ -475,6 +654,91 @@ const actionOptions = computed(() => [
   cursor: pointer;
 }
 .never-toggle.off { color: var(--cy-ink-3); cursor: not-allowed; }
+
+.findings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 9px;
+}
+/* 发现项是可点的(点了筛到下面的表里),所以用 button 而不是 div ——
+   键盘能 tab 到、能回车触发,这是免费拿到的 */
+.finding {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas: 'num label' 'num hint';
+  gap: 0 10px;
+  align-items: center;
+  padding: 8px 11px;
+  text-align: left;
+  background: rgba(var(--cy-raised-rgb), 0.5);
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.14);
+  border-left: 2px solid var(--cy-unknown);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.finding:hover:not(:disabled) { background: rgba(var(--cy-cyan-rgb), 0.07); }
+.finding:disabled { cursor: default; opacity: 0.75; }
+.finding.hit { border-left-color: var(--c); }
+.finding.na { opacity: 0.6; }
+.f-num {
+  grid-area: num;
+  font-size: 21px;
+  font-weight: 700;
+  color: var(--cy-ink-3);
+  min-width: 30px;
+  text-align: right;
+}
+.finding.hit .f-num { color: var(--c); }
+.f-label { grid-area: label; font-size: 12px; color: var(--cy-ink); }
+.f-hint { grid-area: hint; font-size: 10px; color: var(--cy-ink-3); line-height: 1.45; }
+
+.finding-detail {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(var(--cy-cyan-rgb), 0.12);
+}
+.fd-block { margin-bottom: 12px; }
+.fd-head { font-size: 11px; letter-spacing: 0.06em; margin-bottom: 4px; }
+.fd-row {
+  display: grid;
+  grid-template-columns: 42px minmax(90px, 160px) minmax(140px, 1fr);
+  gap: 4px 10px;
+  font-size: 11px;
+  padding: 2px 0;
+  align-items: baseline;
+}
+.fd-seq { color: var(--cy-ink-3); }
+.fd-name { color: var(--cy-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-addr { color: var(--cy-ink-2); font-size: 10.5px; word-break: break-all; }
+.fd-reason {
+  grid-column: 2 / -1;
+  font-size: 10.5px;
+  color: var(--cy-degraded);
+  line-height: 1.5;
+}
+.fd-reason.dim { color: var(--cy-ink-3); }
+
+.audit-note {
+  margin-top: 10px;
+  font-size: 10.5px;
+  color: var(--cy-ink-3);
+  line-height: 1.6;
+  padding-left: 8px;
+  border-left: 2px solid rgba(var(--cy-degraded-rgb), 0.5);
+}
+
+.csv-link {
+  font-size: 11px;
+  color: var(--cy-cyan);
+  text-decoration: none;
+  border: 1px solid rgba(var(--cy-cyan-rgb), 0.45);
+  padding: 3px 9px;
+  margin-left: auto;
+  transition: background 0.15s ease;
+}
+.csv-link:hover { background: rgba(var(--cy-cyan-rgb), 0.12); }
 
 .kv-grid {
   display: grid;

@@ -419,6 +419,10 @@ export interface PolicyRow {
   last_hit_at: string | null
   /** 三态:true=从未命中 / false=命中过 / null=**不知道**(SSH 通道没有计数) */
   never_hit: boolean | null
+  /** 过宽规则:'critical'(any-any-any 放行)/ 'warning'(服务任意)/ ''(不算) */
+  permissive_level: string
+  /** 放行但不记日志 —— 出事之后查不出来源 */
+  logging_off: boolean
   synced_at: string
   method: string
   raw?: Record<string, any>
@@ -439,6 +443,44 @@ export interface PolicySummaryRow {
   disabled: number
   has_hit_stats: boolean
   never_hit: number | null
+  /** 过宽的放行规则条数。不依赖命中统计,SSH 通道也能判 */
+  wide_open: number
+  /** 放行但不记日志的条数 */
+  no_log: number
+}
+
+export interface PolicyAuditItem {
+  id: number
+  device_id: number
+  device_name: string
+  vdom: string
+  policy_id: number
+  seq: number
+  name: string
+  action: string
+  enabled: boolean
+  src_addr: string[]
+  dst_addr: string[]
+  service: string[]
+  hit_count: number | null
+  comments: string
+  level?: string
+  reason?: string
+  shadowed_by?: { id: number; policy_id: number; seq: number; name: string; action: string }
+}
+
+export interface PolicyAudit {
+  generated_at: string
+  total: number
+  has_hit_stats: boolean
+  findings: Array<{
+    key: string
+    label: string
+    hint: string
+    /** null = 无法判断(没有命中统计时的「从未命中」) */
+    count: number | null
+    items: PolicyAuditItem[]
+  }>
 }
 
 export interface EventRow {
@@ -742,6 +784,17 @@ export const api = {
   policySummary: () =>
     http.get<{ generated_at: string; devices: PolicySummaryRow[] }>('/firewall-policies/summary/'),
   syncPoliciesNow: (id: number) => http.post<{ detail: string }>(`/devices/${id}/sync_policies_now/`),
+  policyAudit: (deviceId?: number) =>
+    http.get<PolicyAudit>('/firewall-policies/audit/', { params: { device: deviceId } }),
+  /** CSV 导出走普通链接,不经过 axios —— 同 backupDownloadUrl 的理由 */
+  policyExportUrl: (params: Record<string, any> = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') q.set(k, String(v))
+    }
+    const qs = q.toString()
+    return `/api/firewall-policies/export/${qs ? `?${qs}` : ''}`
+  },
 
   // 事件
   events: (params?: object) => http.get<Paged<EventRow>>('/events/', { params }),

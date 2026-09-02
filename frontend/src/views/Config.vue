@@ -356,6 +356,29 @@ const probeFields: FieldSpec[] = [
   { key: 'order', label: '排序', type: 'number', min: 0 },
 ]
 
+/**
+ * SSH 凭据什么时候要显示。
+ *
+ * **不能只看采集通道。**备份走的是 SSH(`show running-config` /
+ * FortiOS 的 `show`),而它和 collect_method 完全无关 —— 一台用 SNMP 采
+ * 指标的交换机想备份配置,仍然需要 SSH 用户名和密码。只看采集通道的话,
+ * 那台设备开了备份之后输入框是隐藏的,而后端强制要求填 → 保存永远失败,
+ * 而页面上找不到能填的地方。策略同步同理(它可以退回 SSH 通道)。
+ */
+const needsSsh = (m: Record<string, any>) =>
+  [m.collect_method, m.fallback_method].includes('ssh')
+  || m.backup_enabled === true
+  || (m.kind === 'firewall' && m.policy_sync_enabled === true)
+
+/**
+ * API Token 什么时候要显示。除了 api 采集通道,还有两种情况:
+ * FortiGate 的备份优先走 API 的 config/backup 端点(那个端点给的是能直接
+ * 回灌的备份文件,CLI 的 show 输出不是),策略同步也只有 API 才有命中计数。
+ */
+const needsApi = (m: Record<string, any>) =>
+  [m.collect_method, m.fallback_method].includes('api')
+  || (m.vendor === 'fortinet' && (m.backup_enabled === true || m.policy_sync_enabled === true))
+
 const deviceFields: FieldSpec[] = [
   { key: 'name', label: '设备名称', type: 'text', required: true },
   { key: 'mgmt_ip', label: '管理地址', type: 'text', required: true, placeholder: '10.0.0.1' },
@@ -400,31 +423,26 @@ const deviceFields: FieldSpec[] = [
     show: (m) => m.snmp_version === '3' && m.snmp_v3_level === 'authPriv'
       && [m.collect_method, m.fallback_method].includes('snmp') },
 
-  { key: 'ssh_username', label: 'SSH 用户名', type: 'text',
-    show: (m) => [m.collect_method, m.fallback_method].includes('ssh') },
-  { key: 'ssh_port', label: 'SSH 端口', type: 'number', min: 1, max: 65535,
-    show: (m) => [m.collect_method, m.fallback_method].includes('ssh') },
-  { key: 'ssh_password', label: 'SSH 密码', type: 'password',
-    show: (m) => [m.collect_method, m.fallback_method].includes('ssh'),
-    hint: '密码和私钥填一个即可' },
+  { key: 'ssh_username', label: 'SSH 用户名', type: 'text', show: needsSsh,
+    hint: '采集、配置备份、策略同步共用这一份凭据' },
+  { key: 'ssh_port', label: 'SSH 端口', type: 'number', min: 1, max: 65535, show: needsSsh },
+  { key: 'ssh_password', label: 'SSH 密码', type: 'password', show: needsSsh,
+    hint: '密码和私钥填一个即可;编辑时留空表示不修改已存的值' },
   { key: 'ssh_enable_password', label: 'enable 密码', type: 'password',
-    show: (m) => [m.collect_method, m.fallback_method].includes('ssh') && m.vendor === 'cisco' },
-  { key: 'ssh_private_key', label: 'SSH 私钥', type: 'textarea', rows: 4,
-    show: (m) => [m.collect_method, m.fallback_method].includes('ssh') },
+    show: (m) => needsSsh(m) && m.vendor === 'cisco',
+    // running-config 是特权命令,普通 exec 模式下直接报 Invalid input
+    hint: '**开了配置备份的 Cisco 必须填** —— show running-config 需要进 enable' },
+  { key: 'ssh_private_key', label: 'SSH 私钥', type: 'textarea', rows: 4, show: needsSsh },
 
-  { key: 'api_token', label: 'API Token', type: 'password',
-    show: (m) => [m.collect_method, m.fallback_method].includes('api'),
-    hint: 'FortiGate:系统 → 管理员 → REST API 管理员生成' },
+  { key: 'api_token', label: 'API Token', type: 'password', show: needsApi,
+    hint: 'FortiGate:系统 → 管理员 → REST API 管理员生成。'
+      + '备份和策略同步也用它 —— 策略的**命中计数只有 API 拿得到**' },
   { key: 'api_scheme', label: 'API 协议', type: 'select',
     options: [{ label: 'https', value: 'https' }, { label: 'http', value: 'http' }],
-    show: (m) => [m.collect_method, m.fallback_method].includes('api') },
-  { key: 'api_port', label: 'API 端口', type: 'number', min: 1, max: 65535,
-    show: (m) => [m.collect_method, m.fallback_method].includes('api') },
-  { key: 'api_vdom', label: 'VDOM', type: 'text',
-    show: (m) => [m.collect_method, m.fallback_method].includes('api'),
-    hint: '单 VDOM 填 root' },
-  { key: 'api_verify_tls', label: '校验 API 证书', type: 'switch',
-    show: (m) => [m.collect_method, m.fallback_method].includes('api') },
+    show: needsApi },
+  { key: 'api_port', label: 'API 端口', type: 'number', min: 1, max: 65535, show: needsApi },
+  { key: 'api_vdom', label: 'VDOM', type: 'text', show: needsApi, hint: '单 VDOM 填 root' },
+  { key: 'api_verify_tls', label: '校验 API 证书', type: 'switch', show: needsApi },
 
   { key: 'cpu_warn_pct', label: 'CPU 警告线', type: 'number', min: 0, max: 100, suffix: '%' },
   { key: 'cpu_crit_pct', label: 'CPU 严重线', type: 'number', min: 0, max: 100, suffix: '%' },
@@ -444,8 +462,9 @@ const deviceFields: FieldSpec[] = [
   // **和采集通道无关**:采指标可以走 SNMP,但 SNMP 拿不到配置文本。
   // 备份走 SSH(FortiGate 有 API Token 时优先走 API 的 config/backup 端点)
   { key: 'backup_enabled', label: '启用配置备份', type: 'switch', full: true,
-    hint: '需要 SSH 用户名 + 密码/私钥(FortiGate 也可只填 API Token)。'
-      + '和上面的采集通道无关 —— SNMP 拿不到配置文本' },
+    hint: '打开后上面会出现「SSH 用户名 / 密码」——备份走 SSH,'
+      + '和采集通道无关(SNMP 拿不到配置文本)。Cisco 还要填 enable 密码。'
+      + 'FortiGate 也可以只填 API Token' },
   { key: 'backup_interval_hours', label: '备份间隔', type: 'number', min: 1, max: 8760, suffix: '小时',
     show: (m) => m.backup_enabled,
     hint: '配置不是时序数据,一天一次足够。改完配置想立刻留档用页面上的「立即备份」' },
