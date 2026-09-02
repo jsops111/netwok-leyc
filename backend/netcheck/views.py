@@ -32,6 +32,7 @@ from netcheck.filters import (
     DeviceBackupFilter,
     DeviceFilter,
     DeviceInterfaceFilter,
+    DeviceNeighborFilter,
     EventFilter,
     FirewallPolicyFilter,
     NotifierFilter,
@@ -46,6 +47,7 @@ from netcheck.models import (
     DeviceInterface,
     DeviceKind,
     DeviceModel,
+    DeviceNeighbor,
     DeviceSample,
     Event,
     EventKind,
@@ -74,6 +76,7 @@ from netcheck.serializers import (
     DeviceBackupDetailSerializer,
     DeviceBackupSerializer,
     DeviceInterfaceSerializer,
+    DeviceNeighborSerializer,
     DeviceSampleSerializer,
     DeviceSerializer,
     EventSerializer,
@@ -426,6 +429,108 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
     # ---- 防火墙策略 ----
 
+    # ---- 配置合规基线 ----
+
+    @action(detail=False, methods=["get"])
+    def compliance(self, request):
+        """
+        基线检查 —— 在**已经备份下来的配置**上跑,不需要新采集。
+
+        比对告诉你"变了什么",基线告诉你"缺了什么"。后者更容易被忽略:
+        telnet 一直开着、community 还是 public、日志没往外送 ——
+        这些东西没有任何症状,直到出事或者审计。
+
+        **没有规则的厂商 / 没有备份的设备明确回 `checked=false` 和原因**,
+        不给一个 0 条问题的"全部通过"(见 compliance.py 的第 2 条自律)。
+        """
+
+        from netcheck.devices import compliance as comp
+
+        device_id = request.query_params.get("device")
+        devices = Device.objects.filter(enabled=True).order_by("order", "id")
+        if device_id:
+            devices = devices.filter(pk=device_id)
+
+        results = [comp.check_device(d) for d in devices]
+        checked = [r for r in results if r["checked"]]
+        return Response({
+            "generated_at": timezone.now(),
+            "rule_total": len(comp.RULES),
+            "supported_vendors": sorted(comp.SUPPORTED_VENDORS),
+            "devices": results,
+            "totals": {
+                "devices": len(results),
+                "checked": len(checked),
+                "not_checked": len(results) - len(checked),
+                "critical": sum(r["critical"] for r in checked),
+                "warning": sum(r["warning"] for r in checked),
+                "info": sum(r["info"] for r in checked),
+                "clean": sum(1 for r in checked if not r["findings"]),
+            },
+        })
+
+    # ---- MAC / IP 查找 ----
+
+    @action(detail=False, methods=["post"])
+    def lookup(self, request):
+        """
+        **「这个 MAC / 这个 IP 在哪台交换机的哪个口上」** —— 交换机排障
+        问得最多的一句话。
+
+        这是**同步现场查询**,不是查本地缓存:MAC 表大而易变,存下来的
+        是一份过期的表,而排障时要的恰恰是"现在在哪儿"。所以要显式选设备,
+        一台 1~5 秒。
+
+        IP 是两段式:先在选中的设备里找 ARP 拿到 MAC(只有三层设备有),
+        再拿 MAC 去找口。
+        """
+
+        from netcheck.devices import lookup as lookup_mod
+
+        query = (request.data.get("query") or "").strip()
+        ids = request.data.get("devices") or []
+        if not isinstance(ids, list):
+            return Response({"detail": "devices 要是一个 id 数组"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        devices = list(Device.objects.filter(pk__in=ids, enabled=True))
+        try:
+            result = lookup_mod.lookup(query, devices)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("MAC/IP 查找异常")
+            return Response({"detail": f"{type(exc).__name__}: {exc}"},
+                            status=status.HTTP_200_OK)
+        return Response(result)
+
+    # ---- 邻居 ----
+
+    @action(detail=True, methods=["post"])
+    def discover_neighbors(self, request, pk=None):
+        """
+        立刻采一次邻居。**同步执行** —— 两张表几十行,一两秒就回来,
+        排障时等不了一个采集周期。
+        """
+
+        from netcheck.devices import neighbors as neighbor_mod
+
+        device = self.get_object()
+        if not device.collect_neighbors:
+            return Response({"detail": "这台设备关掉了邻居采集"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = neighbor_mod.collect_neighbors(device)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("设备 %s 邻居采集异常", device.name)
+            return Response({"ok": False, "detail": f"{type(exc).__name__}: {exc}"})
+        detail = (
+            f"学到 {result['total']} 条(LLDP {result['lldp']} / CDP {result['cdp']})"
+            f",新增 {result['added']} / 消失 {result['removed']}"
+        )
+        if result["total"] == 0:
+            detail += " —— 一条都没有:对端可能没开 LLDP/CDP,或者 community 的 view 没放开这两个 MIB"
+        return Response({"ok": True, "detail": detail, **result})
+
     @action(detail=True, methods=["post"])
     def sync_policies_now(self, request, pk=None):
         device = self.get_object()
@@ -719,6 +824,160 @@ class ServerViewSet(viewsets.ModelViewSet):
                 v for v in (extra.get("interface_error"), extra.get("stderr")) if v
             ],
         })
+
+
+class DeviceNeighborViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    邻居关系只读 —— 它是采集产物(LLDP / CDP)。
+
+    `topology` 那个 action 给的是**两端都在这个平台管着**的链路,
+    那些才画得成拓扑图;一端是打印机或者别人的设备时,只能列在明细里。
+    """
+
+    serializer_class = DeviceNeighborSerializer
+    filterset_class = DeviceNeighborFilter
+    search_fields = ["remote_device", "remote_port", "local_if_name"]
+    ordering_fields = ["local_if_index", "last_seen", "changed_at"]
+
+    def get_queryset(self):
+        return DeviceNeighbor.objects.select_related("device", "matched_device")
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """按设备一行:学到多少邻居、其中多少是受管设备、最近有没有变过。"""
+
+        devices = list(
+            Device.objects.filter(enabled=True, collect_neighbors=True).order_by("order", "id")
+        )
+        rows = (
+            DeviceNeighbor.objects.filter(device__in=devices)
+            .values("device_id")
+            .annotate(
+                total=Count("id"),
+                lldp=Count("id", filter=Q(protocol="lldp")),
+                cdp=Count("id", filter=Q(protocol="cdp")),
+                managed=Count("id", filter=Q(matched_device__isnull=False)),
+                changed=Count("id", filter=Q(changed_at__isnull=False)),
+                unresolved=Count("id", filter=Q(local_if_index__isnull=True)),
+            )
+        )
+        stats = {r["device_id"]: r for r in rows}
+        payload = []
+        for device in devices:
+            row = stats.get(device.pk, {})
+            payload.append({
+                "device_id": device.pk, "device_name": device.name,
+                "mgmt_ip": device.mgmt_ip, "kind": device.kind, "state": device.state,
+                "model_label": device.get_model_display(),
+                "last_collected_at": device.last_collected_at,
+                "method": device.last_method_used or device.collect_method,
+                "total": row.get("total", 0),
+                "lldp": row.get("lldp", 0), "cdp": row.get("cdp", 0),
+                "managed": row.get("managed", 0),
+                "changed": row.get("changed", 0),
+                # 本地口没解析出 ifIndex 的条数 —— 那些邻居不知道挂在哪个口
+                "unresolved": row.get("unresolved", 0),
+                # 邻居只有 SNMP 通道采得到,走 API/SSH 的设备永远是 0 ——
+                # 明确说出来,否则"0 个邻居"会被读成"这个口没接线"
+                "snmp_channel": (device.last_method_used or device.collect_method) == CollectMethod.SNMP,
+            })
+        return Response({"generated_at": timezone.now(), "devices": payload})
+
+    @action(detail=False, methods=["get"])
+    def topology(self, request):
+        """
+        受管链路 —— 两端都是这个平台在管的设备。
+
+        **同一条物理链路会被两端各上报一次**(A 的 Gi1/0/1 看到 B,
+        B 的 Gi1/0/48 看到 A),这里合并成一条:按 (设备 id 小的在前) 归一化,
+        并标注这条链路是不是**双向都确认**的。
+
+        单向确认的链路要单独标出来:它可能是对端没开 LLDP,
+        也可能是我们把邻居挂到了错误的口上 —— 后者是要去查的。
+        """
+
+        links: dict[tuple, dict] = {}
+        queryset = (
+            DeviceNeighbor.objects.filter(matched_device__isnull=False)
+            .select_related("device", "matched_device")
+        )
+        for n in queryset:
+            a_id, b_id = n.device_id, n.matched_device_id
+            # 归一化方向:小 id 在前,这样两端上报的同一条链路落到同一个 key
+            if a_id <= b_id:
+                key = (a_id, n.local_if_name, b_id, n.remote_port, n.protocol)
+                entry = links.setdefault(key, {
+                    "a_device_id": a_id, "a_device": n.device.name, "a_port": n.local_if_name,
+                    "b_device_id": b_id, "b_device": n.matched_device.name, "b_port": n.remote_port,
+                    "protocol": n.protocol, "confirmed_by": [],
+                    "last_seen": n.last_seen, "changed_at": n.changed_at,
+                })
+            else:
+                key = (b_id, n.remote_port, a_id, n.local_if_name, n.protocol)
+                entry = links.setdefault(key, {
+                    "a_device_id": b_id, "a_device": n.matched_device.name, "a_port": n.remote_port,
+                    "b_device_id": a_id, "b_device": n.device.name, "b_port": n.local_if_name,
+                    "protocol": n.protocol, "confirmed_by": [],
+                    "last_seen": n.last_seen, "changed_at": n.changed_at,
+                })
+            entry["confirmed_by"].append(n.device.name)
+            if n.changed_at and (entry["changed_at"] is None or n.changed_at > entry["changed_at"]):
+                entry["changed_at"] = n.changed_at
+
+        out = []
+        for entry in links.values():
+            entry["bidirectional"] = len(set(entry["confirmed_by"])) >= 2
+            out.append(entry)
+        out.sort(key=lambda e: (e["a_device"], e["a_port"]))
+
+        one_way = sum(1 for e in out if not e["bidirectional"])
+        return Response({
+            "generated_at": timezone.now(),
+            "links": out,
+            "total": len(out),
+            "bidirectional": len(out) - one_way,
+            "one_way": one_way,
+            "one_way_hint": (
+                "单向确认的链路:可能是对端没开 LLDP/CDP,也可能是邻居被挂到了"
+                "错误的本地口上 —— 后者要去查(对照接口的实际连线)"
+            ) if one_way else "",
+        })
+
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """邻居清单导出 —— 交维和画拓扑图时要的就是这张表。"""
+
+        import csv
+        import io as _io
+
+        from django.http import HttpResponse
+
+        queryset = self.filter_queryset(self.get_queryset()).order_by(
+            "device_id", "local_if_index", "protocol")
+        buf = _io.StringIO()
+        buf.write("\ufeff")
+        writer = csv.writer(buf)
+        writer.writerow([
+            "本端设备", "本端接口", "ifIndex", "发现协议", "对端设备", "对端接口",
+            "对端平台", "对端管理地址", "对端 chassis id", "对端是否纳管",
+            "首次发现", "最后确认", "最后变化",
+        ])
+        for n in queryset.iterator(chunk_size=500):
+            writer.writerow([
+                n.device.name, n.local_if_name,
+                # 解析不出 ifIndex 时写「未解析」而不是空 —— 空会被读成 0
+                n.local_if_index if n.local_if_index is not None else "未解析",
+                n.protocol.upper(), n.remote_device, n.remote_port,
+                n.remote_platform, n.remote_mgmt_ip, n.remote_chassis_id,
+                n.matched_device.name if n.matched_device_id else "否",
+                timezone.localtime(n.first_seen).strftime("%Y-%m-%d %H:%M:%S"),
+                timezone.localtime(n.last_seen).strftime("%Y-%m-%d %H:%M:%S"),
+                timezone.localtime(n.changed_at).strftime("%Y-%m-%d %H:%M:%S") if n.changed_at else "",
+            ])
+        response = HttpResponse(buf.getvalue(), content_type="text/csv; charset=utf-8")
+        stamp = timezone.localtime(timezone.now()).strftime("%Y%m%d-%H%M%S")
+        response["Content-Disposition"] = f'attachment; filename="neighbors-{stamp}.csv"'
+        return response
 
 
 class DeviceBackupViewSet(viewsets.ReadOnlyModelViewSet):

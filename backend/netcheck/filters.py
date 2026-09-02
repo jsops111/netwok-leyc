@@ -13,6 +13,7 @@ from netcheck.models import (
     Device,
     DeviceBackup,
     DeviceInterface,
+    DeviceNeighbor,
     Event,
     FirewallPolicy,
     Notifier,
@@ -86,6 +87,32 @@ class DeviceInterfaceFilter(filters.FilterSet):
         from django.db.models import Q
 
         return queryset.filter(Q(if_name__icontains=value) | Q(if_alias__icontains=value))
+
+
+class DeviceNeighborFilter(filters.FilterSet):
+    device = filters.NumberFilter(field_name="device_id")
+    keyword = filters.CharFilter(method="filter_keyword", label="本地口/对端/平台")
+    # 只看「两端都在这个平台管着」的链路 —— 那些是能画成拓扑的
+    managed_only = filters.BooleanFilter(
+        field_name="matched_device", lookup_expr="isnull", exclude=True, label="仅受管链路")
+    # 最近变过的 —— "谁动了线"
+    changed = filters.BooleanFilter(
+        field_name="changed_at", lookup_expr="isnull", exclude=True, label="曾发生变化")
+
+    class Meta:
+        model = DeviceNeighbor
+        fields = ["device", "protocol"]
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(local_if_name__icontains=value)
+            | Q(remote_device__icontains=value)
+            | Q(remote_port__icontains=value)
+            | Q(remote_platform__icontains=value)
+            | Q(remote_mgmt_ip__icontains=value)
+        )
 
 
 class ServerFilter(filters.FilterSet):

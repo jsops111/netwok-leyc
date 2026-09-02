@@ -11,6 +11,7 @@ from netcheck.models import (
     Device,
     DeviceBackup,
     DeviceInterface,
+    DeviceNeighbor,
     Event,
     FirewallPolicy,
     Notifier,
@@ -122,3 +123,11 @@ class FirewallPolicyAdmin(admin.ModelAdmin):
                     "enabled", "nat", "hit_count", "synced_at")
     list_filter = ("device", "vdom", "action", "enabled", "method")
     search_fields = ("name", "comments")
+
+
+@admin.register(DeviceNeighbor)
+class DeviceNeighborAdmin(admin.ModelAdmin):
+    list_display = ("device", "local_if_name", "protocol", "remote_device",
+                    "remote_port", "matched_device", "last_seen", "changed_at")
+    list_filter = ("device", "protocol")
+    search_fields = ("local_if_name", "remote_device", "remote_port", "remote_mgmt_ip")

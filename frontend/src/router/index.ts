@@ -2,7 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
 /**
- * 路由。八个页面 + 一个登录页。
+ * 路由。十个页面 + 一个登录页。
  * 大屏是首页:这个平台绝大多数时间是挂在墙上被看的,不是被操作的。
  *
  * **除了登录页,全部要登录**(`meta.public` 是唯一的例外标记)。
@@ -33,6 +33,18 @@ const routes = [
     name: 'interfaces',
     component: () => import('@/views/Interfaces.vue'),
     meta: { title: '设备接口', nav: '设备接口' },
+  },
+  {
+    path: '/topology',
+    name: 'topology',
+    component: () => import('@/views/Topology.vue'),
+    meta: { title: '邻居与拓扑', nav: '邻居与拓扑' },
+  },
+  {
+    path: '/compliance',
+    name: 'compliance',
+    component: () => import('@/views/Compliance.vue'),
+    meta: { title: '配置合规', nav: '配置合规' },
   },
   {
     path: '/backups',

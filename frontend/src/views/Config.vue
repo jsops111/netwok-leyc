@@ -99,7 +99,7 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
     cpu_warn_pct: 75, cpu_crit_pct: 90, mem_warn_pct: 80, mem_crit_pct: 92,
     temp_warn_c: 55, temp_crit_c: 68, session_warn: 0, if_util_warn_pct: 80,
     fail_threshold: 2, recover_threshold: 2,
-    collect_interfaces: true, enabled: true, order: 0,
+    collect_interfaces: true, collect_neighbors: true, enabled: true, order: 0,
     backup_enabled: false, backup_interval_hours: 24, backup_keep: 20,
     backup_check_unsaved: true,
     policy_sync_enabled: false, policy_sync_interval_minutes: 30,
@@ -458,6 +458,10 @@ const deviceFields: FieldSpec[] = [
   { key: 'recover_threshold', label: '连续正常关事件', type: 'number', min: 1, suffix: '次' },
   { key: 'collect_interfaces', label: '采集接口明细', type: 'switch',
     hint: '48 口设备一次要走近百个 OID;只看整机指标可以关掉' },
+  { key: 'collect_neighbors', label: '采集邻居(LLDP/CDP)', type: 'switch',
+    // 只有 SNMP 通道采得到 —— LLDP-MIB 和 CISCO-CDP-MIB 都是 SNMP MIB
+    hint: '「这个口对面接的是谁」。**只有 SNMP 通道采得到**,'
+      + '走 API/SSH 的设备会一直是 0 条 —— 那不等于没接线' },
 
   // ---- 配置备份 ----
   // **和采集通道无关**:采指标可以走 SNMP,但 SNMP 拿不到配置文本。

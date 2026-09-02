@@ -20,6 +20,7 @@ from netcheck.models import (
     DeviceBackup,
     DeviceInterface,
     DeviceKind,
+    DeviceNeighbor,
     DeviceSample,
     Event,
     FirewallPolicy,
@@ -405,6 +406,30 @@ class InterfaceSampleSerializer(serializers.ModelSerializer):
             "id", "interface", "ts", "in_bps", "out_bps",
             "in_errors", "out_errors", "in_discards", "out_discards", "oper_up",
         ]
+
+
+class DeviceNeighborSerializer(serializers.ModelSerializer):
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    matched_device_name = serializers.CharField(
+        source="matched_device.name", read_only=True, default="")
+    # 本地口没解析出 ifIndex 时前端要能看出来 —— 那条邻居不知道挂在哪个口,
+    # 而"不知道"和"挂在 X 口"是两个结论
+    local_resolved = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DeviceNeighbor
+        fields = [
+            "id", "device", "device_name", "protocol",
+            "local_if_index", "local_if_name", "local_resolved",
+            "remote_device", "remote_port", "remote_platform",
+            "remote_mgmt_ip", "remote_chassis_id",
+            "matched_device", "matched_device_name",
+            "first_seen", "last_seen", "changed_at",
+        ]
+        read_only_fields = fields
+
+    def get_local_resolved(self, obj) -> bool:
+        return obj.local_if_index is not None
 
 
 # =========================================================================

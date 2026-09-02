@@ -569,6 +569,21 @@ def collect_device(device: Device) -> DeviceSample:
             log.warning("设备 %s 接口采集失败: %s", device.name, exc)
             data.setdefault("extra", {})["interface_error"] = str(exc)[:200]
 
+    # ---- 邻居(LLDP / CDP) ----
+    # **只在 SNMP 通道下采** —— 这两张表是 SNMP MIB,API/SSH 通道拿不到。
+    # 放在接口之后是有意的:邻居要靠接口表把 lldpLocalPortNum 翻成口名
+    # (见 neighbors._resolve_local),接口先采完命中率才高
+    neighbor_result: dict = {}
+    if reachable and device.collect_neighbors and method_used == CollectMethod.SNMP:
+        from . import neighbors as neighbor_mod
+
+        try:
+            neighbor_result = neighbor_mod.collect_neighbors(device)
+            data.setdefault("extra", {})["neighbors"] = neighbor_result["total"]
+        except Exception as exc:  # noqa: BLE001 —— 邻居采不到不影响别的
+            log.warning("设备 %s 邻居采集失败: %s", device.name, exc)
+            data.setdefault("extra", {})["neighbor_error"] = str(exc)[:200]
+
     # ---- 写样本 ----
     sample = DeviceSample.objects.create(
         device=device, ts=now, reachable=reachable, method=method_used,
@@ -625,6 +640,35 @@ def collect_device(device: Device) -> DeviceSample:
         outcome.escalated += iface_outcome.escalated
 
     _queue_notifications(outcome)
+
+    # ---- 邻居变化 ----
+    # **瞬时事件**,不走 process()(见 CLAUDE.md 第 8 条)。
+    # 首次采集时"全是新增"不是变化,不报。
+    if neighbor_result.get("changes") and not neighbor_result.get("first_run"):
+        from netcheck.events.engine import record_point_event
+
+        lines = "\n".join(
+            f"  {c['local']}: {c['before']} → {c['after']}({c['protocol'].upper()})"
+            for c in neighbor_result["changes"]
+        )
+        event = record_point_event(
+            event_engine.EventSource.from_device(device),
+            EventKind.NEIGHBOR_CHANGE, Severity.WARNING,
+            title=f"{device.name} 邻居关系发生变化",
+            message=(
+                f"新增 {neighbor_result['added']} / 消失 {neighbor_result['removed']} / "
+                f"换端 {neighbor_result['changed']}:\n{lines}\n"
+                "—— 通常意味着有人动了线,或者对端设备被换掉/关机了"
+            ),
+            # 一次改线会在两端设备上各报一次,而且可能连着几拍才稳定 ——
+            # 半小时窗口把一次操作收敛成一条
+            dedupe_seconds=1800,
+        )
+        if event is not None:
+            from netcheck.tasks import send_notification
+
+            send_notification.delay(event.pk, "alert")
+
     return sample
 
 

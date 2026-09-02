@@ -183,6 +183,7 @@ export interface DeviceRow {
   fail_threshold: number
   recover_threshold: number
   collect_interfaces: boolean
+  collect_neighbors: boolean
   backup_enabled: boolean
   backup_interval_hours: number
   backup_keep: number
@@ -534,6 +535,117 @@ export interface InterfaceSummaryRow {
   counter_32bit: number
 }
 
+export interface NeighborRow {
+  id: number
+  device: number
+  device_name: string
+  protocol: string
+  local_if_index: number | null
+  local_if_name: string
+  /** false = 本地口没解析出 ifIndex,**不知道挂在哪个口** */
+  local_resolved: boolean
+  remote_device: string
+  remote_port: string
+  remote_platform: string
+  remote_mgmt_ip: string
+  remote_chassis_id: string
+  matched_device: number | null
+  matched_device_name: string
+  first_seen: string
+  last_seen: string
+  changed_at: string | null
+}
+
+export interface NeighborSummaryRow {
+  device_id: number
+  device_name: string
+  mgmt_ip: string
+  kind: string
+  state: string
+  model_label: string
+  last_collected_at: string | null
+  method: string
+  total: number
+  lldp: number
+  cdp: number
+  managed: number
+  changed: number
+  unresolved: number
+  /** 邻居只有 SNMP 通道采得到 —— false 时"0 条"不等于"没接线" */
+  snmp_channel: boolean
+}
+
+export interface TopologyLink {
+  a_device_id: number
+  a_device: string
+  a_port: string
+  b_device_id: number
+  b_device: string
+  b_port: string
+  protocol: string
+  confirmed_by: string[]
+  bidirectional: boolean
+  last_seen: string
+  changed_at: string | null
+}
+
+export interface ComplianceFinding {
+  key: string
+  label: string
+  severity: string
+  why: string
+  fix: string
+  kind: string
+  hit_count: number
+  hits: Array<{ line: number; text: string }>
+}
+
+export interface ComplianceRow {
+  device_id: number
+  device_name: string
+  mgmt_ip: string
+  vendor: string
+  vendor_label: string
+  model_label: string
+  kind: string
+  rule_count: number
+  backup_at: string | null
+  backup_hash: string
+  supported: boolean
+  /** false = **没检查**(没规则或没备份),不等于合规 */
+  checked: boolean
+  reason: string
+  findings: ComplianceFinding[]
+  critical: number
+  warning: number
+  info: number
+  passed: number
+}
+
+export interface LookupResult {
+  query: string
+  kind: string
+  mac: string
+  arp: Array<{ device_id: number; device_name: string; if_index: number | null; if_name: string; mac: string }>
+  hits: Array<{
+    device_id: number
+    device_name: string
+    mgmt_ip: string
+    vlan: string
+    bridge_port: string
+    if_index: number | null
+    if_name: string
+    /** false = 桥端口号没翻成 ifIndex,**不要照着它拔线** */
+    port_resolved: boolean
+    note: string
+    source: string
+  }>
+  errors: Array<{ device: string; error: string }>
+  searched: number
+  detail?: string
+  multi_note?: string
+}
+
 export interface EventRow {
   id: number
   source_type: string
@@ -798,6 +910,41 @@ export const api = {
     http.get<{ generated_at: string; devices: InterfaceSummaryRow[] }>('/interfaces/summary/'),
   toggleInterfaceMonitor: (id: number) =>
     http.post<{ id: number; monitored: boolean }>(`/interfaces/${id}/toggle_monitor/`),
+  // 邻居 / 拓扑
+  neighbors: (params?: object) => http.get<Paged<NeighborRow>>('/neighbors/', { params }),
+  neighborSummary: () =>
+    http.get<{ generated_at: string; devices: NeighborSummaryRow[] }>('/neighbors/summary/'),
+  topology: () =>
+    http.get<{
+      generated_at: string; links: TopologyLink[]
+      total: number; bidirectional: number; one_way: number; one_way_hint: string
+    }>('/neighbors/topology/'),
+  discoverNeighbors: (id: number) =>
+    http.post<{ ok: boolean; detail: string }>(`/devices/${id}/discover_neighbors/`),
+  neighborExportUrl: (params: Record<string, any> = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') q.set(k, String(v))
+    }
+    const qs = q.toString()
+    return `/api/neighbors/export/${qs ? `?${qs}` : ''}`
+  },
+
+  // 配置合规基线
+  compliance: (deviceId?: number) =>
+    http.get<{
+      generated_at: string; rule_total: number; supported_vendors: string[]
+      devices: ComplianceRow[]
+      totals: {
+        devices: number; checked: number; not_checked: number
+        critical: number; warning: number; info: number; clean: number
+      }
+    }>('/devices/compliance/', { params: { device: deviceId } }),
+
+  // MAC / IP 查找
+  macLookup: (query: string, devices: number[]) =>
+    http.post<LookupResult>('/devices/lookup/', { query, devices }),
+
   interfaceExportUrl: (params: Record<string, any> = {}) => {
     const q = new URLSearchParams()
     for (const [k, v] of Object.entries(params)) {

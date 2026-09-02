@@ -8,6 +8,7 @@ router.register("probe-groups", views.ProbeGroupViewSet, basename="probe-group")
 router.register("probes", views.ProbeTargetViewSet, basename="probe")
 router.register("devices", views.DeviceViewSet, basename="device")
 router.register("interfaces", views.DeviceInterfaceViewSet, basename="interface")
+router.register("neighbors", views.DeviceNeighborViewSet, basename="neighbor")
 router.register("servers", views.ServerViewSet, basename="server")
 # 配置备份和防火墙策略都是**只读**的:它们是采集产物,
 # 写入只有一条路(定时任务 / 页面上的「立即执行」按钮)

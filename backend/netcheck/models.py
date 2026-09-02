@@ -88,6 +88,7 @@ class EventKind(models.TextChoices):
     BACKUP_FAILED = "backup_failed", "配置备份失败"
     CONFIG_CHANGED = "config_changed", "配置发生变更"
     CONFIG_UNSAVED = "config_unsaved", "配置未保存"
+    NEIGHBOR_CHANGE = "neighbor_change", "邻居变化"
 
 
 class SourceType(models.TextChoices):
@@ -584,6 +585,13 @@ class Device(BaseModel):
     collect_interfaces = models.BooleanField(
         "采集接口明细", default=True, help_text="48 口设备一次要走近百个 OID;只关心整机指标可以关掉"
     )
+    collect_neighbors = models.BooleanField(
+        "采集邻居(LLDP/CDP)", default=True,
+        help_text=(
+            "「这个口对面接的是谁」。多走两张表(LLDP + CDP),"
+            "邻居关系变化很慢所以代价不大 —— 但它是排障时第一个要看的东西"
+        ),
+    )
     enabled = models.BooleanField("启用", default=True, db_index=True)
     order = models.IntegerField("排序", default=0)
 
@@ -796,6 +804,94 @@ class InterfaceSample(models.Model):
         verbose_name = verbose_name_plural = "接口样本"
         ordering = ["-ts"]
         indexes = [models.Index(fields=["interface", "-ts"], name="idx_ifsample_ts")]
+
+
+class DeviceNeighbor(BaseModel):
+    """
+    一条邻居关系 —— **「这个口对面接的是谁」**。
+
+    这是 `show lldp neighbors` / `show cdp neighbors` 的落库版本,
+    也是网络工程师排障时问的第一个问题:一个口 down 了,对面是谁?
+    一台设备失联了,它挂在哪台交换机的哪个口上?
+
+    ## 为什么是**当前状态表**而不是时序表
+
+    邻居关系变化很慢(一年可能不变),但**变化本身是重要信息** ——
+    "这个口对面换人了"通常意味着有人插错线或者改了拓扑。所以:
+    行是原地更新的(每台每口每协议一行),而 `first_seen` / `changed_at`
+    留着变化的痕迹,变化时另外记一条瞬时事件。
+
+    存成时序表的话,一台 48 口交换机每分钟 48 行,一年两千五百万行,
+    而其中有信息量的可能只有几十行。
+
+    ## LLDP 和 CDP 两套都存
+
+    LLDP 是标准,CDP 是 Cisco 私有 —— 纯 Cisco 环境里往往只开了 CDP。
+    只采一套的结果是"有些口对面是空的",而那是最容易被当成"没接线"的误读。
+    同一个口两套都有时,页面上按 LLDP 优先显示,但两行都留着
+    (它们的 remote_port 格式不一样,对不上时能互相印证)。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="neighbors", verbose_name="设备"
+    )
+    protocol = models.CharField(
+        "发现协议", max_length=8, help_text="lldp / cdp", db_index=True
+    )
+    local_if_index = models.IntegerField("本地 ifIndex", null=True, blank=True)
+    local_if_name = models.CharField("本地接口", max_length=128)
+
+    remote_device = models.CharField("对端设备名", max_length=255, blank=True)
+    remote_port = models.CharField("对端接口", max_length=255, blank=True)
+    remote_platform = models.CharField(
+        "对端型号/平台", max_length=255, blank=True,
+        help_text="CDP 的 cdpCachePlatform 或 LLDP 的 sysDesc 头部",
+    )
+    remote_mgmt_ip = models.CharField("对端管理地址", max_length=64, blank=True)
+    remote_chassis_id = models.CharField(
+        "对端 chassis id", max_length=128, blank=True,
+        help_text="LLDP 的机箱标识,通常是对端的一个 MAC。**换设备时它会变**,是判断"
+                  "「对面是不是同一台机器」最可靠的字段",
+    )
+    # 对端如果也是这个平台在管的设备,关联过去 —— 这样能画出"受管链路"
+    matched_device = models.ForeignKey(
+        Device, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="neighbor_of", verbose_name="对端(已纳管)",
+    )
+
+    first_seen = models.DateTimeField("首次发现")
+    last_seen = models.DateTimeField("最后确认", db_index=True)
+    changed_at = models.DateTimeField(
+        "最后变化时间", null=True, blank=True,
+        help_text="对端设备名/接口/chassis id 变过的时间 —— 通常意味着有人动了线",
+    )
+    raw = models.JSONField("原始记录", default=dict, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "设备邻居"
+        ordering = ["device_id", "local_if_index", "protocol"]
+        constraints = [
+            # 一个口在一个协议下**可以有多个邻居**(接了个哑交换机、
+            # 或者一个口上挂了 IP 电话 + PC 这种级联),所以对端也进唯一键。
+            # nulls_distinct=False:local_if_index 可能取不到
+            models.UniqueConstraint(
+                fields=["device", "protocol", "local_if_name", "remote_device", "remote_port"],
+                name="uniq_neighbor_per_port",
+                nulls_distinct=False,
+            )
+        ]
+        indexes = [
+            models.Index(fields=["device", "local_if_index"], name="idx_neighbor_local"),
+            models.Index(fields=["remote_device"], name="idx_neighbor_remote"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.device_id}:{self.local_if_name} → {self.remote_device}/{self.remote_port}"
+
+    @property
+    def identity(self) -> tuple:
+        """判断"对面是不是同一台机器"用的那几个字段。"""
+        return (self.remote_device, self.remote_port, self.remote_chassis_id)
 
 
 # =========================================================================

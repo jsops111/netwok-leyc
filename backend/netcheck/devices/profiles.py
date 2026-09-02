@@ -67,6 +67,41 @@ IF_FALLBACK_COLUMNS = {
 
 ENTITY_SERIAL = "1.3.6.1.2.1.47.1.1.1.1.11"  # entPhysicalSerialNum
 
+# ---------------------------------------------------------------- 邻居发现
+#
+# 「这个口对面接的是谁」—— 网络工程师排障时问的第一个问题,
+# 而它是 `show lldp neighbors` / `show cdp neighbors` 的 SNMP 版本。
+#
+# **两套都采,LLDP 优先。**LLDP 是标准(802.1AB,各厂商都有),
+# CDP 是 Cisco 私有但在纯 Cisco 环境里往往只开了 CDP。
+# 只采一套的结果是"有些口对面是空的",而那是最容易被当成"没接线"的误读。
+
+# LLDP-MIB。lldpRemTable 的索引是 lldpRemTimeMark.lldpRemLocalPortNum.lldpRemIndex
+# —— **本地口是索引的第二段**,不是 ifIndex(见 collector 里的说明)
+LLDP_REM = {
+    "lldpRemChassisId": "1.0.8802.1.1.2.1.4.1.1.5",
+    "lldpRemPortId": "1.0.8802.1.1.2.1.4.1.1.7",
+    "lldpRemPortDesc": "1.0.8802.1.1.2.1.4.1.1.8",
+    "lldpRemSysName": "1.0.8802.1.1.2.1.4.1.1.9",
+    "lldpRemSysDesc": "1.0.8802.1.1.2.1.4.1.1.10",
+}
+# lldpLocPortId:lldpLocalPortNum → 本地口的名字。
+# **不能假设 lldpLocalPortNum == ifIndex** —— 在 Cat9k 上通常相等,
+# 但标准没有这么规定,有的平台上是从 1 开始的另一套编号。
+# 靠这张表拿到名字,再和接口表的 ifName 对上
+LLDP_LOC_PORT_ID = "1.0.8802.1.1.2.1.3.7.1.3"
+LLDP_LOC_PORT_DESC = "1.0.8802.1.1.2.1.3.7.1.4"
+
+# CISCO-CDP-MIB。cdpCacheTable 的索引是 **ifIndex**.cdpCacheDeviceIndex
+# —— 这一套直接就是 ifIndex,比 LLDP 那套省一次映射
+CDP_CACHE = {
+    "cdpCacheDeviceId": "1.3.6.1.4.1.9.9.23.1.2.1.1.6",
+    "cdpCacheDevicePort": "1.3.6.1.4.1.9.9.23.1.2.1.1.7",
+    "cdpCachePlatform": "1.3.6.1.4.1.9.9.23.1.2.1.1.8",
+    # 地址是十六进制的字节串(通常 4 字节 IPv4),要自己转
+    "cdpCacheAddress": "1.3.6.1.4.1.9.9.23.1.2.1.1.4",
+}
+
 # ---------------------------------------------------------------- Cisco
 
 # CISCO-PROCESS-MIB:cpmCPUTotal5minRev(表,按 CPU 索引)。
