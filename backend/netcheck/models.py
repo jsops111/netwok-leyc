@@ -101,6 +101,12 @@ class EventKind(models.TextChoices):
     HW_FAN = "hw_fan", "风扇异常"
     HW_VOLTAGE = "hw_voltage", "电压异常"
     SSD_WORN = "ssd_worn", "SSD 寿命将尽"
+    # SD-WAN 性能 SLA。**和线路拨测的 latency/loss/jitter 是两回事**:
+    # 那三个是**这个平台自己**从部署点探出来的,这三个是**防火墙自己**
+    # 从它的出口探出来的 —— 同一条链路两边测出来的数不一样是正常的
+    # (路径不同),而两边都测才能分清"是线路坏了"还是"我们到防火墙这段坏了"
+    SLA_VIOLATED = "sla_violated", "SD-WAN SLA 未达标"
+    SDWAN_DEAD = "sdwan_dead", "SD-WAN 成员失联"
 
 
 class SourceType(models.TextChoices):
@@ -610,6 +616,33 @@ class Device(BaseModel):
     last_policy_error = models.CharField("最后策略同步错误", max_length=255, blank=True)
     policy_count = models.IntegerField("策略条数", default=0)
 
+    # ---- SD-WAN 性能 SLA ----
+    #
+    # **跟着设备指标采集的节拍走,不单独排一类调度。**它是指标(延迟/抖动/
+    # 丢包),和 CPU、温度同一个性质 —— 每台设备自己的 interval_seconds
+    # 已经是对的节拍了,再加一类 zset 只是多一处要维护的东西。
+    collect_sdwan = models.BooleanField(
+        "采集 SD-WAN SLA", default=False,
+        help_text=(
+            "仅 FortiGate。**强烈建议配 API Token** —— "
+            "monitor/virtual-wan/health-check 一次给全部成员的延迟/抖动/丢包/"
+            "达标情况;SSH 的 `diagnose sys sdwan health-check` 格式在版本间有出入"
+        ),
+    )
+    # 平台自己的那条额外判据。**设备自己算的 sla_met 是主判据** ——
+    # 它比我们更清楚它按哪一档选路。这两个门限是给"设备说达标但数字已经很难看"
+    # 那种情况准备的:FortiOS 的 SLA 门限常常配得很松(比如 200ms),
+    # 而一条 180ms 的专线该早点有人看一眼
+    sla_latency_warn_ms = models.FloatField(
+        "SLA 延迟警告线(ms)", null=True, blank=True,
+        help_text="留空 = 只按设备自己的 SLA 判定。填了则延迟超过它也告警(级别 warning)",
+    )
+    sla_loss_warn_pct = models.FloatField(
+        "SLA 丢包警告线(%)", null=True, blank=True, help_text="留空 = 不判"
+    )
+    last_sdwan_at = models.DateTimeField("最后 SD-WAN 采集时间", null=True, blank=True)
+    last_sdwan_error = models.CharField("最后 SD-WAN 采集错误", max_length=255, blank=True)
+
     fail_threshold = models.IntegerField("连续失败次数开事件", default=2, validators=[MinValueValidator(1)])
     recover_threshold = models.IntegerField("连续正常次数关事件", default=2, validators=[MinValueValidator(1)])
 
@@ -711,6 +744,14 @@ class Device(BaseModel):
                 )
             elif not (has_api or has_ssh):
                 errors["policy_sync_enabled"] = "策略同步需要 API Token(推荐,带命中计数)或 SSH 凭据"
+
+        # SD-WAN 是 FortiGate 特有的东西。开在一台 Cisco 交换机上不会报错、
+        # 只会每拍白走一次 API 然后什么都拿不到 —— 那种"静默无效"的开关
+        # 正是要在这里拦住的
+        if self.collect_sdwan and self.vendor != Vendor.FORTINET:
+            errors["collect_sdwan"] = (
+                f"SD-WAN SLA 只有 FortiGate 有。{self.get_vendor_display()} 上这个开关不起作用"
+            )
 
         if errors:
             raise ValidationError(errors)
@@ -1738,6 +1779,149 @@ class FirewallService(models.Model):
         if self.is_group:
             return f"服务组({len(self.members or [])} 个成员)"
         return self.value or "—"
+
+
+class SdwanState(models.TextChoices):
+    """
+    一个 SD-WAN 成员的探测状态。
+
+    **`UNKNOWN` 不能并进 ALIVE** —— 「这一拍没读到这个成员」和
+    「它是通的」是两个结论。健康检查刚建、接口刚 up、API 权限不够时
+    都会读不到。
+    """
+
+    ALIVE = "alive", "通"
+    DEAD = "dead", "不通"
+    UNKNOWN = "unknown", "未知"
+
+
+class SdwanLink(models.Model):
+    """
+    一条 **SD-WAN 性能 SLA 链路** —— 也就是「某个健康检查 × 某个成员接口」。
+
+    ## 它和线路拨测测的不是同一段
+
+    `ProbeTarget` 的 latency / loss / jitter 是**这个平台自己**从部署点探
+    出来的;这里的三个数是**防火墙自己**从它的出口探出来的
+    (FortiOS 的 health-check,默认 500ms 一拍,比这个平台快得多)。
+
+    同一条运营商线路,两边测出来的数**不一样是正常的** —— 路径不同。
+    而两边都有才分得清:防火墙侧正常而平台侧不通 = 我们到防火墙这一段
+    的问题;两边都不通 = 那条线路真的断了。**所以这一页不是拨测的替代,
+    是另一个视角。**
+
+    ## 为什么一行是「健康检查 × 成员」而不是「一条线路」
+
+    FortiOS 里一个健康检查会同时探**所有成员**(wan1 / wan2 / ipsec…),
+    而 SLA 是**按成员判**的:wan1 达标、wan2 不达标是最常见的情形,
+    也正是 SD-WAN 要做选路的原因。合成"一条线路一行"就看不出是哪个口
+    掉了。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="sdwan_links", verbose_name="设备"
+    )
+    vdom = models.CharField("VDOM", max_length=64, blank=True, default="root")
+    health_check = models.CharField("健康检查", max_length=64, help_text="FortiOS 里那个 health-check 的名字")
+    member = models.CharField("成员接口", max_length=64, help_text="wan1 / wan2 / ipsec-tunnel…")
+    #: 探测目标(health-check 的 server)。同一个检查可以有多个 server,
+    #: 这里存的是设备报上来的那个
+    server = models.CharField("探测目标", max_length=255, blank=True)
+    protocol = models.CharField("探测协议", max_length=16, blank=True, help_text="ping / http / tcp-echo…")
+
+    # ---- 当前值(采集器回写) ----
+    state = models.CharField(
+        "状态", max_length=12, choices=SdwanState.choices, default=SdwanState.UNKNOWN, db_index=True
+    )
+    latency_ms = models.FloatField("延迟(ms)", null=True, blank=True)
+    jitter_ms = models.FloatField("抖动(ms)", null=True, blank=True)
+    loss_pct = models.FloatField("丢包率(%)", null=True, blank=True)
+    #: **达标了吗。三态:**True 达标 / False 未达标 / None 设备没报
+    #: (没配 SLA 目标,或者这个固件不给这一项)。
+    #: None 显示成"达标"就是替设备做一个它没做的判断
+    sla_met = models.BooleanField("SLA 达标", null=True, blank=True)
+    #: 配了几档 SLA、达标了几档。FortiOS 允许一个检查配多档 SLA
+    #: (比如 sla 1 要求 100ms、sla 2 要求 200ms),选路按档走
+    sla_targets_met = models.IntegerField("达标档数", null=True, blank=True)
+    sla_targets_total = models.IntegerField("SLA 档数", null=True, blank=True)
+
+    tx_bps = models.FloatField("出向带宽(bps)", null=True, blank=True)
+    rx_bps = models.FloatField("入向带宽(bps)", null=True, blank=True)
+    session_count = models.IntegerField("会话数", null=True, blank=True)
+
+    #: 设备上配的 SLA 门限,**原样带出来只为展示** —— 判定用的是
+    #: 设备自己算的 sla_met(它比我们更清楚它按哪一档选路)。
+    #: 平台自己那条额外的判据在 `Device.sla_*` 上
+    sla_latency_threshold = models.FloatField("门限:延迟(ms)", null=True, blank=True)
+    sla_jitter_threshold = models.FloatField("门限:抖动(ms)", null=True, blank=True)
+    sla_loss_threshold = models.FloatField("门限:丢包(%)", null=True, blank=True)
+
+    last_change = models.DateTimeField("最后状态变化", null=True, blank=True)
+    synced_at = models.DateTimeField("同步时间", db_index=True)
+    method = models.CharField("同步通道", max_length=8, blank=True, help_text="api / ssh")
+    extra = models.JSONField("明细", default=dict, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "SD-WAN SLA 链路"
+        ordering = ["device_id", "vdom", "health_check", "member"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "vdom", "health_check", "member"],
+                name="uniq_sdwan_link",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["device", "state"], name="idx_sdwan_device_state"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.health_check}/{self.member}"
+
+    @property
+    def sla_text(self) -> str:
+        """
+        达标情况的人话。**三态各有各的说法** ——
+        `None` 说"设备没报",不能显示成"达标"。
+        """
+        if self.sla_met is None:
+            return "设备没报 SLA 判定"
+        if self.sla_targets_total:
+            return (f"达标 {self.sla_targets_met or 0}/{self.sla_targets_total} 档"
+                    if self.sla_met else f"未达标({self.sla_targets_total} 档都没过)")
+        return "达标" if self.sla_met else "未达标"
+
+
+class SdwanSample(models.Model):
+    """
+    一拍 SD-WAN SLA 采样。
+
+    **没有降采样表**,和 DeviceSample / ServerSample 同一个取舍:它跟着
+    设备采集的节拍走(最快 10 秒),一天几千行,不值得为它另建三张桶表。
+    代价是能看的跨度就是原始样本保留期。
+
+    **不通的那一拍 latency/jitter/loss 要留 None**(丢包率例外,给 100)——
+    和拨测那条规矩完全一样:写 0 会把平均延迟拉低,图上看着比实际好。
+    """
+
+    link = models.ForeignKey(
+        SdwanLink, on_delete=models.CASCADE, related_name="samples", verbose_name="链路"
+    )
+    ts = models.DateTimeField("时间", db_index=True)
+    state = models.CharField("状态", max_length=12, choices=SdwanState.choices)
+    latency_ms = models.FloatField("延迟(ms)", null=True, blank=True)
+    jitter_ms = models.FloatField("抖动(ms)", null=True, blank=True)
+    loss_pct = models.FloatField("丢包率(%)", null=True, blank=True)
+    sla_met = models.BooleanField("SLA 达标", null=True, blank=True)
+    tx_bps = models.FloatField("出向带宽(bps)", null=True, blank=True)
+    rx_bps = models.FloatField("入向带宽(bps)", null=True, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "SD-WAN 采样"
+        ordering = ["-ts"]
+        indexes = [models.Index(fields=["link", "-ts"], name="idx_sdwan_sample")]
+
+    def __str__(self) -> str:
+        return f"{self.link_id}@{self.ts:%m-%d %H:%M}"
 
 
 # =========================================================================

@@ -26,6 +26,8 @@ from netcheck.models import (
     FirewallPolicy,
     FirewallAddress,
     FirewallService,
+    SdwanLink,
+    SdwanSample,
     FirewallVip,
     IdracHost,
     IdracSample,
@@ -353,6 +355,16 @@ class DeviceSerializer(serializers.ModelSerializer):
                 errors["policy_sync_enabled"] = (
                     "策略同步需要 API Token(推荐,只有 API 有命中计数)或 SSH 凭据"
                 )
+
+        # SD-WAN 只有 FortiGate 有。**这一条必须在这里也写一遍** ——
+        # 模型的 clean() 拦得住 admin 和 shell,但 DRF 从不调 full_clean(),
+        # 而页面上所有写入都走 API(CLAUDE.md 第 1 条)。
+        # 漏掉的表现:开关能打开、不报任何错,然后每拍白走一次 API 什么都
+        # 拿不到 —— 那种"静默无效"最难查
+        if _merged(self, attrs, "collect_sdwan", False) and vendor != Vendor.FORTINET:
+            errors["collect_sdwan"] = (
+                "SD-WAN SLA 只有 FortiGate 有,这个厂商上这个开关不起作用"
+            )
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -695,6 +707,40 @@ class FirewallServiceSerializer(serializers.ModelSerializer):
     def get_member_count(self, obj) -> int | None:
         """**不是组的话回 None,不是 0** —— 0 会被读成"这个组是空的"。"""
         return len(obj.members or []) if obj.is_group else None
+
+
+class SdwanLinkSerializer(serializers.ModelSerializer):
+    """
+    一条 SD-WAN SLA 链路。
+
+    `sla_text` 是**模型属性** —— 达标情况是三态(达标 / 未达标 / 设备没报),
+    三种说法完全不同,在后端拼好免得前端某一处把 `null` 渲染成"达标"。
+    """
+
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    state_label = serializers.CharField(source="get_state_display", read_only=True)
+    sla_text = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = SdwanLink
+        fields = [
+            "id", "device", "device_name", "vdom", "health_check", "member",
+            "server", "protocol", "state", "state_label",
+            "latency_ms", "jitter_ms", "loss_pct",
+            "sla_met", "sla_targets_met", "sla_targets_total", "sla_text",
+            "tx_bps", "rx_bps", "session_count",
+            "sla_latency_threshold", "sla_jitter_threshold", "sla_loss_threshold",
+            "last_change", "synced_at", "method",
+        ]
+        read_only_fields = fields
+
+
+class SdwanSampleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SdwanSample
+        fields = ["ts", "state", "latency_ms", "jitter_ms", "loss_pct",
+                  "sla_met", "tx_bps", "rx_bps"]
+        read_only_fields = fields
 
 
 class IdracHostSerializer(serializers.ModelSerializer):

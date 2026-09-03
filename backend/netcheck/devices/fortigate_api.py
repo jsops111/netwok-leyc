@@ -451,6 +451,33 @@ def fetch_address_groups(device: Device) -> list[dict]:
     return results if isinstance(results, list) else []
 
 
+def fetch_sdwan_health(device: Device):
+    """
+    SD-WAN 健康检查(性能 SLA)的**实时**状态。
+
+    `/monitor/virtual-wan/health-check` 一次给全部健康检查 × 全部成员的
+    延迟 / 抖动 / 丢包 / 达标情况 / 带宽 / 会话数 —— 这是 SD-WAN 这一页
+    最主要的数据来源。
+
+    ⚠ **端点名在大版本间变过**:7.0 之前是 `/monitor/virtual-wan/members`
+    加 `/monitor/virtual-wan/health-check`,更早的叫 `virtual-wan-link`。
+    这里按新到老依次试,第一个有内容的就用 —— 只试一条的话老固件上
+    这一页永远是空的,**而且不报错**。
+
+    取不到返回 `None`(不是空 dict)—— 调用方要能区分"端点没响应"和
+    "响应了但没有健康检查"。
+    """
+
+    for path in (
+        "/monitor/virtual-wan/health-check",
+        "/monitor/virtual-wan-link/health-check",
+    ):
+        data = _safe(device, path)
+        if data and data.get("results"):
+            return data
+    return None
+
+
 def fetch_services(device: Device) -> list[dict]:
     """
     服务对象(firewall service custom)。**取不到返回空列表,不抛。**

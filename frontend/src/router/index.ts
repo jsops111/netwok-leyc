@@ -65,6 +65,12 @@ const routes = [
     meta: { title: '防火墙策略', nav: '防火墙策略' },
   },
   {
+    path: '/sdwan',
+    name: 'sdwan',
+    component: () => import('@/views/Sdwan.vue'),
+    meta: { title: 'SD-WAN SLA', nav: 'SD-WAN SLA' },
+  },
+  {
     path: '/mappings',
     name: 'mappings',
     component: () => import('@/views/Mappings.vue'),

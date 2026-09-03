@@ -31,7 +31,7 @@ from netcheck.models import (
     Vendor,
 )
 
-from . import fortigate_api, snmp, ssh_cli
+from . import fortigate_api, sdwan, snmp, ssh_cli
 from .profiles import (
     ENTITY_SERIAL,
     IF_COLUMNS,
@@ -519,6 +519,173 @@ def _run_channel(device: Device, method: str, profile: Profile) -> dict:
     raise CollectError(f"未知的采集方式 {method}")
 
 
+def _collect_sdwan(device: Device, now) -> list[dict]:
+    """
+    拉一次 SD-WAN 健康检查,写链路当前值 + 一行采样,返回要开的事件。
+
+    通道:有 API Token 走 monitor 端点(能拿到带宽、会话数、SLA 档数),
+    否则退回 SSH 的 `diagnose sys sdwan health-check`(**拿不到的东西比
+    拿得到的多**,见 `sdwan.py` 的说明)。
+
+    ## 判定:**主判据是设备自己算的**
+
+    FortiOS 允许一个健康检查配多档 SLA,选路按档走 —— **它比我们更清楚
+    它按哪一档选路**,所以"达标没达标"以 `sla_met` 为准,平台不重算。
+    平台自己那两个门限(`Device.sla_latency_warn_ms` / `sla_loss_warn_pct`)
+    是给"设备说达标但数字已经很难看"准备的:FortiOS 的门限常常配得很松
+    (比如 200ms),而一条 180ms 的专线该早点有人看一眼。
+    """
+
+    from netcheck.models import SdwanLink, SdwanSample, SdwanState
+
+    rows: list[dict] = []
+    method = ""
+    if device.api_token:
+        payload = fortigate_api.fetch_sdwan_health(device)
+        if payload is not None:
+            rows = sdwan.parse_health_check(payload)
+            method = "api"
+    if not rows:
+        raw = ssh_cli_sdwan(device)
+        if raw:
+            rows = sdwan.parse_diagnose_sdwan(raw)
+            method = "ssh"
+
+    if not rows:
+        # **没有链路不等于没配 SD-WAN。**权限不够、命令名在这个版本上不一样、
+        # 或者真的没配 —— 三种都会走到这里,所以这句话说的是"没采到"
+        device.last_sdwan_error = "没有采到 SD-WAN 健康检查数据(没配?权限不够?)"[:255]
+        device.save(update_fields=["last_sdwan_error"])
+        return []
+
+    problems: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    vdom = device.api_vdom or "root"
+
+    for row in rows:
+        key = (row["health_check"], row["member"])
+        seen.add(key)
+        link, created = SdwanLink.objects.get_or_create(
+            device=device, vdom=vdom,
+            health_check=row["health_check"], member=row["member"],
+            defaults={"synced_at": now},
+        )
+        # 状态变了要留时间戳 —— "这条线什么时候掉的"是排障第一句话
+        if not created and link.state != row["state"]:
+            link.last_change = now
+
+        for field in ("server", "protocol", "state", "latency_ms", "jitter_ms",
+                      "loss_pct", "sla_met", "sla_targets_met", "sla_targets_total",
+                      "tx_bps", "rx_bps", "session_count", "extra"):
+            setattr(link, field, row[field])
+        link.synced_at = now
+        link.method = method
+        link.save()
+
+        SdwanSample.objects.create(
+            link=link, ts=now, state=row["state"],
+            latency_ms=row["latency_ms"], jitter_ms=row["jitter_ms"],
+            loss_pct=row["loss_pct"], sla_met=row["sla_met"],
+            tx_bps=row["tx_bps"], rx_bps=row["rx_bps"],
+        )
+
+        label = f"{row['health_check']}/{row['member']}"
+
+        # ---- 成员不通 ----
+        if row["state"] == SdwanState.DEAD:
+            problems.append({
+                "kind": EventKind.SDWAN_DEAD, "severity": Severity.CRITICAL,
+                "value": None, "threshold": None, "unit": "",
+                "message": f"SD-WAN 成员 {label} 探测不通(丢包 100%)",
+            })
+            continue
+
+        # ---- SLA 未达标(设备自己的判定) ----
+        if row["sla_met"] is False:
+            detail = []
+            if row["latency_ms"] is not None:
+                detail.append(f"延迟 {row['latency_ms']:.1f}ms")
+            if row["jitter_ms"] is not None:
+                detail.append(f"抖动 {row['jitter_ms']:.1f}ms")
+            if row["loss_pct"] is not None:
+                detail.append(f"丢包 {row['loss_pct']:.1f}%")
+            targets = ""
+            if row["sla_targets_total"]:
+                targets = f",{row['sla_targets_total']} 档 SLA 都没过"
+            problems.append({
+                "kind": EventKind.SLA_VIOLATED, "severity": Severity.WARNING,
+                "value": row["latency_ms"], "threshold": None, "unit": "ms",
+                "message": f"{label} SLA 未达标({'、'.join(detail) or '设备判定'}){targets}",
+            })
+            continue
+
+        # ---- 平台自己那条额外门限 ----
+        # **只在设备说达标时才判** —— 上面那条已经报过的不再重复报一次
+        extra_hits = []
+        if device.sla_latency_warn_ms and row["latency_ms"] is not None \
+                and row["latency_ms"] >= device.sla_latency_warn_ms:
+            extra_hits.append(
+                f"延迟 {row['latency_ms']:.1f}ms 超过平台警告线 {device.sla_latency_warn_ms:.0f}ms")
+        if device.sla_loss_warn_pct and row["loss_pct"] is not None \
+                and row["loss_pct"] >= device.sla_loss_warn_pct:
+            extra_hits.append(
+                f"丢包 {row['loss_pct']:.1f}% 超过平台警告线 {device.sla_loss_warn_pct:.1f}%")
+        if extra_hits:
+            problems.append({
+                "kind": EventKind.SLA_VIOLATED, "severity": Severity.WARNING,
+                "value": row["latency_ms"], "threshold": device.sla_latency_warn_ms,
+                "unit": "ms",
+                # **说清楚这是平台的线不是设备的** —— 否则人会去 FortiGate 上
+                # 找一条对不上的 SLA 配置
+                "message": (
+                    f"{label} 设备判定达标,但{'、'.join(extra_hits)}"
+                    "(这是平台自己的门限,不是设备的 SLA)"
+                ),
+            })
+
+    # 设备上已经没有的链路要删掉(改了健康检查名、删了成员)——
+    # 留着的话页面上会一直显示一条永远不更新的链路
+    stale = [
+        link.pk for link in SdwanLink.objects.filter(device=device, vdom=vdom)
+        if (link.health_check, link.member) not in seen
+    ]
+    if stale:
+        SdwanLink.objects.filter(pk__in=stale).delete()
+
+    device.last_sdwan_at = now
+    device.last_sdwan_error = ""
+    device.save(update_fields=["last_sdwan_at", "last_sdwan_error"])
+    return problems
+
+
+def ssh_cli_sdwan(device: Device) -> str:
+    """
+    SSH 兜底:跑 `diagnose sys sdwan health-check`。
+
+    **7.0 之前那条命令叫 `diagnose sys virtual-wan-link health-check`**,
+    所以两条都试 —— 只试一条的话老固件上这一项永远是空的,而且不报错。
+    """
+
+    profile = get_profile(device.model, device.vendor)
+    if not profile.sdwan_cli:
+        return ""
+    if not device.ssh_username or not (device.ssh_password or device.ssh_private_key):
+        return ""
+
+    client = ssh_cli._connect(device)
+    try:
+        for command in profile.sdwan_cli.split("|||"):
+            try:
+                raw = ssh_cli._run_exec(client, command.strip(), timeout=60.0)
+            except ssh_cli.SshError:
+                continue
+            if "Health Check" in raw:
+                return raw
+    finally:
+        client.close()
+    return ""
+
+
 def collect_device(device: Device) -> DeviceSample:
     """
     采一台设备:主通道 → 失败降级 → 写样本 → 判事件。
@@ -628,6 +795,24 @@ def collect_device(device: Device) -> DeviceSample:
         device.serial = str(data["serial"])[:64]
         fields.append("serial")
     device.save(update_fields=fields)
+
+    # ---- SD-WAN 性能 SLA ----
+    #
+    # **跟着设备采集的节拍走,不单独排一类调度** —— 它是指标(延迟/抖动/
+    # 丢包),和 CPU、温度同一个性质,每台设备自己的 interval_seconds
+    # 已经是对的节拍。
+    #
+    # 它的 problems **合进设备这一次 process()**,不另开一次:
+    # process() 的语义是"这个来源这一拍观测到的全部问题",分两次调用的话
+    # 后一次会把前一次开的事件当成已恢复关掉(CLAUDE.md 第 8 条)。
+    if reachable and device.collect_sdwan:
+        try:
+            sdwan_problems = _collect_sdwan(device, now)
+            problems.extend(sdwan_problems)
+        except Exception as exc:  # noqa: BLE001 —— SD-WAN 拿不到不该让整台设备的采集失败
+            log.warning("设备 %s SD-WAN 采集失败: %s", device.name, exc)
+            device.last_sdwan_error = f"{type(exc).__name__}: {exc}"[:255]
+            device.save(update_fields=["last_sdwan_error"])
 
     # ---- 事件 ----
     outcome = event_engine.process(event_engine.EventSource.from_device(device), problems)

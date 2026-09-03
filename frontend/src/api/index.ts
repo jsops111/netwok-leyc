@@ -198,6 +198,11 @@ export interface DeviceRow {
   unsaved_diff: string[]
   profile_supports: { backup: boolean; policy: boolean; unsaved_check: boolean }
   policy_sync_enabled: boolean
+  /** 仅 FortiGate。**开在别的厂商上不起作用**(后端 clean() 拦着) */
+  collect_sdwan: boolean
+  /** 平台自己的门限。**留空 = 只按设备自己的 SLA 判定** */
+  sla_latency_warn_ms: number | null
+  sla_loss_warn_pct: number | null
   policy_sync_interval_minutes: number
   last_policy_sync_at: string | null
   last_policy_error: string
@@ -660,6 +665,76 @@ export interface ServiceRow {
   predefined: boolean
   synced_at: string
   method: string
+}
+
+// ------------------------------------------------- SD-WAN 性能 SLA
+
+export interface SdwanLinkRow {
+  id: number
+  device: number
+  device_name: string
+  vdom: string
+  health_check: string
+  member: string
+  server: string
+  protocol: string
+  /** `alive` / `dead` / **`unknown`(这一拍没读到,不等于它是通的)** */
+  state: string
+  state_label: string
+  latency_ms: number | null
+  jitter_ms: number | null
+  loss_pct: number | null
+  /**
+   * 达标了吗。**三态**:true 达标 / false 未达标 /
+   * **null = 设备没报**(没配 SLA 目标,或这个固件不给这一项)。
+   * null 显示成"达标"就是替设备做一个它没做的判断。
+   */
+  sla_met: boolean | null
+  sla_targets_met: number | null
+  sla_targets_total: number | null
+  /** 三态各自的说法,后端拼好 */
+  sla_text: string
+  tx_bps: number | null
+  rx_bps: number | null
+  session_count: number | null
+  last_change: string | null
+  synced_at: string
+  method: string
+  series?: Array<{
+    ts: string; latency: number | null; jitter: number | null
+    loss: number | null; state: string
+  }>
+}
+
+export interface SdwanBoard {
+  generated_at: string
+  hours: number
+  verdict: 'ok' | 'warn' | 'crit' | 'unknown'
+  totals: {
+    devices: number; links: number
+    alive: number; dead: number; unknown: number
+    sla_ok: number; sla_bad: number
+    /** **设备没报 SLA 判定的单独一栏** */
+    sla_unknown: number
+    latency_max: number | null
+    latency_avg: number | null
+    /** 最慢那条**点名** */
+    latency_max_link: string | null
+  }
+  devices: Array<{
+    device_id: number; device_name: string; mgmt_ip: string; vdom: string
+    state: string; method: string; synced_at: string; last_error: string
+    /** 平台自己的门限 —— **不是设备的 SLA**,页面上要说清楚 */
+    sla_latency_warn_ms: number | null
+    sla_loss_warn_pct: number | null
+    links: SdwanLinkRow[]
+    alerts: Array<{
+      kind: string; kind_label: string; severity: string
+      message: string; started_at: string
+    }>
+  }>
+  /** 开了开关但一条链路都没采到的设备 —— **"没采到"不是"没配"** */
+  devices_without_data: Array<{ device_id: number; device_name: string; last_error: string }>
 }
 
 // ------------------------------------------------- 带外硬件(iDRAC)
@@ -1469,6 +1544,12 @@ export const api = {
   resolveService: (deviceId: number, name: string) =>
     http.get<AddressResolve>('/firewall-services/resolve/',
       { params: { device: deviceId, name } }),
+
+  // SD-WAN 性能 SLA —— 防火墙自己从出口探出来的延迟/抖动/丢包
+  sdwanBoard: (hours = 6) =>
+    http.get<SdwanBoard>('/sdwan/board/', { params: { hours } }),
+  sdwanLinks: (params?: object) =>
+    http.get<Paged<SdwanLinkRow>>('/sdwan/', { params }),
 
   // 带外硬件(iDRAC)
   idracHosts: (params?: object) => http.get<Paged<IdracRow>>('/idrac/', { params }),

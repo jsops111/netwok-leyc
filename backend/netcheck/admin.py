@@ -16,6 +16,7 @@ from netcheck.models import (
     FirewallPolicy,
     FirewallAddress,
     FirewallService,
+    SdwanLink,
     FirewallVip,
     IdracHost,
     IdracSample,
@@ -153,6 +154,14 @@ class FirewallServiceAdmin(admin.ModelAdmin):
     list_display = ("device", "vdom", "name", "protocol", "is_group", "display", "synced_at")
     list_filter = ("device", "vdom", "is_group", "protocol", "method")
     search_fields = ("name", "value", "comment", "category")
+
+
+@admin.register(SdwanLink)
+class SdwanLinkAdmin(admin.ModelAdmin):
+    list_display = ("device", "health_check", "member", "state", "latency_ms",
+                    "jitter_ms", "loss_pct", "sla_text", "synced_at")
+    list_filter = ("device", "vdom", "state", "method")
+    search_fields = ("health_check", "member", "server")
 
 
 @admin.register(IdracHost)

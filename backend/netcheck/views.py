@@ -41,6 +41,7 @@ from netcheck.filters import (
     FirewallPolicyFilter,
     FirewallAddressFilter,
     FirewallServiceFilter,
+    SdwanLinkFilter,
     FirewallVipFilter,
     IdracHostFilter,
     NotifierFilter,
@@ -64,6 +65,8 @@ from netcheck.models import (
     FirewallAddress,
     FirewallService,
     FirewallVip,
+    SdwanLink,
+    SdwanSample,
     HwState,
     IdracHost,
     IdracSample,
@@ -81,6 +84,7 @@ from netcheck.models import (
     RollupBucket,
     Server,
     ServerOS,
+    SdwanState,
     ServerSample,
     Severity,
     SnmpSecLevel,
@@ -101,6 +105,8 @@ from netcheck.serializers import (
     FirewallPolicySerializer,
     FirewallAddressSerializer,
     FirewallServiceSerializer,
+    SdwanLinkSerializer,
+    SdwanSampleSerializer,
     FirewallVipSerializer,
     IdracHostSerializer,
     IdracSampleSerializer,
@@ -1502,6 +1508,172 @@ class FirewallServiceViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
+class SdwanLinkViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    **SD-WAN 性能 SLA** 只读快照。跟着设备指标采集的节拍走。
+
+    ## 它和线路拨测测的不是同一段
+
+    `/`(大屏)上那些 latency/loss/jitter 是**这个平台自己**从部署点探
+    出来的;这一页是**防火墙自己**从它的出口探出来的(FortiOS 的
+    health-check,默认 500ms 一拍)。
+
+    同一条运营商线路两边测出来的数**不一样是正常的** —— 路径不同。
+    而两边都有才分得清:防火墙侧正常而平台侧不通 = 我们到防火墙这一段的
+    问题;两边都不通 = 那条线路真的断了。**这一页不是拨测的替代,
+    是另一个视角。**
+    """
+
+    serializer_class = SdwanLinkSerializer
+    filterset_class = SdwanLinkFilter
+    search_fields = ["health_check", "member", "server"]
+    ordering_fields = ["health_check", "member", "state", "latency_ms",
+                       "jitter_ms", "loss_pct", "synced_at"]
+
+    def get_queryset(self):
+        return SdwanLink.objects.select_related("device")
+
+    @action(detail=True, methods=["get"])
+    def series(self, request, pk=None):
+        """
+        趋势。**没有降采样表** —— 和 DeviceSample 同一个取舍:它跟着设备
+        采集的节拍(最快 10 秒),一天几千行。代价是能看的跨度就是原始
+        样本保留期。
+        """
+
+        link = self.get_object()
+        hours = min(int(request.query_params.get("hours", 6) or 6), 720)
+        since = timezone.now() - timezone.timedelta(hours=hours)
+        rows = link.samples.filter(ts__gte=since).order_by("ts")
+        return Response({
+            "link": f"{link.health_check}/{link.member}",
+            "hours": hours,
+            "points": SdwanSampleSerializer(rows, many=True).data,
+        })
+
+    @action(detail=False, methods=["get"])
+    def board(self, request):
+        """
+        **SD-WAN 这一页的唯一数据源**:按设备分组 + 每条链路的当前值 +
+        每条的近期趋势。一次请求给完 —— 拆成"每条链路一个请求"会在
+        几十条链路上把 gunicorn 打满(和大屏那三个接口同一条规矩)。
+        """
+
+        hours = min(int(request.query_params.get("hours", 6) or 6), 168)
+        since = timezone.now() - timezone.timedelta(hours=hours)
+
+        links = list(
+            self.filter_queryset(self.get_queryset()).order_by(
+                "device_id", "vdom", "health_check", "member")
+        )
+
+        # 趋势一次查完。**按链路分桶**,不要每条一次查询
+        series: dict = {}
+        if links:
+            for row in SdwanSample.objects.filter(
+                link__in=links, ts__gte=since
+            ).order_by("ts").values("link_id", "ts", "latency_ms", "jitter_ms",
+                                    "loss_pct", "state"):
+                series.setdefault(row["link_id"], []).append({
+                    "ts": row["ts"], "latency": row["latency_ms"],
+                    "jitter": row["jitter_ms"], "loss": row["loss_pct"],
+                    "state": row["state"],
+                })
+
+        # 未恢复的 SD-WAN 事件。**按设备挂** —— 事件的来源是设备
+        # (SdwanLink 没有自己的来源外键,它是设备的一部分)
+        open_events = list(
+            Event.objects.filter(
+                source_type=SourceType.DEVICE,
+                kind__in=[EventKind.SLA_VIOLATED, EventKind.SDWAN_DEAD],
+                resolved_at__isnull=True,
+            ).select_related("device")
+        )
+
+        by_device: dict = {}
+        for link in links:
+            slot = by_device.setdefault(link.device_id, {
+                "device_id": link.device_id,
+                "device_name": link.device.name,
+                "mgmt_ip": link.device.mgmt_ip,
+                "vdom": link.vdom,
+                "state": link.device.state,
+                "method": link.method,
+                "synced_at": link.synced_at,
+                "last_error": link.device.last_sdwan_error,
+                # 平台自己那两个门限 —— 页面上要说清"这条线不是设备的 SLA"
+                "sla_latency_warn_ms": link.device.sla_latency_warn_ms,
+                "sla_loss_warn_pct": link.device.sla_loss_warn_pct,
+                "links": [],
+                "alerts": [],
+            })
+            slot["links"].append({
+                **SdwanLinkSerializer(link).data,
+                "series": series.get(link.pk, []),
+            })
+
+        for event in open_events:
+            if event.device_id in by_device:
+                by_device[event.device_id]["alerts"].append({
+                    "kind": event.kind, "kind_label": event.get_kind_display(),
+                    "severity": event.severity, "message": event.message,
+                    "started_at": event.started_at,
+                })
+
+        # ---- 汇总。**四档分开数,unknown 不并进任何一边** ----
+        totals = {
+            "devices": len(by_device), "links": len(links),
+            "alive": sum(1 for x in links if x.state == "alive"),
+            "dead": sum(1 for x in links if x.state == "dead"),
+            # 「这一拍没读到这个成员」和「它是通的」是两个结论
+            "unknown": sum(1 for x in links if x.state == "unknown"),
+            "sla_ok": sum(1 for x in links if x.sla_met is True),
+            "sla_bad": sum(1 for x in links if x.sla_met is False),
+            # **设备没报 SLA 判定的单独一栏** —— 显示成"达标"就是替设备
+            # 做一个它没做的判断
+            "sla_unknown": sum(1 for x in links if x.sla_met is None),
+        }
+        latencies = [x.latency_ms for x in links if x.latency_ms is not None]
+        totals["latency_max"] = max(latencies) if latencies else None
+        totals["latency_avg"] = (
+            round(sum(latencies) / len(latencies), 2) if latencies else None
+        )
+        worst = max(
+            (x for x in links if x.latency_ms is not None),
+            key=lambda x: x.latency_ms, default=None,
+        )
+        # 最慢那条**点名** —— 只给一个数字的话人还得自己去表里找
+        totals["latency_max_link"] = (
+            f"{worst.device.name} {worst.health_check}/{worst.member}" if worst else None
+        )
+
+        if totals["dead"]:
+            verdict = "crit"
+        elif totals["sla_bad"]:
+            verdict = "warn"
+        elif totals["unknown"] or totals["sla_unknown"]:
+            verdict = "unknown"
+        else:
+            verdict = "ok"
+
+        # 开了这个开关但一条链路都没采到的设备 —— **"没采到"不是"没配"**
+        missing = [
+            {"device_id": d.pk, "device_name": d.name,
+             "last_error": d.last_sdwan_error}
+            for d in Device.objects.filter(enabled=True, collect_sdwan=True)
+            if d.pk not in by_device
+        ]
+
+        return Response({
+            "generated_at": timezone.now(),
+            "hours": hours,
+            "verdict": verdict,
+            "totals": totals,
+            "devices": list(by_device.values()),
+            "devices_without_data": missing,
+        })
+
+
 class FirewallVipViewSet(viewsets.ReadOnlyModelViewSet):
     """
     防火墙**映射**(FortiOS 的 firewall vip)只读快照。写入只有一条路:
@@ -2691,6 +2863,7 @@ def meta_choices(request):
         "snmp_sec_level": pack(SnmpSecLevel),
         "server_os": pack(ServerOS),
         "hw_state": pack(HwState),
+        "sdwan_state": pack(SdwanState),
         "notifier_kind": pack(NotifierKind),
         "rollup_bucket": pack(RollupBucket),
         "notify_status": pack(NotifyLog.Status),

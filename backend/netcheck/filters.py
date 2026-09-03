@@ -18,6 +18,7 @@ from netcheck.models import (
     FirewallPolicy,
     FirewallAddress,
     FirewallService,
+    SdwanLink,
     FirewallVip,
     IdracHost,
     Notifier,
@@ -298,6 +299,37 @@ class FirewallServiceFilter(filters.FilterSet):
             # 组的成员名单也要能搜 —— 「哪个组里有 HTTPS」是个真问题
             | Q(members__icontains=value)
         )
+
+
+class SdwanLinkFilter(filters.FilterSet):
+    device = filters.NumberFilter(field_name="device_id")
+    keyword = filters.CharFilter(method="filter_keyword", label="健康检查/成员/目标")
+    # 「只看有问题的」—— 不通的 + SLA 未达标的。
+    # **sla_met 为 null 的不算**(那是"设备没报",不是"未达标")
+    problem = filters.BooleanFilter(method="filter_problem", label="只看有问题的")
+
+    class Meta:
+        model = SdwanLink
+        fields = ["device", "vdom", "health_check", "member", "state", "method"]
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(health_check__icontains=value)
+            | Q(member__icontains=value)
+            | Q(server__icontains=value)
+        )
+
+    def filter_problem(self, queryset, name, value):
+        from django.db.models import Q
+
+        if value is None:
+            return queryset
+        # **在 SQL 里重写判定**(和 filter_permissive 同一类问题):
+        # 不通 或者 明确未达标。sla_met=None 是"设备没报",两边都不算
+        problem = Q(state="dead") | Q(sla_met=False)
+        return queryset.filter(problem) if value else queryset.exclude(problem)
 
 
 class FirewallVipFilter(filters.FilterSet):

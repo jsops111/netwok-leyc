@@ -601,6 +601,25 @@ const deviceFields: FieldSpec[] = [
     suffix: '分钟', show: (m) => m.kind === 'firewall' && m.policy_sync_enabled,
     hint: '策略表几百条起,一次同步要拉两个端点;5 分钟以下没有意义' },
 
+  // ---- SD-WAN 性能 SLA ----
+  // **只对 FortiGate 显示** —— 开在别的厂商上不会报错、只会每拍白走一次
+  // API 什么都拿不到,而那种"静默无效"的开关最难查(模型 clean() 也拦着)
+  { key: 'collect_sdwan', label: '采集 SD-WAN SLA', type: 'switch', full: true,
+    show: (m) => m.vendor === 'fortinet',
+    hint: '防火墙自己从出口探出来的延迟/抖动/丢包,**和拨测测的不是同一段**。'
+      + '**强烈建议同时配 API Token** —— monitor 端点一次给全部成员的'
+      + '延迟/抖动/丢包/达标情况;SSH 那条命令拿不到带宽和 SLA 档数,'
+      + '而且输出格式在 FortiOS 大版本间有出入' },
+  { key: 'sla_latency_warn_ms', label: 'SLA 延迟警告线', type: 'number', min: 0, suffix: 'ms',
+    show: (m) => m.vendor === 'fortinet' && m.collect_sdwan,
+    hint: '**留空 = 只按设备自己的 SLA 判定**(它比我们更清楚它按哪一档选路)。'
+      + '填了则延迟超过它也告警 —— 这一条是给"设备说达标但数字已经很难看"'
+      + '准备的:FortiOS 的门限常常配得很松(比如 200ms),而一条 180ms 的'
+      + '专线该早点有人看一眼' },
+  { key: 'sla_loss_warn_pct', label: 'SLA 丢包警告线', type: 'number', min: 0, max: 100, suffix: '%',
+    show: (m) => m.vendor === 'fortinet' && m.collect_sdwan,
+    hint: '留空 = 不判' },
+
   { key: 'enabled', label: '启用', type: 'switch' },
   { key: 'order', label: '排序', type: 'number', min: 0 },
 ]
