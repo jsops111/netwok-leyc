@@ -22,8 +22,13 @@ dependencies = [
     "pysnmp>=7.1.0",
     #   SSH   —— Cisco IOS-XE / FortiOS 的 CLI 兜底通道
     "paramiko>=5.0.0",
-    #   HTTP  —— FortiGate REST API、Webhook 推送、Telegram sendMessage
+    #   HTTP  —— FortiGate REST API、iDRAC Redfish、Webhook 推送、Telegram sendMessage
     "requests>=2.32",
+    #   **直接 import,所以显式声明**,不靠 requests 传递进来:
+    #   idrac/redfish.py 要关掉 InsecureRequestWarning(iDRAC 出厂是自签证书,
+    #   几十台机器每分钟一条警告会把日志淹掉)。requests 哪天换了 HTTP 后端,
+    #   一个没声明的直接 import 会在新环境里报 ModuleNotFoundError
+    "urllib3>=2.0",
     # DNS 拨测。**这是有意新增的依赖**:需求要求"配置检测的 IP",也就是
     # 要能指向**指定的那台 DNS 服务器**发查询,而 socket.getaddrinfo 只会走
     # 系统 resolver,拨测目标填了也没用。自己拼 DNS 报文则要处理压缩指针、
