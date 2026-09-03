@@ -568,6 +568,37 @@ def _collect_sdwan(device: Device, now) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     vdom = device.api_vdom or "root"
 
+    def add(kind, severity, message, value=None, threshold=None, unit=""):
+        """
+        记一条问题。**同一个 kind 只能有一条。**
+
+        `event_engine.process()` 里是 `{p["kind"]: p for p in problems}` ——
+        同 kind 的第二条会**静默覆盖**第一条。而 SD-WAN 这边一个 kind 下
+        天生就有好几条:一台设备上 wan2 和 wan3 可以同时 SLA 未达标、
+        两个成员可以同时断。按追加写的话事件里只会看到最后一条,
+        **而最后一条常常是级别较低的那条**。
+
+        实测:wan2 的"2 档 SLA 都没过"被 wan3 的"设备说达标但超平台门限"
+        顶掉了 —— 前者是真正的 SLA 违规,后者只是平台自己那条软门限。
+
+        和 `idrac/collector.evaluate_idrac()` 里那个 `add()` 是同一份语义:
+        **级别取高的**,消息拼起来,高级别那句放前面。
+        """
+        entry = next((p for p in problems if p["kind"] == kind), None)
+        if entry is None:
+            problems.append({
+                "kind": kind, "severity": severity, "value": value,
+                "threshold": threshold, "unit": unit, "message": message,
+            })
+            return
+        rank = {Severity.INFO: 0, Severity.WARNING: 1, Severity.CRITICAL: 2}
+        if rank.get(severity, 0) > rank.get(entry["severity"], 0):
+            entry.update({"severity": severity, "value": value,
+                          "threshold": threshold, "unit": unit})
+            entry["message"] = f"{message};{entry['message']}"
+        else:
+            entry["message"] = f"{entry['message']};{message}"
+
     for row in rows:
         key = (row["health_check"], row["member"])
         seen.add(key)
@@ -623,11 +654,8 @@ def _collect_sdwan(device: Device, now) -> list[dict]:
 
         # ---- 成员不通 ----
         if row["state"] == SdwanState.DEAD:
-            problems.append({
-                "kind": EventKind.SDWAN_DEAD, "severity": Severity.CRITICAL,
-                "value": None, "threshold": None, "unit": "",
-                "message": f"SD-WAN 成员 {label} 探测不通(丢包 100%)",
-            })
+            add(EventKind.SDWAN_DEAD, Severity.CRITICAL,
+                f"{label} 探测不通(丢包 100%)")
             continue
 
         # ---- SLA 未达标(设备自己的判定) ----
@@ -642,11 +670,9 @@ def _collect_sdwan(device: Device, now) -> list[dict]:
             targets = ""
             if row["sla_targets_total"]:
                 targets = f",{row['sla_targets_total']} 档 SLA 都没过"
-            problems.append({
-                "kind": EventKind.SLA_VIOLATED, "severity": Severity.WARNING,
-                "value": row["latency_ms"], "threshold": None, "unit": "ms",
-                "message": f"{label} SLA 未达标({'、'.join(detail) or '设备判定'}){targets}",
-            })
+            add(EventKind.SLA_VIOLATED, Severity.WARNING,
+                f"{label} SLA 未达标({'、'.join(detail) or '设备判定'}){targets}",
+                value=row["latency_ms"], unit="ms")
             continue
 
         # ---- 平台自己那条额外门限 ----
@@ -661,17 +687,12 @@ def _collect_sdwan(device: Device, now) -> list[dict]:
             extra_hits.append(
                 f"丢包 {row['loss_pct']:.1f}% 超过平台警告线 {device.sla_loss_warn_pct:.1f}%")
         if extra_hits:
-            problems.append({
-                "kind": EventKind.SLA_VIOLATED, "severity": Severity.WARNING,
-                "value": row["latency_ms"], "threshold": device.sla_latency_warn_ms,
-                "unit": "ms",
-                # **说清楚这是平台的线不是设备的** —— 否则人会去 FortiGate 上
-                # 找一条对不上的 SLA 配置
-                "message": (
-                    f"{label} 设备判定达标,但{'、'.join(extra_hits)}"
-                    "(这是平台自己的门限,不是设备的 SLA)"
-                ),
-            })
+            # **说清楚这是平台的线不是设备的** —— 否则人会去 FortiGate 上
+            # 找一条对不上的 SLA 配置
+            add(EventKind.SLA_VIOLATED, Severity.WARNING,
+                f"{label} 设备判定达标,但{'、'.join(extra_hits)}"
+                "(这是平台自己的门限,不是设备的 SLA)",
+                value=row["latency_ms"], threshold=device.sla_latency_warn_ms, unit="ms")
 
     # 设备上已经没有的链路要删掉(改了健康检查名、删了成员)——
     # 留着的话页面上会一直显示一条永远不更新的链路
