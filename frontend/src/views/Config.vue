@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
 import {
-  NButton, NDataTable, NModal, NPopconfirm, NSpace, NSwitch,
+  NButton, NDataTable, NInput, NModal, NPopconfirm, NSpace, NSwitch,
   NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
@@ -141,7 +141,6 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
 function openEdit(kind: EntityKind, row?: Record<string, any>) {
   editing.value = kind
   formErrors.value = {}
-  copyNote.value = ''
   // 凭据字段后端是 write_only,不会回传 —— 编辑时留空表示"不修改",
   // 这一点在 hint 里写给用户看
   form.value = row ? { ...DEFAULTS[kind], ...row } : { ...DEFAULTS[kind] }
@@ -150,112 +149,69 @@ function openEdit(kind: EntityKind, row?: Record<string, any>) {
 
 // ---- 复制 ----
 //
-// 「复制」打开的是**预填好的新建表单**,不是直接建一条。理由:名字、地址
-// 这些带唯一约束的字段必须先改,直接建只会撞约束 —— 而且人复制一台设备
-// 十有八九是要改其中一两项(隔壁机柜那台、下一个网段那台)。
+// **复制在后端做**(`netcheck/duplicate.py`)。理由只有一条但是决定性的:
+// 凭据字段是 `write_only`,列表接口**根本不回传** —— 前端拼出来的"副本"
+// 必然是一台没有密码的机器。后端拿得到解密后的值,所以点一下就是一条
+// 能用的副本,名字自动编号(`xxx 复制1` / `复制2` / …)。
+//
+// 两种结果:
+//   201            直接建好了(监控类 / 网络设备 / 通知渠道 —— 只有名字唯一)
+//   400 + needs    线路 / 服务器 / 带外有端点唯一约束,先要一个新地址
 
-/**
- * **所有类型都要剥掉的字段。**分三类,每一类漏掉的后果不一样:
- *
- * 1. `id` —— 留着的话 `isNew` 是 false,点「创建」实际是**改了源那一条**。
- *    这是最危险的一个:表单标题会写"编辑",但人以为自己在复制。
- * 2. 运行时状态(state / last_* / consecutive_* / total_*)—— 留着的话
- *    新建那条在页面上一开始就顶着**源那条的状态和最后错误**,
- *    看着像它已经采过了。
- * 3. 只读的统计字段 —— 后端本来就会忽略,但留在表单模型里会让
- *    "这些值也复制过来了"这个误解成立。
- */
-const COPY_STRIP_COMMON = [
-  'id', 'state', 'state_label',
-  'last_collected_at', 'last_checked_at', 'last_error', 'last_sent_at',
-  'consecutive_fail', 'consecutive_ok', 'total_checks', 'total_fail',
-  'total_sent', 'total_failed',
-  'last_rtt_ms', 'last_loss_pct', 'last_jitter_ms',
-  'has_credential', 'uses_key', 'open_event_count', 'interface_count',
-  'target_count', 'profile_notes',
-]
+const API_PATH: Record<EntityKind, string> = {
+  group: 'probe-groups', probe: 'probes', device: 'devices',
+  server: 'servers', idrac: 'idrac', notifier: 'notifiers',
+}
 
-/**
- * **首次采集回填的铭牌字段。**这些是从**源那台机器**上采回来的 ——
- * 型号、序列号、内核版本、CPU 核数、服务编号……
- *
- * 复制过去的后果很安静:新建那条在第一次采集之前,页面上显示的是
- * **另一台机器的硬件信息**。人会照着它去判断"这台是 C9300 还是 C9200L",
- * 而那是错的。所以一律剥掉,让它显示"待采集"。
- */
-const COPY_STRIP_INVENTORY = [
-  'os_version', 'serial', 'hostname', 'os_name', 'kernel',
-  'cpu_cores', 'mem_total_bytes',
-  'model_name', 'manufacturer', 'service_tag', 'bios_version',
-  'idrac_firmware', 'system_hostname', 'power_state',
-  'last_backup_at', 'last_backup_status', 'last_backup_error',
-  'config_unsaved', 'config_unsaved_lines', 'config_checked_at',
-  'last_policy_sync_at', 'last_policy_error', 'policy_count',
-  'backup_count',
-]
+/** 要新地址时弹的那个小框。**只问必须改的那一两项**,不是整张表单 */
+const dupAsk = ref<{
+  kind: EntityKind; id: number; name: string
+  fields: string[]; values: Record<string, string>; source: Record<string, any>
+} | null>(null)
+const duplicating = ref(0)
 
-/**
- * 凭据。后端是 `write_only`,**列表接口根本不会回传它们** ——
- * 所以复制出来的那条天生是空凭据。这里显式列出来只为了两件事:
- * 保证表单里是空串(而不是 undefined),以及**在弹窗里说出来**。
- *
- * 不说的后果:人复制一台设备、改个 IP、点创建 —— 然后收到一个
- * "SNMP v2c 必须填 community" 的报错,而他以为自己什么都没动。
- */
-const COPY_STRIP_SECRETS = [
-  'snmp_community', 'snmp_v3_auth_key', 'snmp_v3_priv_key',
-  'ssh_password', 'ssh_private_key', 'ssh_enable_password',
-  'ssh_key_passphrase', 'api_token', 'telegram_bot_token', 'password',
-]
+const FIELD_LABEL: Record<string, string> = {
+  host: '地址', mgmt_ip: '管理地址', port: '端口', ssh_port: 'SSH 端口',
+}
 
-/** 弹窗顶部那句"这次复制没带过来什么"。**必须显示** —— 见上面 */
-const copyNote = ref('')
-
-function copyFrom(kind: EntityKind, row: Record<string, any>) {
-  editing.value = kind
-  formErrors.value = {}
-
-  const draft: Record<string, any> = { ...DEFAULTS[kind], ...row }
-  for (const key of [...COPY_STRIP_COMMON, ...COPY_STRIP_INVENTORY]) {
-    delete draft[key]
+async function copyFrom(kind: EntityKind, row: Record<string, any>,
+                        overrides?: Record<string, any>) {
+  duplicating.value = row.id
+  try {
+    const { data } = await api.duplicate(API_PATH[kind], row.id, overrides)
+    dupAsk.value = null
+    // **设备没有端点唯一约束**(多 VDOM 就是同一个管理地址配好几条),
+    // 所以它能直接建成功 —— 而不改地址的话同一台设备会被采两遍。
+    // 这句提醒放在这儿而不是拦在后端:拦住会打断多 VDOM 那个合法用法
+    const extra = kind === 'device' && !overrides
+      ? ' —— 地址和源那台一样,不改的话同一台设备会被采两遍,记得改'
+      : ''
+    message.success(`已复制为「${data.name}」${extra}`, { duration: extra ? 9000 : 4000 })
+    await loadAll()
+  } catch (e) {
+    const body = (e as any)?.response?.data
+    if (body?.needs) {
+      // 这一类要先给新地址。**把源的值预填进去** —— 人通常只改最后一段
+      dupAsk.value = {
+        kind, id: row.id, name: row.name,
+        fields: body.needs,
+        values: Object.fromEntries(
+          body.needs.map((f: string) => [f, String(body.source?.[f] ?? '')]),
+        ),
+        source: body.source || {},
+      }
+    } else {
+      message.error(errText(e))
+    }
+  } finally {
+    duplicating.value = 0
   }
-  // 凭据置成**空串而不是删掉** —— 删掉的话 SchemaForm 里那个输入框
-  // 是 undefined,敲一下再清空会变成受控/非受控的来回切换
-  for (const key of COPY_STRIP_SECRETS) {
-    if (key in draft) draft[key] = ''
-  }
+}
 
-  // 名字带唯一约束,原样复制必然撞。加后缀而不是清空:清空的话人得从头
-  // 想一个名字,而"xxx 副本"改一个字就能用
-  if (draft.name) draft.name = `${row.name} 副本`
-
-  form.value = { ...DEFAULTS[kind], ...draft }
-
-  const notes = ['**凭据没有复制**(后端不回传密码/密钥),要重新填一遍。']
-  // 地址的提示**按类型分开写**,因为三者的约束不一样:
-  //   server / idrac —— (地址, 端口) 有唯一约束,不改就建不出来
-  //   device         —— **没有**这条约束(多 VDOM 的 FortiGate 就是同一个
-  //                     管理地址配好几条),所以不改也能建出来,而后果是
-  //                     同一台设备被采两遍。这种"能建出来但不对"的情况
-  //                     才更需要提前说一句
-  //   probe          —— (监控类, 地址, 协议, 端口) 唯一
-  if (kind === 'server' || kind === 'idrac') {
-    notes.push('地址原样带过来了 —— **同一个地址+端口只能加一台**,不改的话建不出来。')
-  }
-  if (kind === 'device') {
-    notes.push(
-      '地址原样带过来了。设备**允许**同地址多条(多 VDOM 就是这么用的),'
-      + '所以不改也能建成功 —— 而那意味着**同一台设备被采两遍**:接口表、事件、'
-      + 'SNMP 负载都翻倍。不是有意为之的话记得改。',
-    )
-  }
-  if (kind === 'probe') {
-    notes.push('同一个监控类下,地址+协议+端口不能重复 —— 不改的话建不出来。')
-  }
-  notes.push('型号/序列号/内核这些是采回来的,没有复制(它们属于源那台机器)。')
-  copyNote.value = notes.join('')
-
-  modal.value = true
+function confirmDuplicate() {
+  const ask = dupAsk.value
+  if (!ask) return
+  void copyFrom(ask.kind, { id: ask.id, name: ask.name }, { ...ask.values })
 }
 
 async function save() {
@@ -292,7 +248,6 @@ async function save() {
     }
     message.success(isNew.value ? '已创建,下一拍开始采集' : '已保存')
     modal.value = false
-    copyNote.value = ''
     await loadAll()
   } catch (e) {
     // 字段级错误标到对应输入框上,不只弹一句话 —— 四十个字段的表单里
@@ -857,7 +812,8 @@ const groupColumns: DataTableColumns<ProbeGroup> = [
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('group', r) }) },
   { title: '操作', key: 'act', width: 160,
     render: (r) => h(NSpace, { size: 4 }, () => [
-      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('group', r) }, () => '复制'),
+      h(NButton, { size: 'tiny', ghost: true, loading: duplicating.value === r.id,
+        onClick: () => copyFrom('group', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('group', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('group', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -900,7 +856,8 @@ const probeColumns: DataTableColumns<ProbeTarget> = [
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testProbe(r) }, () => '测试'),
-      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('probe', r) }, () => '复制'),
+      h(NButton, { size: 'tiny', ghost: true, loading: duplicating.value === r.id,
+        onClick: () => copyFrom('probe', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('probe', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('probe', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -979,7 +936,8 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
         ? h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
             onClick: () => testBackup(r) }, () => '测备份')
         : null,
-      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('device', r) }, () => '复制'),
+      h(NButton, { size: 'tiny', ghost: true, loading: duplicating.value === r.id,
+        onClick: () => copyFrom('device', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('device', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('device', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -1038,7 +996,8 @@ const serverColumns: DataTableColumns<ServerRow> = [
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testServer(r) }, () => '测试'),
-      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('server', r) }, () => '复制'),
+      h(NButton, { size: 'tiny', ghost: true, loading: duplicating.value === r.id,
+        onClick: () => copyFrom('server', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('server', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('server', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -1089,7 +1048,8 @@ const idracColumns: DataTableColumns<IdracRow> = [
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testIdrac(r) }, () => '测试'),
-      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('idrac', r) }, () => '复制'),
+      h(NButton, { size: 'tiny', ghost: true, loading: duplicating.value === r.id,
+        onClick: () => copyFrom('idrac', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('idrac', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('idrac', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -1131,7 +1091,8 @@ const notifierColumns: DataTableColumns<NotifierRow> = [
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', type: 'primary', ghost: true, loading: testing.value === r.id,
         onClick: () => testNotifier(r) }, () => '发测试'),
-      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('notifier', r) }, () => '复制'),
+      h(NButton, { size: 'tiny', ghost: true, loading: duplicating.value === r.id,
+        onClick: () => copyFrom('notifier', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('notifier', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('notifier', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -1285,18 +1246,49 @@ const profileNote = computed(() => {
       </NTabPane>
     </NTabs>
 
+    <!-- ============ 复制:要新地址的那几类 ============ -->
+    <!-- **只问必须改的那一两项**,不是整张表单 —— 凭据和其它配置后端已经
+         一起复制过去了,不用重填。这是"复制"和"照着新建一个"的全部区别 -->
+    <NModal
+      :show="!!dupAsk" preset="card" :bordered="false"
+      :title="`复制「${dupAsk?.name ?? ''}」`"
+      style="width: min(460px, 94vw)"
+      @update:show="(v: boolean) => { if (!v) dupAsk = null }"
+    >
+      <template v-if="dupAsk">
+        <div class="dup-hint">
+          这一类<b>同一个地址只能加一台</b> —— 否则同一台机器会被采两遍,
+          图上是两条一模一样的线、事件也开两条。给个新地址就行,
+          <b>凭据和其它配置都会一起复制过去,不用重填</b>。
+        </div>
+        <div v-for="f in dupAsk.fields" :key="f" class="dup-row">
+          <label>{{ FIELD_LABEL[f] || f }}</label>
+          <NInput
+            v-model:value="dupAsk.values[f]" size="small" clearable
+            :placeholder="`源:${dupAsk.source[f] ?? ''}`"
+            @keyup.enter="confirmDuplicate"
+          />
+        </div>
+        <div class="dup-src">源那台是 {{ dupAsk.source[dupAsk.fields[0]] }}</div>
+      </template>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton size="small" @click="dupAsk = null">取消</NButton>
+          <NButton
+            size="small" type="primary" :loading="duplicating > 0"
+            :disabled="!dupAsk || dupAsk.fields.some((f) => !dupAsk!.values[f]?.trim())"
+            @click="confirmDuplicate"
+          >复制并保存</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
     <!-- ============ 编辑弹窗 ============ -->
     <NModal
       v-model:show="modal" preset="card" :bordered="false"
-      :title="`${copyNote ? '复制为新的' : isNew ? '新建' : '编辑'}${MODAL_TITLES[editing]}`"
+      :title="`${isNew ? '新建' : '编辑'}${MODAL_TITLES[editing]}`"
       style="width: min(860px, 94vw)"
     >
-      <!-- **复制没带过来什么,必须说出来。**不说的后果:人复制一台设备、
-           改个 IP、点创建,然后收到一个"必须填 community"的报错,
-           而他以为自己什么都没动 -->
-      <div v-if="copyNote" class="copy-note">
-        <b>这是一份副本 —— 有几项没有复制过来:</b>{{ copyNote }}
-      </div>
       <div v-if="profileNote" class="profile-note">
         <b>型号采集特点:</b>{{ profileNote }}
       </div>
@@ -1310,7 +1302,7 @@ const profileNote = computed(() => {
       />
       <template #footer>
         <NSpace justify="end">
-          <NButton size="small" @click="modal = false; copyNote = ''">取消</NButton>
+          <NButton size="small" @click="modal = false">取消</NButton>
           <NButton size="small" type="primary" :loading="saving" @click="save">
             {{ isNew ? '创建' : '保存' }}
           </NButton>
@@ -1345,15 +1337,18 @@ const profileNote = computed(() => {
 <style scoped>
 .cfg :deep(.n-tabs-nav) { margin-bottom: 12px; }
 
-.copy-note {
+.dup-hint {
   font-size: 11.5px;
   line-height: 1.65;
-  color: var(--cy-degraded);
+  color: var(--cy-ink-2);
   padding: 6px 11px;
-  margin-bottom: 10px;
-  border-left: 2px solid var(--cy-degraded);
-  background: rgba(var(--cy-degraded-rgb), 0.07);
+  margin-bottom: 12px;
+  border-left: 2px solid var(--cy-line);
+  background: color-mix(in srgb, var(--cy-raised) 60%, transparent);
 }
+.dup-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.dup-row label { font-size: 12px; color: var(--cy-ink-2); min-width: 56px; }
+.dup-src { font-size: 10.5px; color: var(--cy-ink-3); font-family: 'JetBrains Mono', monospace; }
 
 .profile-note {
   padding: 9px 12px;

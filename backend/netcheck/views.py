@@ -21,6 +21,8 @@ from datetime import timedelta
 
 from django.db.models import Count, Q
 from django.utils import timezone
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -28,6 +30,7 @@ from rest_framework.response import Response
 
 from core.pagination import SampleCursorPagination
 from netcheck import scheduler
+from netcheck import duplicate as duplicate_mod
 from netcheck.filters import (
     DeviceBackupFilter,
     DeviceFilter,
@@ -123,7 +126,83 @@ TOP_KINDS = [
 # =========================================================================
 
 
-class ProbeGroupViewSet(viewsets.ModelViewSet):
+class DuplicateMixin:
+    """
+    给 ViewSet 加一个 `POST {id}/duplicate/`。
+
+    **复制在后端做**,因为凭据是 `write_only`、前端拿不到 —— 前端拼出来的
+    副本必然是一台没有密码的机器(见 `netcheck/duplicate.py` 的模块说明)。
+
+    两种结果:
+
+    - **201** —— 直接建好了。`ProbeGroup` / `Device` / `Notifier` 只有名字
+      唯一,改个名就能存,所以点一下就完事。
+    - **400 + `needs`** —— 有端点唯一约束的那三类(线路 / 服务器 / 带外),
+      原样复制建不出来。这时回**必须改的那几个字段**,前端只弹那几个框,
+      而不是让人对着一个四十项的完整表单从头改。
+
+    `duplicate_needs` 就是那几个字段。**留空表示这一类可以直接建** ——
+    不要为了"保险"给所有类型都填上,那样每次复制都要多点一次。
+    """
+
+    #: 端点唯一约束涉及的字段。空 = 直接建
+    duplicate_needs: list[str] = []
+
+    @action(detail=True, methods=["post"])
+    def duplicate(self, request, pk=None):
+        source = self.get_object()
+        overrides = {
+            k: v for k, v in (request.data or {}).items()
+            if k in self.duplicate_needs
+        }
+
+        # 需要改地址但没给 —— **先问,不要试着存一次让它撞约束**:
+        # 撞出来的 IntegrityError 会把整个事务标记成脏的,而且报错文本
+        # 是数据库的约束名,指不到任何一个输入框
+        missing = [f for f in self.duplicate_needs if not overrides.get(f)]
+        if missing:
+            return Response(
+                {
+                    "needs": self.duplicate_needs,
+                    "missing": missing,
+                    "detail": (
+                        "这一类有端点唯一约束(同一个地址只能加一台,"
+                        "否则同一台机器会被采两遍)—— 填一个新的再复制。"
+                        "**凭据和其它配置都会一起复制过去**,不用重填。"
+                    ),
+                    "source": {
+                        f: getattr(source, f, None) for f in self.duplicate_needs
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            copy = duplicate_mod.duplicate(source, overrides)
+        except DjangoValidationError as exc:
+            # 模型 clean() 的报错。**按字段回**,让前端标到输入框上
+            return Response(
+                exc.message_dict if hasattr(exc, "message_dict")
+                else {"detail": "; ".join(exc.messages)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except IntegrityError as exc:
+            return Response(
+                {"detail": f"复制没能存下来(撞了唯一约束):{exc}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 新建的目标要立刻排进调度,否则要等下一次 sync_schedule 才开始采
+        self._schedule_copy(copy)
+        return Response(
+            self.get_serializer(copy).data, status=status.HTTP_201_CREATED
+        )
+
+    def _schedule_copy(self, copy) -> None:
+        """子类按需覆盖 —— 有的类型(监控类、通知渠道)不进调度。"""
+
+
+class ProbeGroupViewSet(DuplicateMixin, viewsets.ModelViewSet):
     serializer_class = ProbeGroupSerializer
     filterset_fields = ["enabled"]
     search_fields = ["name", "description"]
@@ -132,7 +211,16 @@ class ProbeGroupViewSet(viewsets.ModelViewSet):
         return ProbeGroup.objects.annotate(target_count_ann=Count("targets"))
 
 
-class ProbeTargetViewSet(viewsets.ModelViewSet):
+class ProbeTargetViewSet(DuplicateMixin, viewsets.ModelViewSet):
+
+    # 唯一键是 (监控类, 地址, 协议, 端口)。**只问地址** —— 改端口或换监控类
+    # 同样能解开约束,但人复制一条线路十有八九是要探另一台机器,
+    # 问最常改的那一个就够,其余在「编辑」里改
+    duplicate_needs = ["host"]
+
+    def _schedule_copy(self, copy):
+        if copy.enabled:
+            scheduler.schedule_now("probe", copy.pk)
     serializer_class = ProbeTargetSerializer
     filterset_class = ProbeTargetFilter
     search_fields = ["name", "host"]
@@ -279,7 +367,17 @@ class ProbeTargetViewSet(viewsets.ModelViewSet):
         })
 
 
-class DeviceViewSet(viewsets.ModelViewSet):
+class DeviceViewSet(DuplicateMixin, viewsets.ModelViewSet):
+
+    # **不问地址。**Device 没有端点唯一约束(多 VDOM 的 FortiGate 就是
+    # 同一个管理地址配好几条),所以复制直接就能建出来。代价是不改地址
+    # 的话同一台设备会被采两遍 —— 那句提醒放在前端的成功提示里,
+    # 不是拦在这里:拦住会打断多 VDOM 这个合法用法
+    duplicate_needs: list[str] = []
+
+    def _schedule_copy(self, copy):
+        if copy.enabled:
+            scheduler.schedule_now("device", copy.pk)
     serializer_class = DeviceSerializer
     filterset_class = DeviceFilter
     search_fields = ["name", "mgmt_ip", "serial", "os_version"]
@@ -729,12 +827,18 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({"points": len(rows), "series": rows, "speed_bps": iface.speed_bps})
 
 
-class ServerViewSet(viewsets.ModelViewSet):
+class ServerViewSet(DuplicateMixin, viewsets.ModelViewSet):
     """
     服务器 CRUD + 测试 / 立即采集 / 时序 / 网卡。
 
     和 DeviceViewSet 的形状一样,区别是**没有通道概念** —— 服务器只走 SSH。
     """
+
+    duplicate_needs = ["host"]
+
+    def _schedule_copy(self, copy):
+        if copy.enabled:
+            scheduler.schedule_now("server", copy.pk)
 
     serializer_class = ServerSerializer
     filterset_class = ServerFilter
@@ -894,7 +998,7 @@ class ServerViewSet(viewsets.ModelViewSet):
         })
 
 
-class IdracHostViewSet(viewsets.ModelViewSet):
+class IdracHostViewSet(DuplicateMixin, viewsets.ModelViewSet):
     """
     带外主机(iDRAC)。可增删改 —— 它是配置,不是采集产物。
 
@@ -902,6 +1006,12 @@ class IdracHostViewSet(viewsets.ModelViewSet):
     汇总 + 告警清单一起给出去。拆成"每台一个请求"会在几十台机器上把
     gunicorn 打满(和大屏那三个接口同一条规矩)。
     """
+
+    duplicate_needs = ["host"]
+
+    def _schedule_copy(self, copy):
+        if copy.enabled:
+            scheduler.schedule_now("idrac", copy.pk)
 
     serializer_class = IdracHostSerializer
     filterset_class = IdracHostFilter
@@ -1968,7 +2078,7 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
-class NotifierViewSet(viewsets.ModelViewSet):
+class NotifierViewSet(DuplicateMixin, viewsets.ModelViewSet):
     serializer_class = NotifierSerializer
     filterset_class = NotifierFilter
     search_fields = ["name"]

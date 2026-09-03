@@ -1342,6 +1342,16 @@ export const api = {
   policyAudit: (deviceId?: number) =>
     http.get<PolicyAudit>('/firewall-policies/audit/', { params: { device: deviceId } }),
 
+  /**
+   * 复制一条配置。**在后端做** —— 凭据是 write_only、前端拿不到,
+   * 前端拼出来的副本必然是一台没有密码的机器。
+   *
+   * 201 = 直接建好了(监控类 / 网络设备 / 通知渠道);
+   * 400 + `needs` = 这一类有端点唯一约束,要先给一个新地址。
+   */
+  duplicate: (path: string, id: number, overrides?: Record<string, any>) =>
+    http.post<any>(`/${path}/${id}/duplicate/`, overrides ?? {}),
+
   // 端口面板图 —— 几何来自型号画像,口的名字和状态来自设备
   deviceFaceplate: (id: number) => http.get<Faceplate>(`/devices/${id}/faceplate/`),
 

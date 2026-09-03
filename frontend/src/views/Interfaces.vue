@@ -117,8 +117,22 @@ async function loadFaceplate() {
  * 会让人以为这台设备只有一个口。
  */
 function pickPort(port: { id: number; if_name: string }) {
+  // **再点一次取消。**没有这一下的话,选中一个口之后那张表就永远被筛在
+  // 那一个口上,人得手动去清搜索框才能看回全部 —— 而他刚刚的动作是
+  // "点了一下图",直觉上再点一下就该还原
+  if (pickedId.value === port.id) {
+    pickedId.value = null
+    keyword.value = ''
+    return
+  }
   pickedId.value = port.id
   keyword.value = port.if_name
+}
+
+/** 表格上方那个"已筛在某个口上"的提示要能一键清掉 */
+function clearPick() {
+  pickedId.value = null
+  keyword.value = ''
 }
 
 async function loadRows() {
@@ -152,6 +166,20 @@ onMounted(async () => {
 watch([selected, keyword, problemOnly, activeOnly, ordering], () => {
   page.value = 1
   void loadRows()
+})
+// 手动清空/改动搜索框时把图上的选中态也放掉 —— 否则图上还亮着一个口,
+// 而下面那张表已经是全部了,两处对不上
+watch(keyword, (kw) => {
+  if (pickedId.value !== null && kw !== selectedName.value) pickedId.value = null
+})
+const selectedName = computed(() => {
+  const all = faceplate.value
+  if (!all || pickedId.value === null) return ''
+  for (const b of all.banks) {
+    const hit = b.ports.find((p) => p.id === pickedId.value)
+    if (hit) return hit.if_name
+  }
+  return all.unplaced.find((u) => u.id === pickedId.value)?.if_name ?? ''
 })
 // 换设备要重画面板 —— 面板是按设备取的。**筛选变了不用重取**:
 // 图上永远画这台设备的全部口,筛选只作用于下面那张表。
@@ -369,6 +397,11 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
         class="face"
         @pick="pickPort"
       />
+      <div v-if="pickedId !== null" class="picked-bar">
+        下面这张表只显示 <b>{{ selectedName }}</b> ——
+        <button class="linkish" @click="clearPick">显示全部</button>
+        <span class="dim">(或者再点一下图上那个口)</span>
+      </div>
       <div v-else-if="!faceLoading && faceplate" class="face-empty">
         这台设备还没有采到接口,画不出面板图 —— 接口清单是采出来的,
         设备刚加进来时是空的。
@@ -408,7 +441,25 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
 </template>
 
 <style scoped>
-.face { margin: 0 0 12px; }
+.face { margin: 0 0 8px; }
+.picked-bar {
+  font-size: 11.5px;
+  color: var(--cy-ink-2);
+  padding: 5px 10px;
+  margin-bottom: 10px;
+  border-left: 2px solid var(--cy-cyan);
+  background: color-mix(in srgb, var(--cy-cyan) 7%, transparent);
+}
+.picked-bar .dim { color: var(--cy-ink-3); }
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--cy-cyan);
+  cursor: pointer;
+  font-size: 11.5px;
+  text-decoration: underline;
+}
 .face-loading, .face-empty {
   font-size: 11.5px; color: var(--cy-ink-3); padding: 8px 0;
 }
