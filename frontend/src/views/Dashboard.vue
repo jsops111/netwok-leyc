@@ -84,7 +84,15 @@ function groupLevel(summary: { down: number; degraded: number }) {
 const allDevices = computed<DeviceCard[]>(() => {
   const d = devices.data.value
   if (!d) return []
+  // ⚠ **拼完必须重排。**接口是按 kind 分成三个桶给的(switches /
+  // firewalls / others),**每个桶内**是按优先级排好的 —— 但直接拼起来
+  // 之后整体不是优先级顺序:一台优先级 5 的交换机会排在优先级 1 的
+  // 防火墙前面,因为它在前一个桶里。
+  //
+  // 这一屏是一个网格、不按类型分区,所以顺序就该是**优先级**
+  // (order 小的在前),和配置中心、线路图、下拉一致
   return [...d.switches, ...d.firewalls, ...d.others]
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id - b.id)
 })
 
 /** 调度迟到 —— 图上的点变稀是因为这个,不是线路的问题。 */
