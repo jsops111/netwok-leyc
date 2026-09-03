@@ -517,6 +517,181 @@ export interface VipRow {
   method: string
 }
 
+// ------------------------------------------------- 带外硬件(iDRAC)
+
+export interface IdracRow {
+  id: number
+  name: string
+  host: string
+  port: number
+  username: string
+  site: string
+  role: string
+  server: number | null
+  server_name?: string
+  interval_seconds: number
+  timeout_ms: number
+  verify_tls: boolean
+  temp_warn_c: number
+  temp_crit_c: number
+  temp_delta_warn_c: number
+  ssd_life_warn_pct: number
+  event_window_days: number
+  fail_threshold: number
+  recover_threshold: number
+  collect_events: boolean
+  enabled: boolean
+  order: number
+  state: string
+  state_label?: string
+  last_collected_at: string | null
+  last_error: string
+  model_name: string
+  manufacturer: string
+  service_tag: string
+  bios_version: string
+  idrac_firmware: string
+  system_hostname: string
+  power_state: string
+  has_credential?: boolean
+  open_event_count?: number
+}
+
+/**
+ * 一个部件的三元组 `[总数, 异常数, 未知数]`。
+ *
+ * ⚠ **未知不并进任何一边。**并进异常会天天误报,并进正常会在真出事时闭嘴
+ * ——「读不到这块盘的状态」和「这块盘是好的」是两个结论。
+ * 某一项整个是 `[null,null,null]` 表示这台还没采过。
+ */
+export type PartTriple = [number | null, number | null, number | null]
+
+export interface IdracBoardHost {
+  id: number
+  name: string
+  host: string
+  site: string
+  role: string
+  model: string
+  service_tag: string
+  power_state: string
+  server_id: number | null
+  server_name: string
+  /**
+   * 大屏上的档位。**六档,每台只落一档**:
+   * `pending` 还没轮到采(不是故障)/ `down` 带外连不上 /
+   * `crit` 有严重告警 / `warn` 有警告 / `unknown` 部件状态读不到 / `ok`
+   */
+  level: 'ok' | 'warn' | 'crit' | 'unknown' | 'down' | 'pending'
+  state: string
+  health: string | null
+  reachable: boolean | null
+  ts: string | null
+  last_error: string
+  interval: number
+  metrics: {
+    power_watts: number | null
+    inlet_temp_c: number | null
+    max_temp_c: number | null
+    /** 同机两颗 CPU 的温差 —— iDRAC 自己没有这条判据 */
+    temp_delta_c: number | null
+    fan_max_rpm: number | null
+  }
+  parts: {
+    disk: PartTriple; psu: PartTriple; memory: PartTriple
+    fan: PartTriple; vdisk: PartTriple
+  }
+  hottest: string
+  sel_recent: number | null
+  alerts: IdracAlert[]
+}
+
+export interface IdracAlert {
+  host_id?: number
+  host?: string
+  kind: string
+  kind_label: string
+  severity: string
+  message: string
+  started_at: string
+}
+
+export interface IdracBoard {
+  generated_at: string
+  verdict: 'ok' | 'warn' | 'crit' | 'unknown'
+  totals: {
+    hosts: number; ok: number; warn: number; crit: number
+    unknown: number; pending: number; down: number
+    disk_total: number; disk_bad: number; disk_unknown: number; ssd_worn: number
+    psu_total: number; psu_bad: number
+    memory_total: number; memory_bad: number
+    fan_total: number; fan_bad: number
+    vdisk_total: number; vdisk_bad: number
+    power_watts: number | null
+    sel_recent_critical: number
+    temp_max: number | null
+    temp_avg: number | null
+    /** 最热那台**点名** —— 只给数字的话人还得自己去表里找 */
+    temp_max_host: string | null
+  }
+  hosts: IdracBoardHost[]
+  alerts: IdracAlert[]
+}
+
+export interface IdracDisk {
+  name: string; health: string; media: string
+  capacity_gb: number | null; model: string; serial: string
+  /** SMART 预警:还在跑,但快坏了。等 health 变红时盘通常已经掉了 */
+  smart_alert: boolean
+  /** **只有 SSD 有。**机械盘一律 null —— 它返回 0 不是"寿命耗尽",是"没有这个概念" */
+  life_pct: number | null
+  is_ssd: boolean
+  slot: string
+}
+
+export interface IdracDetail {
+  host: IdracRow
+  ts: string | null
+  reachable: boolean | null
+  health: string | null
+  error: string
+  disks: IdracDisk[]
+  volumes: Array<{ name: string; health: string; raid_type: string
+                   capacity_gb: number | null; remaining_redundancy: number | null }>
+  memory: Array<{ name: string; health: string; size_mib: number | null
+                  speed_mhz: number | null; manufacturer: string; serial: string }>
+  psus: Array<{ name: string; health: string; capacity_w: number | null
+                input_voltage: number | null; model: string }>
+  fans: Array<{ name: string; rpm: number | null; units: string; health: string }>
+  temps: Array<{ name: string; celsius: number | null; warn_c: number | null
+                 crit_c: number | null; health: string
+                 is_inlet: boolean; is_exhaust: boolean }>
+  sel: {
+    entries: Array<{ id: string; severity: string; message: string
+                     at: string | null; in_window: boolean }>
+    total: number; window_days: number
+    recent_critical: number; recent_warning: number
+    /** 时间戳解不出来的条数 —— 它们不计入窗口计数,单独报 */
+    undated: number
+  } | null
+  notes: string[]
+  /** 哪一段没取到、为什么。**没有它,"硬盘 0 块"看着像这台机器没有硬盘** */
+  endpoint_errors: Record<string, string>
+  current: {
+    power_watts: number | null; inlet_temp_c: number | null
+    max_temp_c: number | null; temp_delta_c: number | null; hottest: string
+  }
+}
+
+export interface IdracSamplePoint {
+  ts: string; reachable: boolean
+  power_watts: number | null; inlet_temp_c: number | null
+  max_temp_c: number | null; temp_delta_c: number | null
+  fan_max_rpm: number | null
+  disk_bad: number | null; psu_bad: number | null
+  health: string
+}
+
 export interface VipSummary {
   generated_at: string
   total: number
@@ -1099,6 +1274,22 @@ export const api = {
   syncPoliciesNow: (id: number) => http.post<{ detail: string }>(`/devices/${id}/sync_policies_now/`),
   policyAudit: (deviceId?: number) =>
     http.get<PolicyAudit>('/firewall-policies/audit/', { params: { device: deviceId } }),
+
+  // 带外硬件(iDRAC)
+  idracHosts: (params?: object) => http.get<Paged<IdracRow>>('/idrac/', { params }),
+  createIdrac: (body: Partial<IdracRow>) => http.post<IdracRow>('/idrac/', body),
+  updateIdrac: (id: number, body: Partial<IdracRow>) =>
+    http.patch<IdracRow>(`/idrac/${id}/`, body),
+  deleteIdrac: (id: number) => http.delete(`/idrac/${id}/`),
+  idracBoard: () => http.get<IdracBoard>('/idrac/board/'),
+  idracDetail: (id: number) => http.get<IdracDetail>(`/idrac/${id}/detail_info/`),
+  idracSeries: (id: number, hours = 24) =>
+    http.get<{ host: string; hours: number; points: IdracSamplePoint[] }>(
+      `/idrac/${id}/series/`, { params: { hours } }),
+  testIdrac: (id: number) =>
+    http.post<{ ok: boolean; detail: string }>(`/idrac/${id}/test/`),
+  collectIdracNow: (id: number) =>
+    http.post<{ detail: string }>(`/idrac/${id}/collect_now/`),
 
   // 映射(firewall vip)—— 和策略同一次同步拿回来的
   vips: (params?: object) => http.get<Paged<VipRow>>('/firewall-vips/', { params }),

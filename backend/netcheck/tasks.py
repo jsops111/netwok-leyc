@@ -2,10 +2,11 @@
 Celery 任务。
 
 分四类:
-    派发      dispatch_due_* —— beat 每拍调用,共五类:
-              线路 / 设备 / 服务器 / 配置备份 / 防火墙策略
+    派发      dispatch_due_* —— beat 每拍调用,共六类:
+              线路 / 设备 / 服务器 / 带外(iDRAC)/ 配置备份 / 防火墙策略
     执行      run_probe / collect_device_task / collect_server_task /
-              backup_device_task / sync_policies_task —— 一个目标一个任务
+              collect_idrac_task / backup_device_task / sync_policies_task
+              —— 一个目标一个任务
     聚合清理  rollup_1m / rollup_5m_1h / purge_raw_samples
     通知      send_notification / retry_pending_notifications
 
@@ -36,6 +37,7 @@ from netcheck.models import (
     DeviceKind,
     Event,
     EventKind,
+    IdracHost,
     LinkState,
     ProbeRollup,
     ProbeSample,
@@ -97,6 +99,23 @@ def dispatch_due_servers() -> dict:
         # 而给短了会在上一拍还没结束时又派一次,同一台机器被并发登录
         if scheduler.mark_inflight("server", server_id, ttl_seconds=600):
             collect_server_task.delay(server_id)
+            dispatched += 1
+    return {"due": len(due), "dispatched": dispatched, **sync}
+
+
+@shared_task(name="netcheck.dispatch_due_idrac")
+def dispatch_due_idrac() -> dict:
+    enabled_ids = list(IdracHost.objects.filter(enabled=True).values_list("id", flat=True))
+    sync = scheduler.sync_schedule("idrac", enabled_ids)
+
+    due = scheduler.take_due("idrac", limit=200)
+    dispatched = 0
+    for host_id in due:
+        # 一次带外采集要打五六个 Redfish 端点,而 BMC 是一颗很弱的处理器 ——
+        # 慢的机器上十几秒是常态。ttl 给到 10 分钟,给短了会在上一拍还没
+        # 结束时又派一次,而**同时打同一个 BMC 会让它更慢**,滚成雪球
+        if scheduler.mark_inflight("idrac", host_id, ttl_seconds=600):
+            collect_idrac_task.delay(host_id)
             dispatched += 1
     return {"due": len(due), "dispatched": dispatched, **sync}
 
@@ -261,6 +280,37 @@ def collect_server_task(self, server_id: int) -> dict:
         # 少一个这条服务器就此停摆 —— 和 run_probe 的 finally 同一条规矩
         scheduler.clear_inflight("server", server_id)
         scheduler.reschedule("server", server_id, server.interval_seconds)
+
+
+@shared_task(name="netcheck.collect_idrac", bind=True, max_retries=0)
+def collect_idrac_task(self, host_id: int) -> dict:
+    """
+    采一台带外。
+
+    `max_retries=0`,理由和拨测/服务器一样:**采集失败本身就是要记录的
+    结果**。BMC 超时重试三次成功,记下来的是"可达",而真实情况是那台
+    带外当时登不上去 —— 而带外登不上去这件事本身就值得知道。
+    """
+
+    from netcheck.idrac import collector as idrac_collector
+
+    try:
+        host = IdracHost.objects.get(pk=host_id, enabled=True)
+    except IdracHost.DoesNotExist:
+        scheduler.unschedule("idrac", host_id)
+        return {"skipped": "带外主机不存在或已停用"}
+
+    try:
+        sample = idrac_collector.collect_idrac(host)
+        return {
+            "idrac": host.name, "reachable": sample.reachable, "health": sample.health,
+            "disk_bad": sample.disk_bad, "psu_bad": sample.psu_bad,
+            "max_temp_c": sample.max_temp_c,
+        }
+    finally:
+        # 少一个这台带外就此停摆 —— 和 run_probe 的 finally 同一条规矩
+        scheduler.clear_inflight("idrac", host_id)
+        scheduler.reschedule("idrac", host_id, host.interval_seconds)
 
 
 # =========================================================================

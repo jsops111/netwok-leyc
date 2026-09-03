@@ -10,13 +10,15 @@ import StateDot from '@/components/cyber/StateDot.vue'
 import SchemaForm from '@/components/SchemaForm.vue'
 import type { FieldSpec } from '@/components/SchemaForm.vue'
 import { api, errText } from '@/api'
-import type { DeviceRow, NotifierRow, ProbeGroup, ProbeTarget, ServerRow } from '@/api'
+import type {
+  DeviceRow, IdracRow, NotifierRow, ProbeGroup, ProbeTarget, ServerRow,
+} from '@/api'
 import { useMetaStore } from '@/stores/meta'
 import { ago, bytes, endpoint, ms, pct } from '@/composables/useFormat'
 import { STATE } from '@/theme'
 
 /**
- * 配置中心。五个 tab:检测线路 / 监控类 / 网络设备 / 服务器 / 通知渠道。
+ * 配置中心。六个 tab:检测线路 / 监控类 / 网络设备 / 服务器 / 带外硬件 / 通知渠道。
  *
  * 表单靠 SchemaForm 从 `fields` 数组生成 —— 手写四份表单模板的话,
  * 加一个字段要改四处而表单是最容易漏的那处(见 SchemaForm 的注释)。
@@ -37,22 +39,25 @@ const groups = ref<ProbeGroup[]>([])
 const probes = ref<ProbeTarget[]>([])
 const devices = ref<DeviceRow[]>([])
 const servers = ref<ServerRow[]>([])
+const idracs = ref<IdracRow[]>([])
 const notifiers = ref<NotifierRow[]>([])
 
 async function loadAll() {
   loading.value = true
   try {
-    const [g, p, d, s, n] = await Promise.all([
+    const [g, p, d, s, i, n] = await Promise.all([
       api.groups({ page_size: 200 }),
       api.probes({ page_size: 500, ordering: 'group__order,order' }),
       api.devices({ page_size: 200, ordering: 'order' }),
       api.servers({ page_size: 200, ordering: 'order' }),
+      api.idracHosts({ page_size: 200, ordering: 'order' }),
       api.notifiers({ page_size: 100 }),
     ])
     groups.value = g.data.results
     probes.value = p.data.results
     devices.value = d.data.results
     servers.value = s.data.results
+    idracs.value = i.data.results
     notifiers.value = n.data.results
   } catch (e) {
     message.error(errText(e))
@@ -67,7 +72,7 @@ onMounted(async () => {
 })
 
 // ---- 编辑弹窗 ----
-type EntityKind = 'group' | 'probe' | 'device' | 'server' | 'notifier'
+type EntityKind = 'group' | 'probe' | 'device' | 'server' | 'idrac' | 'notifier'
 const modal = ref(false)
 const editing = ref<EntityKind>('probe')
 const form = ref<Record<string, any>>({})
@@ -113,6 +118,15 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
     fail_threshold: 2, recover_threshold: 2,
     collect_processes: true, enabled: true, order: 0,
   },
+  idrac: {
+    name: '', host: '', port: 443, username: 'root', password: '',
+    verify_tls: false, server: null, site: '', role: '',
+    interval_seconds: 300, timeout_ms: 15000,
+    temp_warn_c: 70, temp_crit_c: 85, temp_delta_warn_c: 15,
+    ssd_life_warn_pct: 10, event_window_days: 7,
+    fail_threshold: 2, recover_threshold: 2,
+    collect_events: true, enabled: true, order: 0,
+  },
   notifier: {
     name: '', kind: 'telegram', enabled: true,
     telegram_bot_token: '', telegram_chat_id: '',
@@ -144,6 +158,9 @@ async function save() {
       'snmp_community', 'snmp_v3_auth_key', 'snmp_v3_priv_key',
       'ssh_password', 'ssh_private_key', 'ssh_enable_password',
       'ssh_key_passphrase', 'api_token', 'telegram_bot_token',
+      // iDRAC 的 Redfish 密码。**漏掉这一项的话**,编辑一台带外主机时
+      // 只改个名字就会把密码清空,而下一拍采集才会报认证失败
+      'password',
     ]) {
       if (body[key] === '' || body[key] === undefined) delete body[key]
     }
@@ -157,6 +174,8 @@ async function save() {
       isNew.value ? await api.createDevice(body) : await api.updateDevice(body.id, body)
     } else if (kind === 'server') {
       isNew.value ? await api.createServer(body) : await api.updateServer(body.id, body)
+    } else if (kind === 'idrac') {
+      isNew.value ? await api.createIdrac(body) : await api.updateIdrac(body.id, body)
     } else {
       isNew.value ? await api.createNotifier(body) : await api.updateNotifier(body.id, body)
     }
@@ -186,6 +205,7 @@ async function remove(kind: EntityKind, id: number) {
     else if (kind === 'probe') await api.deleteProbe(id)
     else if (kind === 'device') await api.deleteDevice(id)
     else if (kind === 'server') await api.deleteServer(id)
+    else if (kind === 'idrac') await api.deleteIdrac(id)
     else await api.deleteNotifier(id)
     message.success('已删除')
     await loadAll()
@@ -200,6 +220,7 @@ async function toggleEnabled(kind: EntityKind, row: any) {
     if (kind === 'probe') await api.updateProbe(row.id, body)
     else if (kind === 'device') await api.updateDevice(row.id, body)
     else if (kind === 'server') await api.updateServer(row.id, body)
+    else if (kind === 'idrac') await api.updateIdrac(row.id, body)
     else if (kind === 'group') await api.updateGroup(row.id, body)
     else await api.updateNotifier(row.id, body)
     await loadAll()
@@ -261,6 +282,26 @@ async function testServer(row: ServerRow) {
   try {
     const { data } = await api.testServer(row.id)
     testResult.value = { title: `${row.name} SSH 连通性`, ok: data.ok, lines: data.detail.split(' | ') }
+  } catch (e) {
+    testResult.value = { title: `${row.name} 测试失败`, ok: false, lines: [errText(e)] }
+  } finally {
+    testing.value = 0
+  }
+}
+
+/**
+ * 测带外通道。**只读、不写库、不开事件** —— 重点是报错要有指向性:
+ * 401 说凭据、403 说角色权限不够、404 说固件太老或者这不是一台 Dell、
+ * TLS 说把「校验 TLS 证书」关掉。
+ *
+ * 成功时**部件数是 0 的那一栏最能说明问题**(硬盘 0 块通常不是没有硬盘,
+ * 而是这个账号读不到存储那一段)。
+ */
+async function testIdrac(row: IdracRow) {
+  testing.value = row.id
+  try {
+    const { data } = await api.testIdrac(row.id)
+    testResult.value = { title: `${row.name} 带外连通性`, ok: data.ok, lines: data.detail.split(' | ') }
   } catch (e) {
     testResult.value = { title: `${row.name} 测试失败`, ok: false, lines: [errText(e)] }
   } finally {
@@ -570,6 +611,55 @@ const serverFields: FieldSpec[] = [
   { key: 'order', label: '排序', type: 'number', min: 0 },
 ]
 
+const idracFields: FieldSpec[] = [
+  { key: 'name', label: '名称', type: 'text', required: true, placeholder: '如:r740-idrac-09' },
+  { key: 'host', label: 'iDRAC 地址', type: 'text', required: true,
+    placeholder: 'BMC 的 IP',
+    hint: '**带外管理口的地址,不是服务器自己的 IP** —— 两者是两个不同的地址,'
+      + '拿服务器 IP 来填是这里最常见的错' },
+  { key: 'port', label: '端口', type: 'number', min: 1, max: 65535 },
+  { key: 'username', label: '用户名', type: 'text', required: true,
+    hint: '要有 Read Only 及以上的角色。权限不够时报的是 403,不是密码错' },
+  { key: 'password', label: '密码', type: 'password',
+    hint: '编辑时留空表示不修改' },
+  { key: 'verify_tls', label: '校验 TLS 证书', type: 'switch',
+    hint: 'iDRAC 出厂是自签证书,所以默认关。打开而没换过正式证书的话,'
+      + '报的是 TLS 握手失败' },
+  { key: 'server', label: '对应的服务器', type: 'select', options: 'server_options',
+    hint: '**可选。**只有 iDRAC 没有 SSH 账号的裸金属是常态,不填不影响采集。'
+      + '填了的话两张卡片会连起来 —— 带内看"系统忙不忙",带外看"机器会不会坏"' },
+  { key: 'site', label: '机房位置', type: 'text' },
+  { key: 'role', label: '用途', type: 'text', hint: '只用于展示分组' },
+
+  { key: 'interval_seconds', label: '采集频率', type: 'number', min: 60, max: 86400, suffix: '秒',
+    hint: '**最小 60 秒。**BMC 是一颗很弱的处理器,打太勤会把它自己拖慢,'
+      + '严重时管理界面登不进去 —— 而那正是出事时要用的东西。带外的东西本来变化就慢' },
+  { key: 'timeout_ms', label: '超时', type: 'number', min: 2000, max: 120000, suffix: '毫秒',
+    hint: 'BMC 响应慢是常态,别设太短' },
+
+  { key: 'temp_warn_c', label: '温度警告线', type: 'number', min: 0, max: 150, suffix: '℃' },
+  { key: 'temp_crit_c', label: '温度严重线', type: 'number', min: 0, max: 150, suffix: '℃',
+    hint: '**这是平台自己的线,不是 iDRAC 的。**iDRAC 的严重线通常是 100℃(CPU 的绝对上限),'
+      + '照抄它等于只在已经要坏了的时候才知道' },
+  { key: 'temp_delta_warn_c', label: '同机温差警告', type: 'number', min: 0, max: 100, suffix: '℃',
+    full: true,
+    hint: '同一台机器上两颗 CPU 温度差这么多 = **那一颗的散热出了问题**,不是机房热'
+      + '(风道堵了 / 硅脂干了)。这条判据 iDRAC 自己没有,而它比绝对温度更早发现问题。'
+      + '0 = 不判' },
+  { key: 'ssd_life_warn_pct', label: 'SSD 剩余寿命警告', type: 'number', min: 0, max: 100, suffix: '%',
+    hint: '**机械盘没有这个概念,不参与判定** —— 它返回 0 不是"寿命耗尽"' },
+  { key: 'event_window_days', label: '硬件日志回看', type: 'number', min: 1, max: 365, suffix: '天',
+    hint: 'SEL(硬件事件日志)**不会自动清**,一台跑了几年的机器上留着很早以前的记录很正常。'
+      + '只看这个窗口内的 —— **一条永远都在的红等于没有红**' },
+
+  { key: 'fail_threshold', label: '连续失败开事件', type: 'number', min: 1, suffix: '次' },
+  { key: 'recover_threshold', label: '连续正常关事件', type: 'number', min: 1, suffix: '次' },
+  { key: 'collect_events', label: '采集硬件日志', type: 'switch',
+    hint: '多一次请求。SEL 是「这台机器过去发生过什么」的唯一来源' },
+  { key: 'enabled', label: '启用', type: 'switch' },
+  { key: 'order', label: '排序', type: 'number', min: 0 },
+]
+
 const notifierFields: FieldSpec[] = [
   { key: 'name', label: '渠道名称', type: 'text', required: true },
   { key: 'kind', label: '类型', type: 'select', options: 'notifier_kind', required: true },
@@ -614,7 +704,7 @@ const notifierFields: FieldSpec[] = [
 const currentFields = computed(() => {
   const map = {
     group: groupFields, probe: probeFields, device: deviceFields,
-    server: serverFields, notifier: notifierFields,
+    server: serverFields, idrac: idracFields, notifier: notifierFields,
   }
   return map[editing.value]
 })
@@ -626,6 +716,14 @@ function resolveOptions(key: string) {
       || key === 'notifier_kind' || key === 'severity' || key === 'event_kind'
       || key === 'server_os') {
     return meta.options(key)
+  }
+  // 「对应的服务器」不是枚举 —— 它是库里的行。**第一项是"不关联"**:
+  // 只有 iDRAC 没有 SSH 账号的裸金属是常态,必须能选空
+  if (key === 'server_options') {
+    return [
+      { label: '不关联(只有带外)', value: null },
+      ...servers.value.map((s) => ({ label: `${s.name}(${s.host})`, value: s.id })),
+    ]
   }
   return []
 }
@@ -833,6 +931,56 @@ const serverColumns: DataTableColumns<ServerRow> = [
     ]) },
 ]
 
+const idracColumns: DataTableColumns<IdracRow> = [
+  { title: '状态', key: 'state', width: 78,
+    render: (r) => h(StateDot, { state: r.state, label: true }) },
+  { title: '带外主机', key: 'name', minWidth: 168,
+    render: (r) => h('div', [
+      h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
+      // **地址后面标明"带外" ** —— 拿服务器自己的 IP 来填是这里最常见的错,
+      // 而填错了的表现是连不上,人会去怀疑凭据
+      h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
+        `${r.host}:${r.port} · ${r.username} · 带外口`),
+    ]) },
+  { title: '硬件', key: 'model_name', minWidth: 168,
+    render: (r) => h('div', [
+      h('div', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.model_name || '待采集'),
+      h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
+        [r.service_tag ? `SN ${r.service_tag}` : '', r.idrac_firmware,
+         r.power_state].filter(Boolean).join(' · ') || '—'),
+    ]) },
+  { title: '带内', key: 'server_name', width: 118,
+    render: (r) => r.server_name
+      ? h('span', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.server_name)
+      // **没关联不是问题** —— 只有 iDRAC 没有 SSH 账号的裸金属是常态
+      : h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '未关联') },
+  { title: '凭据', key: 'creds', width: 72,
+    render: (r) => r.has_credential
+      ? h(NTag, { size: 'tiny', bordered: false }, () => '已配置')
+      : h('span', { style: `font-size:10.5px;color:${STATE.down}` }, '未配置') },
+  { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
+    render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
+  { title: '阈值', key: 'thresholds', width: 190,
+    render: (r) => h('span', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
+      `温度 ${r.temp_warn_c}/${r.temp_crit_c}℃ · 温差 ${r.temp_delta_warn_c}℃`
+      + ` · SSD ${r.ssd_life_warn_pct}% · 日志 ${r.event_window_days}d`) },
+  { title: '最后采集', key: 'last_collected_at', width: 96,
+    render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
+  { title: '启用', key: 'enabled', width: 66,
+    render: (r) => h(NSwitch, { value: r.enabled, size: 'small',
+      onUpdateValue: () => toggleEnabled('idrac', r) }) },
+  { title: '操作', key: 'act', width: 182, fixed: 'right',
+    render: (r) => h(NSpace, { size: 4 }, () => [
+      h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
+        onClick: () => testIdrac(r) }, () => '测试'),
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('idrac', r) }, () => '编辑'),
+      h(NPopconfirm, { onPositiveClick: () => remove('idrac', r.id) }, {
+        trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
+        default: () => '删除后历史样本和事件也会一起删掉,确认?',
+      }),
+    ]) },
+]
+
 const notifierColumns: DataTableColumns<NotifierRow> = [
   { title: '渠道', key: 'name', minWidth: 140,
     render: (r) => h('div', [
@@ -876,7 +1024,7 @@ const notifierColumns: DataTableColumns<NotifierRow> = [
 
 const MODAL_TITLES: Record<EntityKind, string> = {
   group: '监控类', probe: '检测线路', device: '网络设备',
-  server: '服务器', notifier: '通知渠道',
+  server: '服务器', idrac: '带外硬件', notifier: '通知渠道',
 }
 
 /** 当前编辑的设备型号画像说明 —— 让人知道这款型号能采到什么。 */
@@ -967,6 +1115,36 @@ const profileNote = computed(() => {
             (那些格式随发行版和 locale 变);<b>ESXi 走 <code>esxcli</code> / <code>vim-cmd</code></b>,
             加的时候<b>「系统类型」要选对</b> —— 选错了指标会全是空的而且不报错。<br>
             <b>只支持 Linux / 类 Unix。</b>Windows 要走 WinRM,那是另一条通道,这里没有实现。
+          </div>
+        </CyberPanel>
+      </NTabPane>
+
+      <!-- ============ 带外硬件 ============ -->
+      <NTabPane name="idrac" tab="带外硬件">
+        <CyberPanel
+          title="带外硬件(iDRAC)"
+          :subtitle="`${idracs.length} 台 · 走 Redfish,答「这台机器本身会不会坏」`"
+          flush
+        >
+          <template #actions>
+            <NButton size="small" type="primary" ghost @click="openEdit('idrac')">新建带外主机</NButton>
+            <NButton size="small" ghost :loading="loading" @click="loadAll()">刷新</NButton>
+          </template>
+          <NDataTable
+            :columns="idracColumns" :data="idracs" :loading="loading"
+            size="small" :bordered="false" :single-line="false" :scroll-x="1240"
+            :pagination="{ pageSize: 20 }"
+          />
+          <div v-if="!idracs.length && !loading" class="cy-empty">
+            还没有带外主机。带外走 <b>Redfish</b>(HTTPS,只读),回答的是
+            <b>「这台机器本身会不会坏」</b> —— 哪块盘、哪条内存、哪个电源、RAID 卷、
+            风扇、逐点温度。<br>
+            这些东西<b>在操作系统里通常一点症状都没有</b>:一块正在 SMART 预警的硬盘、
+            一个已经掉了电的冗余电源,SSH 上去什么都看不出来 ——
+            所以它不是「服务器」那一页的补充,而是另一半。<br>
+            要填的是 <b>iDRAC 的地址(带外管理口,不是服务器自己的 IP)</b>
+            和一个有 Read Only 及以上角色的账号。加完点「测试」——
+            报错是指向性的。
           </div>
         </CyberPanel>
       </NTabPane>

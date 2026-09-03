@@ -29,6 +29,12 @@ const routes = [
     meta: { title: '服务器', nav: '服务器' },
   },
   {
+    path: '/idrac',
+    name: 'idrac',
+    component: () => import('@/views/Idrac.vue'),
+    meta: { title: '带外硬件', nav: '带外硬件' },
+  },
+  {
     path: '/interfaces',
     name: 'interfaces',
     component: () => import('@/views/Interfaces.vue'),

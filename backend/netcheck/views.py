@@ -36,6 +36,7 @@ from netcheck.filters import (
     EventFilter,
     FirewallPolicyFilter,
     FirewallVipFilter,
+    IdracHostFilter,
     NotifierFilter,
     ProbeTargetFilter,
     ServerFilter,
@@ -54,6 +55,9 @@ from netcheck.models import (
     EventKind,
     FirewallPolicy,
     FirewallVip,
+    HwState,
+    IdracHost,
+    IdracSample,
     InterfaceSample,
     LinkState,
     Notifier,
@@ -86,6 +90,8 @@ from netcheck.serializers import (
     FirewallPolicyDetailSerializer,
     FirewallPolicySerializer,
     FirewallVipSerializer,
+    IdracHostSerializer,
+    IdracSampleSerializer,
     InterfaceSampleSerializer,
     NotifierSerializer,
     NotifyLogSerializer,
@@ -846,6 +852,277 @@ class ServerViewSet(viewsets.ModelViewSet):
                     extra.get("load_absent"),
                     extra.get("stderr"),
                 ) if v
+            ],
+        })
+
+
+class IdracHostViewSet(viewsets.ModelViewSet):
+    """
+    带外主机(iDRAC)。可增删改 —— 它是配置,不是采集产物。
+
+    `board` 那个 action 是**大屏的唯一数据源**:一次请求把所有机器 + 部件
+    汇总 + 告警清单一起给出去。拆成"每台一个请求"会在几十台机器上把
+    gunicorn 打满(和大屏那三个接口同一条规矩)。
+    """
+
+    serializer_class = IdracHostSerializer
+    filterset_class = IdracHostFilter
+    search_fields = ["name", "host", "model_name", "service_tag", "system_hostname"]
+    ordering_fields = ["order", "name", "state", "last_collected_at"]
+
+    def get_queryset(self):
+        return IdracHost.objects.select_related("server").annotate(
+            open_event_count_ann=Count(
+                "events", filter=Q(events__resolved_at__isnull=True), distinct=True
+            )
+        )
+
+    @action(detail=True, methods=["post"])
+    def test(self, request, pk=None):
+        """
+        「测试」按钮。**同步跑,不排队** —— 人点了要立刻看到结果,
+        而且它不写库,重跑一次没有副作用。
+        """
+
+        from netcheck.idrac import collector as idrac_collector
+
+        host = self.get_object()
+        ok, detail = idrac_collector.test_connection(host)
+        return Response({"ok": ok, "detail": detail})
+
+    @action(detail=True, methods=["post"])
+    def collect_now(self, request, pk=None):
+        """立刻采一次。排队跑 —— 一次带外采集要打五六个端点,不能占着请求。"""
+
+        from netcheck.tasks import collect_idrac_task
+
+        host = self.get_object()
+        collect_idrac_task.delay(host.pk)
+        return Response({"detail": f"{host.name} 的带外采集已排入队列"})
+
+    @action(detail=True, methods=["get"])
+    def series(self, request, pk=None):
+        """
+        趋势。**没有降采样表** —— 和 DeviceSample / ServerSample 同一个取舍:
+        最快 60 秒一拍,一天一千多行,不值得为它建三张桶表。代价是能看的
+        跨度就是原始样本保留期。
+        """
+
+        host = self.get_object()
+        hours = min(int(request.query_params.get("hours", 24) or 24), 720)
+        since = timezone.now() - timezone.timedelta(hours=hours)
+        rows = host.samples.filter(ts__gte=since).order_by("ts")
+        return Response({
+            "host": host.name,
+            "hours": hours,
+            "points": IdracSampleSerializer(rows, many=True).data,
+        })
+
+    @action(detail=True, methods=["get"])
+    def detail_info(self, request, pk=None):
+        """
+        单台的部件明细 —— 最新一条样本的 `extra`。
+
+        单独一个接口的理由和 ServerViewSet.detail_info 一样:这些东西
+        **只看最新一条就够**,塞进 series 会让每个点都带一份部件数组。
+        """
+
+        host = self.get_object()
+        latest = host.samples.order_by("-ts").first()
+        extra = (latest.extra if latest else {}) or {}
+        return Response({
+            "host": IdracHostSerializer(host).data,
+            "ts": latest.ts if latest else None,
+            "reachable": latest.reachable if latest else None,
+            "health": latest.health if latest else None,
+            "error": latest.error if latest else "",
+            "disks": extra.get("disks") or [],
+            "volumes": extra.get("volumes") or [],
+            "memory": extra.get("memory") or [],
+            "psus": extra.get("psus") or [],
+            "fans": extra.get("fans") or [],
+            "temps": extra.get("temps") or [],
+            "sel": extra.get("sel"),
+            # 为什么某一栏是空的。**这几条是这一页最该显示的东西** ——
+            # 没有它们,"硬盘 0 块"看着像这台机器没有硬盘
+            "notes": [v for v in (
+                extra.get("memory_summary_only"),
+            ) if v],
+            "endpoint_errors": extra.get("endpoint_errors") or {},
+            "current": {
+                "power_watts": latest.power_watts if latest else None,
+                "inlet_temp_c": latest.inlet_temp_c if latest else None,
+                "max_temp_c": latest.max_temp_c if latest else None,
+                "temp_delta_c": latest.temp_delta_c if latest else None,
+                "hottest": extra.get("hottest") or "",
+            },
+        })
+
+    @action(detail=False, methods=["get"])
+    def board(self, request):
+        """
+        **大屏的唯一数据源。**一次请求给出:每台一行 + 全局汇总 + 告警清单。
+
+        ## 为什么汇总里 `unknown` 单独一栏
+
+        「读不到状态」和「是好的」是两个结论。合成一个的话,一台权限配错的
+        iDRAC 会在大屏上显示成一片绿 —— 而那正是最需要有人去看一眼的时候。
+        所以 `ok / warn / crit / unknown` 是四栏,大屏上是四种颜色。
+
+        ## 为什么「从没采过」不算故障
+
+        刚加进来还没轮到的机器 `last_collected_at` 是 null。把它算成"失联"
+        会让新加的机器在大屏上先红一阵子,人会去查一个不存在的问题。
+        它单独算一档(`pending`)。
+        """
+
+        hosts = list(
+            IdracHost.objects.filter(enabled=True)
+            .select_related("server")
+            .order_by("order", "id")
+        )
+        # 每台取最新一条样本。**一次查完**,不要每台一次 —— 几十台就是几十次查询
+        latest_by_host: dict = {}
+        if hosts:
+            for sample in IdracSample.objects.filter(
+                idrac__in=hosts,
+                ts__gte=timezone.now() - timezone.timedelta(days=2),
+            ).order_by("idrac_id", "-ts"):
+                latest_by_host.setdefault(sample.idrac_id, sample)
+
+        open_events = list(
+            Event.objects.filter(
+                source_type=SourceType.IDRAC, resolved_at__isnull=True
+            ).select_related("idrac").order_by("-severity", "-started_at")[:200]
+        )
+        events_by_host: dict = {}
+        for event in open_events:
+            events_by_host.setdefault(event.idrac_id, []).append(event)
+
+        rows, totals = [], {
+            "hosts": len(hosts), "ok": 0, "warn": 0, "crit": 0,
+            "unknown": 0, "pending": 0, "down": 0,
+            "disk_total": 0, "disk_bad": 0, "disk_unknown": 0, "ssd_worn": 0,
+            "psu_total": 0, "psu_bad": 0,
+            "memory_total": 0, "memory_bad": 0,
+            "fan_total": 0, "fan_bad": 0,
+            "vdisk_total": 0, "vdisk_bad": 0,
+            "power_watts": 0.0, "sel_recent_critical": 0,
+        }
+        temps: list[tuple[float, str]] = []
+
+        for host in hosts:
+            sample = latest_by_host.get(host.pk)
+            events = events_by_host.get(host.pk, [])
+            extra = (sample.extra if sample else {}) or {}
+
+            # 档位。**顺序有意**:没采过 → 失联 → 有严重事件 → 有警告事件 →
+            # 部件状态读不到 → 正常。把"没采过"放最前是因为它不是故障
+            if sample is None:
+                level = "pending"
+            elif not sample.reachable:
+                level = "down"
+            elif any(e.severity == Severity.CRITICAL for e in events):
+                level = "crit"
+            elif events:
+                level = "warn"
+            elif sample.health == HwState.UNKNOWN:
+                level = "unknown"
+            else:
+                level = "ok"
+            # 每台**只落一档**。down 不并进 crit —— 大屏上"带外连不上 3 台"和
+            # "硬件有严重告警 3 台"要人做的事完全不同:前者去查网络/凭据,
+            # 后者去机房换件。合成一栏会让人先跑错方向
+            totals[level] = totals.get(level, 0) + 1
+
+            if sample is not None and sample.reachable:
+                for key in ("disk_total", "disk_bad", "disk_unknown", "psu_total", "psu_bad",
+                            "memory_total", "memory_bad", "fan_total", "fan_bad",
+                            "vdisk_total", "vdisk_bad"):
+                    totals[key] += getattr(sample, key) or 0
+                if sample.power_watts:
+                    totals["power_watts"] += sample.power_watts
+                if sample.max_temp_c is not None:
+                    temps.append((sample.max_temp_c, host.name))
+                sel = extra.get("sel") or {}
+                totals["sel_recent_critical"] += sel.get("recent_critical") or 0
+                totals["ssd_worn"] += sum(
+                    1 for d in (extra.get("disks") or [])
+                    if d.get("life_pct") is not None
+                    and d["life_pct"] <= host.ssd_life_warn_pct
+                )
+
+            rows.append({
+                "id": host.pk, "name": host.name, "host": host.host,
+                "site": host.site, "role": host.role,
+                "model": host.model_name, "service_tag": host.service_tag,
+                "power_state": host.power_state,
+                "server_id": host.server_id, "server_name": host.server.name if host.server else "",
+                "level": level,
+                "state": host.state,
+                "health": sample.health if sample else None,
+                "reachable": sample.reachable if sample else None,
+                "ts": sample.ts if sample else None,
+                "last_error": host.last_error,
+                "interval": host.interval_seconds,
+                "metrics": {
+                    "power_watts": sample.power_watts if sample else None,
+                    "inlet_temp_c": sample.inlet_temp_c if sample else None,
+                    "max_temp_c": sample.max_temp_c if sample else None,
+                    "temp_delta_c": sample.temp_delta_c if sample else None,
+                    "fan_max_rpm": sample.fan_max_rpm if sample else None,
+                },
+                "parts": {
+                    # **每一项都是 (总数, 异常, 未知)** —— 未知不并进任何一边
+                    "disk": [sample.disk_total, sample.disk_bad, sample.disk_unknown]
+                            if sample else [None, None, None],
+                    "psu": [sample.psu_total, sample.psu_bad, None] if sample else [None, None, None],
+                    "memory": [sample.memory_total, sample.memory_bad, None]
+                              if sample else [None, None, None],
+                    "fan": [sample.fan_total, sample.fan_bad, None] if sample else [None, None, None],
+                    "vdisk": [sample.vdisk_total, sample.vdisk_bad, None]
+                             if sample else [None, None, None],
+                },
+                "hottest": extra.get("hottest") or "",
+                "sel_recent": (extra.get("sel") or {}).get("recent_critical"),
+                "alerts": [
+                    {"kind": e.kind, "kind_label": e.get_kind_display(),
+                     "severity": e.severity, "message": e.message,
+                     "started_at": e.started_at}
+                    for e in events
+                ],
+            })
+
+        totals["power_watts"] = round(totals["power_watts"], 1) or None
+        totals["temp_max"] = max(temps)[0] if temps else None
+        # 最热那台**点名** —— 只给一个数字的话人还得自己去表里找
+        totals["temp_max_host"] = max(temps)[1] if temps else None
+        totals["temp_avg"] = round(sum(t[0] for t in temps) / len(temps), 1) if temps else None
+
+        # 全局档位:有严重就是严重,有警告就是警告 —— **unknown 不算正常**,
+        # 但也不算故障,它是"这块屏上有一部分是瞎的"
+        if totals["crit"] or totals["down"]:
+            verdict = "crit"
+        elif totals["warn"]:
+            verdict = "warn"
+        elif totals["unknown"]:
+            verdict = "unknown"
+        else:
+            verdict = "ok"
+
+        return Response({
+            "generated_at": timezone.now(),
+            "verdict": verdict,
+            "totals": totals,
+            "hosts": rows,
+            # 全部未恢复告警,按级别排 —— 大屏右侧那一栏
+            "alerts": [
+                {"host_id": e.idrac_id,
+                 "host": e.idrac.name if e.idrac else "?",
+                 "kind": e.kind, "kind_label": e.get_kind_display(),
+                 "severity": e.severity, "message": e.message,
+                 "started_at": e.started_at}
+                for e in open_events
             ],
         })
 
@@ -2032,6 +2309,7 @@ def meta_choices(request):
         "snmp_version": pack(SnmpVersion),
         "snmp_sec_level": pack(SnmpSecLevel),
         "server_os": pack(ServerOS),
+        "hw_state": pack(HwState),
         "notifier_kind": pack(NotifierKind),
         "rollup_bucket": pack(RollupBucket),
         "notify_status": pack(NotifyLog.Status),

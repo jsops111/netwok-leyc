@@ -17,6 +17,7 @@ from netcheck.models import (
     Event,
     FirewallPolicy,
     FirewallVip,
+    IdracHost,
     Notifier,
     ProbeTarget,
     Server,
@@ -222,6 +223,35 @@ class FirewallPolicyFilter(filters.FilterSet):
         )
         return queryset.filter(cond) if value else queryset.exclude(cond)
 
+
+
+class IdracHostFilter(filters.FilterSet):
+    keyword = filters.CharFilter(method="filter_keyword", label="名称/地址/型号/服务编号")
+    # 「有未恢复告警的」—— 大屏点进来时用。**在 SQL 里判**,
+    # 不是拿序列化器上那个计数字段筛(那是 Python 侧算的)
+    has_open_events = filters.BooleanFilter(method="filter_has_open_events", label="有未恢复告警")
+    site = filters.CharFilter(field_name="site", lookup_expr="icontains")
+
+    class Meta:
+        model = IdracHost
+        fields = ["enabled", "state", "site", "role", "server"]
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(host__icontains=value)
+            | Q(model_name__icontains=value)
+            | Q(service_tag__icontains=value)
+            | Q(system_hostname__icontains=value)
+        )
+
+    def filter_has_open_events(self, queryset, name, value):
+        if value is None:
+            return queryset
+        return queryset.filter(events__resolved_at__isnull=True).distinct() if value \
+            else queryset.exclude(events__resolved_at__isnull=True)
 
 
 class FirewallVipFilter(filters.FilterSet):

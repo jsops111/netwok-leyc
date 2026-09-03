@@ -31,6 +31,7 @@ from netcheck.models import (
     DeviceInterface,
     Event,
     EventKind,
+    IdracHost,
     ProbeTarget,
     Server,
     Severity,
@@ -48,7 +49,7 @@ _SEVERITY_RANK = {Severity.INFO: 0, Severity.WARNING: 1, Severity.CRITICAL: 2}
 
 @dataclass
 class EventSource:
-    """事件的来源。三个外键只有一个非空,和 Event 表一致。"""
+    """事件的来源。**五个外键只有一个非空**,和 Event 表一致。"""
 
     source_type: str
     name: str
@@ -58,6 +59,7 @@ class EventSource:
     device: Device | None = None
     interface: DeviceInterface | None = None
     server: Server | None = None
+    idrac: IdracHost | None = None
     # 附加到事件标题上的限定词,如接口名
     qualifier: str = ""
 
@@ -83,6 +85,13 @@ class EventSource:
         )
 
     @classmethod
+    def from_idrac(cls, h: IdracHost) -> "EventSource":
+        return cls(
+            source_type=SourceType.IDRAC, name=f"{h.name}({h.host})", idrac=h,
+            fail_threshold=h.fail_threshold, recover_threshold=h.recover_threshold,
+        )
+
+    @classmethod
     def from_interface(cls, i: DeviceInterface, device: Device) -> "EventSource":
         # device 也一起填上:这样"这台设备相关的所有事件"一次能查出来,
         # 包含它的接口事件。唯一约束是四元组,填了不会影响去重。
@@ -102,6 +111,7 @@ class EventSource:
             self.interface_id if self.interface else
             self.target_id if self.target else
             self.server_id if self.server else
+            self.idrac_id if self.idrac else
             self.device_id
         )
         return f"streak:{self.source_type}:{obj_id}"
@@ -122,13 +132,20 @@ class EventSource:
     def server_id(self):
         return self.server.pk if self.server else None
 
+    @property
+    def idrac_id(self):
+        return self.idrac.pk if self.idrac else None
+
     def event_filter(self) -> dict:
+        # **五个外键都要在这里**,否则"这个来源当前开着哪些事件"会查到
+        # 别的来源的行上去 —— 加来源时最容易漏的就是这个字典
         return {
             "source_type": self.source_type,
             "target_id": self.target_id,
             "device_id": self.device_id,
             "interface_id": self.interface_id,
             "server_id": self.server_id,
+            "idrac_id": self.idrac_id,
         }
 
 

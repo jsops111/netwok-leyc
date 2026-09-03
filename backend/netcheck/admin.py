@@ -15,6 +15,8 @@ from netcheck.models import (
     Event,
     FirewallPolicy,
     FirewallVip,
+    IdracHost,
+    IdracSample,
     Notifier,
     NotifyLog,
     ProbeGroup,
@@ -135,6 +137,25 @@ class FirewallVipAdmin(admin.ModelAdmin):
                     "port_forward", "synced_at")
     list_filter = ("device", "vdom", "vip_type", "port_forward", "method")
     search_fields = ("name", "comment", "ext_ip", "mapped_ip")
+
+
+@admin.register(IdracHost)
+class IdracHostAdmin(admin.ModelAdmin):
+    # **password 不出现在任何一栏** —— 和 SNMP community、TOTP 密钥同级,
+    # 它是 EncryptedTextField,admin 里也不该显示
+    list_display = ("name", "host", "model_name", "service_tag", "state",
+                    "power_state", "last_collected_at", "enabled")
+    list_filter = ("enabled", "state", "site", "manufacturer")
+    search_fields = ("name", "host", "model_name", "service_tag", "system_hostname")
+    exclude = ("password",)
+
+
+@admin.register(IdracSample)
+class IdracSampleAdmin(admin.ModelAdmin):
+    list_display = ("idrac", "ts", "reachable", "health", "max_temp_c",
+                    "power_watts", "disk_bad", "psu_bad")
+    list_filter = ("idrac", "reachable", "health")
+    date_hierarchy = "ts"
 
 
 @admin.register(DeviceNeighbor)

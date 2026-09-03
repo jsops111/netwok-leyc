@@ -39,6 +39,12 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(
         10.0, dispatch_servers.s(), name="服务器采集派发(每 10s)", expires=10
     )
+    # 带外(iDRAC)派发器。最快 60 秒一拍 —— **BMC 是一颗很弱的处理器**,
+    # 打太勤会把它自己拖慢,严重时管理界面登不进去,而那正是出事时要用的
+    # 东西。所以派发器 30 秒敲一次就够(真正的间隔由每台自己的到期时间定)
+    sender.add_periodic_task(
+        30.0, dispatch_idrac.s(), name="带外采集派发(每 30s)", expires=28
+    )
     # 配置备份派发器。备份间隔是**小时级**,所以派发器一分钟敲一次就够 ——
     # 敲得更勤只是多几次 Redis 查询,而"最多迟一分钟"对一天一次的备份
     # 完全无感。expires=55 保证 worker 堵住时这一拍会被丢掉而不是堆积
@@ -88,6 +94,13 @@ def dispatch_servers():
     from netcheck.tasks import dispatch_due_servers
 
     return dispatch_due_servers()
+
+
+@app.task(name="netcheck.dispatch_idrac")
+def dispatch_idrac():
+    from netcheck.tasks import dispatch_due_idrac
+
+    return dispatch_due_idrac()
 
 
 @app.task(name="netcheck.dispatch_backups")

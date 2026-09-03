@@ -12,7 +12,7 @@ tick 查 Redis 里的"下次该跑的时间"表,把到期的目标派发给 work
 Redis 用 ZSET:member 是目标 id,score 是下次该跑的 unix 时间戳。
 取到期项就是一次 ZRANGEBYSCORE —— 无论多少条线路都是一次查询。
 
-调度五类东西(见 _ZSETS):拨测线路、网络设备、服务器、配置备份、策略同步。
+调度六类东西(见 _ZSETS):拨测线路、网络设备、服务器、配置备份、策略同步、带外(iDRAC)。
 后两类的周期是小时/分钟级,但机制完全一样 —— 每台设备自己的间隔用
 crontab 表达不出来,而"每台一个 beat 条目"正是这个文件一开始要避免的东西。
 
@@ -44,6 +44,9 @@ _ZSETS = {
     # 而且 crontab 表达不出"每台设备自己的间隔"
     "backup": "netcheck:sched:backup",
     "policy": "netcheck:sched:policy",
+    # 带外(iDRAC)。周期是分钟级,和备份/策略同步一样 —— **不是**因为它
+    # 不重要,而是因为 BMC 是一颗很弱的处理器,打太勤会把它自己拖慢
+    "idrac": "netcheck:sched:idrac",
 }
 
 # 正在执行的目标,防止上一拍还没跑完就又派一次(慢线路 + 高频率的组合)。

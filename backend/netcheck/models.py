@@ -89,6 +89,18 @@ class EventKind(models.TextChoices):
     CONFIG_CHANGED = "config_changed", "配置发生变更"
     CONFIG_UNSAVED = "config_unsaved", "配置未保存"
     NEIGHBOR_CHANGE = "neighbor_change", "邻居变化"
+    # 带外硬件(iDRAC / Redfish)。**和上面的 device_* 是两回事**:
+    # 那些说的是"这台设备在网络上还通不通、忙不忙",这些说的是
+    # "这台机器的哪块盘 / 哪条内存 / 哪个电源要坏了"。一台机器上可以
+    # 同时开着 cpu_high(带内)和 hw_disk(带外)—— 两条都对
+    IDRAC_DOWN = "idrac_down", "带外失联"
+    HW_HEALTH = "hw_health", "整机健康告警"
+    HW_DISK = "hw_disk", "物理盘异常"
+    HW_RAID = "hw_raid", "RAID 卷降级"
+    HW_MEMORY = "hw_memory", "内存条异常"
+    HW_FAN = "hw_fan", "风扇异常"
+    HW_VOLTAGE = "hw_voltage", "电压异常"
+    SSD_WORN = "ssd_worn", "SSD 寿命将尽"
 
 
 class SourceType(models.TextChoices):
@@ -96,6 +108,7 @@ class SourceType(models.TextChoices):
     DEVICE = "device", "设备"
     INTERFACE = "interface", "设备接口"
     SERVER = "server", "服务器"
+    IDRAC = "idrac", "带外(iDRAC)"
 
 
 class DeviceKind(models.TextChoices):
@@ -1548,6 +1561,228 @@ class FirewallVip(models.Model):
 
 
 # =========================================================================
+# 带外硬件监控(iDRAC / Redfish)
+# =========================================================================
+
+
+class HwState(models.TextChoices):
+    """
+    一个硬件部件的健康档位。
+
+    **`UNKNOWN` 不能显示成绿色**,也不能并进 OK —— "读不到这块盘的状态"和
+    "这块盘是好的"是两个结论。Dell 的 Redfish 在部件刚插上、固件在升级、
+    或者权限不够时都会给 `null`,把它算成正常等于给一个我们没验证过的保证。
+    """
+
+    OK = "ok", "正常"
+    WARNING = "warning", "警告"
+    CRITICAL = "critical", "严重"
+    UNKNOWN = "unknown", "未知"
+
+
+class IdracHost(BaseModel):
+    """
+    一台**带外管理口**(Dell iDRAC)。走 Redfish(HTTPS REST),不走 SSH。
+
+    ## 和「服务器」是两件事,不是一张表
+
+    `Server` 走 SSH,答的是"这台机器上跑的系统忙不忙、盘满没满"——
+    它**看不见物理部件**:一块正在预警的硬盘、一条报了可纠正错误的内存、
+    一个已经坏掉的冗余电源,在操作系统里通常一点症状都没有。
+
+    `IdracHost` 走带外,答的是"这台机器本身会不会坏"。它反过来**不知道
+    机器上跑的是什么** —— 甚至不知道机器开没开机。
+
+    两边的覆盖不重合,所以谁都不能做成谁的附属列:一台裸金属可能只有
+    iDRAC 没有 SSH 账号,而一台云主机只有 SSH 没有 iDRAC。想把两边对起来
+    就填 `server` 这个可选外键,页面上会把两张卡片连起来 —— **但它是可选的**,
+    不填照样是一台完整的被监控对象。
+
+    ## 判据是平台自己的,不照抄 iDRAC 的 status 位
+
+    iDRAC 自己的温度严重阈值通常是 100 ℃ 上下(那是 CPU 的绝对上限),
+    所以一颗散热出了问题、比同机另一颗高 20 ℃ 的 CPU 在它眼里仍然是"正常"。
+    这里的 `temp_warn_c` / `temp_crit_c` 和 `temp_delta_warn_c`(同机温差)
+    是平台自己的线 —— 照抄厂商的档位等于只在"已经要坏了"的时候才知道。
+    """
+
+    name = models.CharField("名称", max_length=128, unique=True)
+    host = models.GenericIPAddressField(
+        "iDRAC 地址",
+        db_index=True,
+        help_text="**带外管理口的地址,不是服务器自己的 IP** —— 两者是两个不同的地址",
+    )
+    port = models.IntegerField(
+        "端口", default=443, validators=[MinValueValidator(1), MaxValueValidator(65535)]
+    )
+    username = models.CharField("用户名", max_length=64, default="root")
+    password = EncryptedTextField("密码", blank=True, default="")
+    verify_tls = models.BooleanField(
+        "校验 TLS 证书", default=False,
+        help_text="iDRAC 出厂是自签证书,默认关。换过正式证书再打开",
+    )
+
+    # 关联到带内的那台服务器。**可选** —— 只有 iDRAC 没有 SSH 账号的裸金属
+    # 是常态,不能因为关联不上就不让加
+    server = models.ForeignKey(
+        Server, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="idrac_hosts", verbose_name="对应的服务器",
+        help_text="填了的话页面上两张卡片会连起来。不填不影响采集",
+    )
+    site = models.CharField("机房/位置", max_length=64, blank=True)
+    role = models.CharField("用途", max_length=64, blank=True, help_text="只用于展示分组")
+
+    interval_seconds = models.IntegerField(
+        "采集频率(秒)",
+        default=300,
+        validators=[MinValueValidator(60), MaxValueValidator(86400)],
+        help_text=(
+            "带外的东西变化很慢(温度除外),**最小 60 秒**。"
+            "iDRAC 的 BMC 是一颗很弱的处理器,打太勤会把它自己拖慢,"
+            "严重时管理界面登不进去 —— 而那正是出事时要用的东西"
+        ),
+    )
+    timeout_ms = models.IntegerField(
+        "超时(毫秒)", default=15000,
+        validators=[MinValueValidator(2000), MaxValueValidator(120000)],
+        help_text="BMC 响应慢是常态,别设太短",
+    )
+
+    # ---- 阈值 ----
+    temp_warn_c = models.IntegerField("温度警告线(℃)", default=70)
+    temp_crit_c = models.IntegerField("温度严重线(℃)", default=85)
+    # 同机温差:一颗 CPU 比同机另一颗高这么多,说明是**这一颗**的散热出了
+    # 问题,不是机房热。这条判据 iDRAC 自己没有,而它比绝对值更早发现问题
+    temp_delta_warn_c = models.IntegerField(
+        "同机温差警告(℃)", default=15,
+        help_text="同一台机器上两个 CPU 温度差这么多 = 那一颗的散热有问题,不是机房热。0 = 不判",
+    )
+    ssd_life_warn_pct = models.IntegerField(
+        "SSD 剩余寿命警告(%)", default=10,
+        help_text="剩余写入寿命低于这个数就告警。**机械盘没有这个概念,不参与判定**",
+    )
+    event_window_days = models.IntegerField(
+        "硬件日志回看天数", default=7,
+        validators=[MinValueValidator(1), MaxValueValidator(365)],
+        help_text=(
+            "SEL(硬件事件日志)**不会自动清**,一台机器上留着几年前的记录很正常。"
+            "只看这个窗口内的 —— 一条永远都在的红等于没有红"
+        ),
+    )
+
+    fail_threshold = models.IntegerField("连续失败次数开事件", default=2, validators=[MinValueValidator(1)])
+    recover_threshold = models.IntegerField("连续正常次数关事件", default=2, validators=[MinValueValidator(1)])
+
+    collect_events = models.BooleanField(
+        "采集硬件日志(SEL)", default=True,
+        help_text="多一次请求。SEL 是「这台机器过去发生过什么」的唯一来源",
+    )
+    enabled = models.BooleanField("启用", default=True, db_index=True)
+    order = models.IntegerField("排序", default=0)
+
+    # ---- 运行时状态(采集器回写) ----
+    state = models.CharField(
+        "当前状态", max_length=12, choices=LinkState.choices, default=LinkState.UNKNOWN, db_index=True
+    )
+    last_collected_at = models.DateTimeField("最后采集时间", null=True, blank=True)
+    last_error = models.CharField("最后错误", max_length=255, blank=True)
+    consecutive_fail = models.IntegerField("连续失败次数", default=0)
+    consecutive_ok = models.IntegerField("连续正常次数", default=0)
+
+    # 首次采集回填,不用手填
+    model_name = models.CharField("型号", max_length=128, blank=True)
+    manufacturer = models.CharField("厂商", max_length=64, blank=True)
+    service_tag = models.CharField("服务编号", max_length=64, blank=True, db_index=True)
+    bios_version = models.CharField("BIOS 版本", max_length=64, blank=True)
+    idrac_firmware = models.CharField("iDRAC 固件", max_length=64, blank=True)
+    system_hostname = models.CharField("系统主机名", max_length=128, blank=True)
+    power_state = models.CharField("电源状态", max_length=16, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "带外主机(iDRAC)"
+        ordering = ["order", "id"]
+        indexes = [models.Index(fields=["enabled", "state"])]
+        constraints = [
+            models.UniqueConstraint(fields=["host", "port"], name="uniq_idrac_endpoint"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name}({self.host})"
+
+    def clean(self):
+        """跨字段校验。**镜像在 IdracHostSerializer.validate() 里,两边一起改**。"""
+
+        from django.core.exceptions import ValidationError
+
+        errors = {}
+        if not self.password:
+            errors["password"] = "Redfish 需要密码"
+        if self.temp_warn_c and self.temp_crit_c and self.temp_warn_c > self.temp_crit_c:
+            errors["temp_warn_c"] = "温度警告线不能高于严重线"
+        if errors:
+            raise ValidationError(errors)
+
+
+class IdracSample(models.Model):
+    """
+    一拍带外采集。
+
+    **部件明细放在 `extra` 里,不拆成列** —— 和 `ServerSample.extra.mounts`
+    同一条:一台 R740 上有 16 块盘、24 条内存、8 个温度探头,拆成列的话
+    换一款机型就要改表。列里只放**能画成时序图**的那几个标量。
+
+    失败也写一行(`reachable=False`),那些行是带外可用率的分母。
+    """
+
+    idrac = models.ForeignKey(
+        IdracHost, on_delete=models.CASCADE, related_name="samples", verbose_name="带外主机"
+    )
+    ts = models.DateTimeField("时间", db_index=True)
+    reachable = models.BooleanField("可达", default=True)
+    latency_ms = models.FloatField("响应耗时(ms)", null=True, blank=True)
+
+    # ---- 能画图的标量 ----
+    power_watts = models.FloatField("整机功耗(W)", null=True, blank=True)
+    inlet_temp_c = models.FloatField(
+        "进风温度(℃)", null=True, blank=True,
+        help_text="机房环境温度的最好代理 —— 它高说明是机房热,不是这台机器的问题",
+    )
+    max_temp_c = models.FloatField("最高温度(℃)", null=True, blank=True)
+    # 同机温差。**这是 iDRAC 自己没有的判据**,而它比绝对温度更早发现
+    # "某一颗 CPU 的散热坏了"
+    temp_delta_c = models.FloatField("同机最大温差(℃)", null=True, blank=True)
+    fan_max_rpm = models.IntegerField("最高风扇转速", null=True, blank=True)
+
+    # ---- 部件计数。**bad 和 unknown 分开** —— 见 HwState ----
+    disk_total = models.IntegerField("物理盘数", null=True, blank=True)
+    disk_bad = models.IntegerField("异常物理盘", null=True, blank=True)
+    disk_unknown = models.IntegerField("状态未知物理盘", null=True, blank=True)
+    psu_total = models.IntegerField("电源数", null=True, blank=True)
+    psu_bad = models.IntegerField("异常电源", null=True, blank=True)
+    memory_total = models.IntegerField("内存条数", null=True, blank=True)
+    memory_bad = models.IntegerField("异常内存条", null=True, blank=True)
+    fan_total = models.IntegerField("风扇数", null=True, blank=True)
+    fan_bad = models.IntegerField("异常风扇", null=True, blank=True)
+    vdisk_total = models.IntegerField("RAID 卷数", null=True, blank=True)
+    vdisk_bad = models.IntegerField("降级 RAID 卷", null=True, blank=True)
+
+    health = models.CharField(
+        "整机健康", max_length=12, choices=HwState.choices, default=HwState.UNKNOWN
+    )
+    # disks / memory / psus / fans / temps / vdisks / sel —— 明细都在这
+    extra = models.JSONField("明细", default=dict, blank=True)
+    error = models.CharField("错误", max_length=255, blank=True)
+
+    class Meta:
+        verbose_name = verbose_name_plural = "带外样本"
+        ordering = ["-ts"]
+        indexes = [models.Index(fields=["idrac", "-ts"], name="idx_idrac_sample")]
+
+    def __str__(self) -> str:
+        return f"{self.idrac_id}@{self.ts:%m-%d %H:%M}"
+
+
+# =========================================================================
 # 事件 —— 需求里的「事件报告」表
 # =========================================================================
 
@@ -1564,8 +1799,15 @@ class Event(models.Model):
 
     同一个 (source, kind) 同时最多只有一条未恢复事件(见下面的唯一约束),
     这保证了抖动的线路不会刷出几百条重复事件。**那条约束必须带
-    nulls_distinct=False** —— 四个来源外键里只有一个非空,默认的
+    nulls_distinct=False** —— 五个来源外键里只有一个非空,默认的
     "NULL != NULL" 语义会让它一行都挡不住。
+
+    **加一个来源外键就要往那条约束的 fields 里补一行**(现在是五个:
+    target / device / interface / server / idrac)。漏补的表现很安静:
+    新来源的重复未恢复事件挡不住,同一块坏盘每一拍都开一条新事件。
+    加列本身不会制造冲突(新列在老行上全是 NULL,而老行之间原本就是
+    互相区分开的),所以 migration 里**不需要**先跑一次去重 ——
+    加 server 那次要跑是因为在那之前那条约束根本没生效过。
     """
 
     source_type = models.CharField(
@@ -1589,6 +1831,13 @@ class Event(models.Model):
     server = models.ForeignKey(
         Server, null=True, blank=True, on_delete=models.CASCADE,
         related_name="events", verbose_name="服务器",
+    )
+    # 带外硬件。**和 server 是两个独立的来源**:一台机器可以同时有
+    # 一条 disk_high(带内,SSH 看到盘满了)和一条 hw_disk(带外,
+    # 一块物理盘要坏了)—— 两条都对,而且要分别开关
+    idrac = models.ForeignKey(
+        IdracHost, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="events", verbose_name="带外主机",
     )
 
     kind = models.CharField("事件类型", max_length=16, choices=EventKind.choices, db_index=True)
@@ -1637,7 +1886,8 @@ class Event(models.Model):
             #  那边用 Coalesce 折成 0,这边列是外键没法 Coalesce,
             #  用 PG 15+ 的 NULLS NOT DISTINCT)。
             models.UniqueConstraint(
-                fields=["source_type", "target", "device", "interface", "server", "kind"],
+                fields=["source_type", "target", "device", "interface", "server",
+                        "idrac", "kind"],
                 condition=models.Q(resolved_at__isnull=True),
                 nulls_distinct=False,
                 name="uniq_open_event_per_source_kind",
@@ -1653,8 +1903,13 @@ class Event(models.Model):
 
     @property
     def source_name(self) -> str:
+        # **interface 必须先判** —— 接口事件的 device 也是非空的
+        # (见 EventSource.from_interface),顺序反了会让所有接口事件
+        # 显示成设备名
         if self.interface_id and self.interface:
             return f"{self.interface.device.name} / {self.interface.if_name}"
+        if self.idrac_id and self.idrac:
+            return self.idrac.name
         if self.device_id and self.device:
             return self.device.name
         if self.server_id and self.server:

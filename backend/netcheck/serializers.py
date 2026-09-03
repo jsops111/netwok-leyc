@@ -25,6 +25,8 @@ from netcheck.models import (
     Event,
     FirewallPolicy,
     FirewallVip,
+    IdracHost,
+    IdracSample,
     InterfaceSample,
     Notifier,
     NotifierKind,
@@ -640,6 +642,88 @@ class FirewallPolicyDetailSerializer(FirewallPolicySerializer):
 
     class Meta(FirewallPolicySerializer.Meta):
         fields = FirewallPolicySerializer.Meta.fields + ["raw"]
+        read_only_fields = fields
+
+
+class IdracHostSerializer(serializers.ModelSerializer):
+    """带外主机。密码只回"填过没有",不回内容 —— 和设备/服务器同一条规矩。"""
+
+    state_label = serializers.CharField(source="get_state_display", read_only=True)
+    has_credential = serializers.SerializerMethodField()
+    server_name = serializers.CharField(source="server.name", read_only=True, default="")
+    open_event_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = IdracHost
+        fields = "__all__"
+        # 关掉自动生成的 UniqueTogetherValidator,理由和 ServerSerializer
+        # 那里一样:它报的 non_field_errors 既不指向输入框,也不说是**哪一台**
+        # 已经占了这个地址。下面 validate() 里那份手写的会说清楚
+        validators: list = []
+        read_only_fields = [
+            "state", "last_collected_at", "last_error", "consecutive_fail", "consecutive_ok",
+            "model_name", "manufacturer", "service_tag", "bios_version",
+            "idrac_firmware", "system_hostname", "power_state",
+        ]
+        extra_kwargs = {
+            "password": {"write_only": True, "required": False, "allow_blank": True},
+        }
+
+    def get_has_credential(self, obj) -> bool:
+        return bool(obj.password)
+
+    def get_open_event_count(self, obj) -> int:
+        return getattr(obj, "open_event_count_ann", None) or obj.events.filter(
+            resolved_at__isnull=True
+        ).count()
+
+    def validate(self, attrs):
+        """IdracHost.clean() 的镜像 —— 两边必须一起改(DRF 不调 full_clean)。"""
+
+        errors = {}
+        if not _merged(self, attrs, "password"):
+            errors["password"] = "Redfish 需要密码"
+
+        warn = _merged(self, attrs, "temp_warn_c", 0)
+        crit = _merged(self, attrs, "temp_crit_c", 0)
+        if warn and crit and warn > crit:
+            errors["temp_warn_c"] = "温度警告线不能高于严重线"
+
+        # 端点重复。**必须手写** —— 撞了唯一约束会以 IntegrityError 冒成 500,
+        # 页面上看到的是"服务器错误"而不是"这台带外已经加过了"
+        host = _merged(self, attrs, "host")
+        port = _merged(self, attrs, "port", 443)
+        if host:
+            clash = IdracHost.objects.filter(host=host, port=port)
+            if self.instance is not None:
+                clash = clash.exclude(pk=self.instance.pk)
+            if existing := clash.first():
+                errors["host"] = (
+                    f"{host}:{port} 已经作为「{existing.name}」加过了。"
+                    "同一个 BMC 加两遍会被采两遍 —— 而 BMC 很弱,那会把它拖慢"
+                )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
+class IdracSampleSerializer(serializers.ModelSerializer):
+    """
+    时序点。**不带 extra** —— 部件明细几十上百条,每个点都带一份的话
+    响应会大十几倍,而趋势图只要那几个标量(和 ServerSample 同一条)。
+    """
+
+    class Meta:
+        model = IdracSample
+        fields = [
+            "id", "ts", "reachable", "latency_ms", "power_watts",
+            "inlet_temp_c", "max_temp_c", "temp_delta_c", "fan_max_rpm",
+            "disk_total", "disk_bad", "disk_unknown",
+            "psu_total", "psu_bad", "memory_total", "memory_bad",
+            "fan_total", "fan_bad", "vdisk_total", "vdisk_bad",
+            "health", "error",
+        ]
         read_only_fields = fields
 
 
