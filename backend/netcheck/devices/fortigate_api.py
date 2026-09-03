@@ -451,6 +451,33 @@ def fetch_address_groups(device: Device) -> list[dict]:
     return results if isinstance(results, list) else []
 
 
+def fetch_services(device: Device) -> list[dict]:
+    """
+    服务对象(firewall service custom)。**取不到返回空列表,不抛。**
+
+    ⚠ 这条通道**能拿到 FortiOS 自带的几百个预定义服务**(HTTP / HTTPS /
+    SSH / DNS …),而 SSH 的 `show firewall service custom` 只打印被改过的
+    那些。策略里引用得最多的恰恰是预定义服务 —— 所以同一台设备走 API
+    和走 SSH,查 `HTTPS` 一个查得到一个查不到。页面上要说清通道。
+    """
+
+    data = _safe(device, "/cmdb/firewall/service/custom")
+    if not data:
+        return []
+    results = data.get("results")
+    return results if isinstance(results, list) else []
+
+
+def fetch_service_groups(device: Device) -> list[dict]:
+    """服务组(firewall service group)。同上。"""
+
+    data = _safe(device, "/cmdb/firewall/service/group")
+    if not data:
+        return []
+    results = data.get("results")
+    return results if isinstance(results, list) else []
+
+
 def fetch_policy_stats(device: Device) -> dict[int, dict]:
     """
     每条策略的命中统计,按 policyid 索引。

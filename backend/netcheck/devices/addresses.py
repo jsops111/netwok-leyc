@@ -1,5 +1,10 @@
 """
-地址对象/地址组的**展开** —— 纯函数,不碰网络也不碰库。
+地址对象/地址组、服务对象/服务组的**展开** —— 纯函数,不碰网络也不碰库。
+
+`resolve()` 两边共用:它只要 `name / is_group / value / members` 四个键,
+而地址和服务在这四个键上是同构的。**不同的只有内置名那一套**
+(`BUILTIN` vs `SERVICE_BUILTIN`)—— `ALL` 在服务里是"所有协议所有端口",
+在地址里是 `0.0.0.0/0`,共用一套字典会让其中一边的说明是错的。
 
 策略里写的是名字(`内网服务器组`),而人要问的是「它到底是哪几个网段」。
 组可以套组,所以展开是递归的。
@@ -34,7 +39,25 @@ BUILTIN = {
 MAX_DEPTH = 12
 
 
-def resolve(name: str, index: dict, _seen: set | None = None, _depth: int = 0) -> dict:
+#: 服务那边的内置名。和地址的 BUILTIN 是**两套** —— `ALL` 在服务里是
+#: "所有协议所有端口",在地址里是 "0.0.0.0/0",含义不一样,共用一套字典
+#: 会让其中一边的说明是错的。
+#:
+#: ⚠ FortiOS 还自带**几百个预定义服务**(HTTP / HTTPS / SSH / DNS …),
+#: 它们不在这里 —— 那些是真实的对象,API 通道拿得到。这里只放"含义确定
+#: 但不是一个对象"的那几个。
+SERVICE_BUILTIN = {
+    "all": ("所有协议、所有端口", "builtin_any"),
+    "all_tcp": ("所有 TCP 端口", "builtin_any"),
+    "all_udp": ("所有 UDP 端口", "builtin_any"),
+    "all_icmp": ("所有 ICMP", "builtin_any"),
+    "all_icmp6": ("所有 ICMPv6", "builtin_any"),
+    "none": ("空(不匹配任何服务)", "builtin_none"),
+}
+
+
+def resolve(name: str, index: dict, _seen: set | None = None, _depth: int = 0,
+            builtin: dict | None = None) -> dict:
     """
     把一个名字展开成「它到底是什么」。
 
@@ -56,12 +79,13 @@ def resolve(name: str, index: dict, _seen: set | None = None, _depth: int = 0) -
     那张拍平的表,而不是一棵要自己在脑子里展开的树。
     """
 
+    builtin = BUILTIN if builtin is None else builtin
     seen = set(_seen or ())
     key = (name or "").strip().lower()
     row = index.get(key)
 
-    if key in BUILTIN and row is None:
-        label, kind = BUILTIN[key]
+    if key in builtin and row is None:
+        label, kind = builtin[key]
         return {
             "name": name, "kind": "builtin", "value": label,
             "members": [], "leaves": [{"name": name, "value": label, "addr_type": kind}],
@@ -102,7 +126,7 @@ def resolve(name: str, index: dict, _seen: set | None = None, _depth: int = 0) -
     seen.add(key)
     members, leaves, truncated = [], [], False
     for member_name in row.get("members") or []:
-        child = resolve(str(member_name), index, seen, _depth + 1)
+        child = resolve(str(member_name), index, seen, _depth + 1, builtin)
         members.append(child)
         leaves.extend(child["leaves"])
         truncated = truncated or child["truncated"]
@@ -143,7 +167,7 @@ def build_index(rows) -> dict:
     return index
 
 
-def used_by_policies(name: str, policies) -> list[dict]:
+def used_by_policies(name: str, policies, kind: str = "address") -> list[dict]:
     """
     哪些策略引用了这个别名(源或目的)。
 
@@ -156,10 +180,14 @@ def used_by_policies(name: str, policies) -> list[dict]:
     out = []
     for p in policies:
         where = []
-        if any(str(v).strip().lower() == key for v in (p.src_addr or [])):
-            where.append("源")
-        if any(str(v).strip().lower() == key for v in (p.dst_addr or [])):
-            where.append("目的")
+        if kind == "service":
+            if any(str(v).strip().lower() == key for v in (p.service or [])):
+                where.append("服务")
+        else:
+            if any(str(v).strip().lower() == key for v in (p.src_addr or [])):
+                where.append("源")
+            if any(str(v).strip().lower() == key for v in (p.dst_addr or [])):
+                where.append("目的")
         if where:
             out.append({
                 "id": p.pk, "policy_id": p.policy_id, "seq": p.seq,

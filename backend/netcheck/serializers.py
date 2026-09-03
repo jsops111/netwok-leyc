@@ -25,6 +25,7 @@ from netcheck.models import (
     Event,
     FirewallPolicy,
     FirewallAddress,
+    FirewallService,
     FirewallVip,
     IdracHost,
     IdracSample,
@@ -667,6 +668,27 @@ class FirewallAddressSerializer(serializers.ModelSerializer):
             "addr_type", "addr_type_label", "is_group", "value", "display",
             "members", "member_count", "comment", "interface", "uuid",
             "synced_at", "method",
+        ]
+        read_only_fields = fields
+
+    def get_member_count(self, obj) -> int | None:
+        """**不是组的话回 None,不是 0** —— 0 会被读成"这个组是空的"。"""
+        return len(obj.members or []) if obj.is_group else None
+
+
+class FirewallServiceSerializer(serializers.ModelSerializer):
+    """一个服务对象 / 服务组。`display` 是模型属性,在后端拼好。"""
+
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    display = serializers.CharField(read_only=True)
+    member_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FirewallService
+        fields = [
+            "id", "device", "device_name", "vdom", "name", "seq",
+            "is_group", "value", "display", "protocol", "members", "member_count",
+            "category", "comment", "predefined", "synced_at", "method",
         ]
         read_only_fields = fields
 

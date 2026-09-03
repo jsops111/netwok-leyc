@@ -17,6 +17,7 @@ from netcheck.models import (
     Event,
     FirewallPolicy,
     FirewallAddress,
+    FirewallService,
     FirewallVip,
     IdracHost,
     Notifier,
@@ -273,6 +274,28 @@ class FirewallAddressFilter(filters.FilterSet):
             | Q(value__icontains=value)
             | Q(comment__icontains=value)
             # 组的成员名单也要能搜到 —— 「哪个组里有 web-svr」是个真问题
+            | Q(members__icontains=value)
+        )
+
+
+class FirewallServiceFilter(filters.FilterSet):
+    device = filters.NumberFilter(field_name="device_id")
+    keyword = filters.CharFilter(method="filter_keyword", label="名称/端口/备注")
+    is_group = filters.BooleanFilter(field_name="is_group")
+
+    class Meta:
+        model = FirewallService
+        fields = ["device", "vdom", "is_group", "protocol", "method"]
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(value__icontains=value)
+            | Q(comment__icontains=value)
+            | Q(category__icontains=value)
+            # 组的成员名单也要能搜 —— 「哪个组里有 HTTPS」是个真问题
             | Q(members__icontains=value)
         )
 

@@ -40,6 +40,7 @@ from netcheck.filters import (
     EventFilter,
     FirewallPolicyFilter,
     FirewallAddressFilter,
+    FirewallServiceFilter,
     FirewallVipFilter,
     IdracHostFilter,
     NotifierFilter,
@@ -61,6 +62,7 @@ from netcheck.models import (
     EventKind,
     FirewallPolicy,
     FirewallAddress,
+    FirewallService,
     FirewallVip,
     HwState,
     IdracHost,
@@ -98,6 +100,7 @@ from netcheck.serializers import (
     FirewallPolicyDetailSerializer,
     FirewallPolicySerializer,
     FirewallAddressSerializer,
+    FirewallServiceSerializer,
     FirewallVipSerializer,
     IdracHostSerializer,
     IdracSampleSerializer,
@@ -1431,6 +1434,72 @@ class FirewallAddressViewSet(viewsets.ReadOnlyModelViewSet):
             }
             for d in devices
         ]})
+
+
+class FirewallServiceViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    防火墙**服务对象 / 服务组**只读快照。和策略同一次同步拿回来。
+
+    这是「这条策略放开了什么」的第三维:地址回答"谁到谁",这里回答
+    "哪个端口"。策略里写的是 `HTTPS` 这样的名字,**它到底是哪几个端口
+    完全不在策略表里**。
+    """
+
+    serializer_class = FirewallServiceSerializer
+    filterset_class = FirewallServiceFilter
+    search_fields = ["name", "value", "comment", "category"]
+    ordering_fields = ["name", "protocol", "is_group", "value", "synced_at"]
+
+    def get_queryset(self):
+        return FirewallService.objects.select_related("device")
+
+    @action(detail=False, methods=["get"])
+    def resolve(self, request):
+        """
+        **服务名查询。**`?device=1&name=业务服务组` → 它到底是哪几个端口。
+
+        和地址那边共用同一个展开器(`devices/addresses.resolve()`)——
+        两者在 `name / is_group / value / members` 上是同构的。
+        **不同的只有内置名那一套**:`ALL` 在服务里是"所有协议所有端口",
+        在地址里是 `0.0.0.0/0`。
+
+        ⚠ **走 SSH 通道时查预定义服务必然查不到。**FortiOS 自带几百个
+        (HTTP / HTTPS / SSH / DNS …),而 `show firewall service custom`
+        只打印**被改过的**那些 —— 而策略里引用得最多的恰恰是它们。
+        返回里带着 `method`,页面上要把这一点说出来:那是"没同步到",
+        **不是"这个服务不存在"**。
+        """
+
+        device_id = request.query_params.get("device")
+        name = (request.query_params.get("name") or "").strip()
+        if not device_id or not name:
+            return Response(
+                {"detail": "要同时给 device 和 name"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        rows = list(FirewallService.objects.filter(device_id=device_id))
+        index = addresses_mod.build_index([
+            {"name": r.name, "is_group": r.is_group, "addr_type": r.protocol,
+             "value": r.value, "members": r.members, "comment": r.comment}
+            for r in rows
+        ])
+        tree = addresses_mod.resolve(name, index, builtin=addresses_mod.SERVICE_BUILTIN)
+
+        policies = list(
+            FirewallPolicy.objects.filter(device_id=device_id).only(
+                "id", "policy_id", "seq", "name", "service", "enabled", "action",
+            )
+        )
+        return Response({
+            "device": int(device_id),
+            "query": name,
+            "method": rows[0].method if rows else "",
+            "synced_at": rows[0].synced_at if rows else None,
+            "total_objects": len(rows),
+            "result": tree,
+            "used_by": addresses_mod.used_by_policies(name, policies, kind="service"),
+        })
 
 
 class FirewallVipViewSet(viewsets.ReadOnlyModelViewSet):

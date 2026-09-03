@@ -640,6 +640,28 @@ export interface AddressSummaryRow {
   note: string
 }
 
+export interface ServiceRow {
+  id: number
+  device: number
+  device_name: string
+  vdom: string
+  name: string
+  seq: number
+  is_group: boolean
+  /** `TCP/443, UDP/53` —— 后端拼好。FortiOS 的 `443:1024-65535` 里
+   *  冒号后面那半是**源端口**,不是目的端口,解错会显示成六万个端口 */
+  value: string
+  display: string
+  protocol: string
+  members: string[]
+  member_count: number | null
+  category: string
+  comment: string
+  predefined: boolean
+  synced_at: string
+  method: string
+}
+
 // ------------------------------------------------- 带外硬件(iDRAC)
 
 export interface IdracRow {
@@ -1438,6 +1460,14 @@ export const api = {
   /** 别名查询:名字 → 它到底是哪几个网段(地址组递归展开) */
   resolveAddress: (deviceId: number, name: string) =>
     http.get<AddressResolve>('/firewall-addresses/resolve/',
+      { params: { device: deviceId, name } }),
+
+  // 服务对象 / 服务组 —— 「这条策略放开了什么」的第三维:哪个端口
+  services: (params?: object) =>
+    http.get<Paged<ServiceRow>>('/firewall-services/', { params }),
+  /** 服务名查询。**走 SSH 通道时预定义服务查不到**(show 只打印被改过的) */
+  resolveService: (deviceId: number, name: string) =>
+    http.get<AddressResolve>('/firewall-services/resolve/',
       { params: { device: deviceId, name } }),
 
   // 带外硬件(iDRAC)

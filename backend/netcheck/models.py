@@ -1664,6 +1664,82 @@ class FirewallAddress(models.Model):
         return self.value or "—"
 
 
+class FirewallService(models.Model):
+    """
+    一个**服务对象**(FortiOS 的 firewall service custom / group),**只读快照**。
+
+    这是「这条策略放开了什么」的**第三维**:地址回答"谁到谁",服务回答
+    "哪个端口"。策略里写的是 `HTTPS`、`自定义-业务端口` 这样的**名字**,
+    **它到底是哪几个端口完全不在策略表里** —— 和地址对象是同一个缺口,
+    所以做法也一样(见 `FirewallAddress` 的说明)。
+
+    ## 服务组也在这张表里
+
+    和地址那边同理:`service/custom` 和 `service/group` 在策略里是一样用的,
+    都是往 `service` 里写一个名字。合成一张表,`is_group` 区分。
+
+    ## ⚠ 预定义服务在 SSH 通道下查不到
+
+    FortiOS **自带几百个预定义服务**(HTTP / HTTPS / SSH / DNS / SMB …)。
+    `show firewall service custom` 只打印**被改过的**那些 —— 没改过的
+    预定义服务一条都不出现。而策略里引用得最多的恰恰是它们。
+
+    所以走 SSH 通道的设备上,查 `HTTPS` 必然查不到,而那**不等于**这个
+    服务不存在。API 通道(`/cmdb/firewall/service/custom`)能拿全。
+    页面上要说"没同步到",并且说明这批数据是哪条通道来的。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="services", verbose_name="设备"
+    )
+    vdom = models.CharField("VDOM", max_length=64, blank=True, default="root")
+    name = models.CharField("名称", max_length=128, help_text="策略的服务里引用的就是这个名字")
+    seq = models.IntegerField("顺序", default=0)
+
+    is_group = models.BooleanField("是服务组", default=False, db_index=True)
+    #: 人话形式的值:`TCP/443` / `TCP/8080-8090, UDP/53` / `ICMP 8/0` / `IP 47`。
+    #: **在后端拼好** —— FortiOS 的 `tcp-portrange` 是 `443:1024-65535`
+    #: 这种"目的:源"的形状,前端各解一遍必然有一处会把源端口当成目的端口
+    value = models.CharField("端口 / 协议", max_length=255, blank=True)
+    protocol = models.CharField(
+        "协议", max_length=32, blank=True, help_text="TCP/UDP/SCTP / ICMP / IP"
+    )
+    members = models.JSONField("成员", default=list, blank=True)
+
+    category = models.CharField("分类", max_length=64, blank=True)
+    comment = models.CharField("备注", max_length=255, blank=True)
+    #: 预定义服务(FortiOS 自带的那几百个)。**它们在 SSH 通道下拿不到**,
+    #: 所以这一位只有 API 通道填得准 —— 用它在页面上解释"为什么查不到"
+    predefined = models.BooleanField("预定义服务", default=False)
+
+    raw = models.JSONField("原始记录", default=dict, blank=True)
+    synced_at = models.DateTimeField("同步时间", db_index=True)
+    method = models.CharField("同步通道", max_length=8, blank=True, help_text="api / ssh")
+
+    class Meta:
+        verbose_name = verbose_name_plural = "防火墙服务对象"
+        ordering = ["device_id", "vdom", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "vdom", "name"], name="uniq_service_per_device_vdom"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["device", "is_group"], name="idx_svc_device_group"),
+            models.Index(fields=["device", "name"], name="idx_svc_device_name"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} = {self.display}"
+
+    @property
+    def display(self) -> str:
+        """这个对象**是什么**,一行说清。组给成员数,展开是 resolve 的事。"""
+        if self.is_group:
+            return f"服务组({len(self.members or [])} 个成员)"
+        return self.value or "—"
+
+
 # =========================================================================
 # 带外硬件监控(iDRAC / Redfish)
 # =========================================================================

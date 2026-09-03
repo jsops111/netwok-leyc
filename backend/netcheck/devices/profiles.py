@@ -206,6 +206,11 @@ class Profile:
     #: **空 = 这款型号不同步地址对象**,不要拿别的命令凑
     address_cli: str = ""
     addrgrp_cli: str = ""
+    #: `show firewall service custom` / `... service group` —— 服务对象和服务组。
+    #: **注意 SSH 通道拿不到预定义服务**(FortiOS 自带几百个,show 只打印
+    #: 被改过的),而策略里引用得最多的恰恰是它们。API 通道能拿全
+    service_cli: str = ""
+    servicegrp_cli: str = ""
     # 「启动配置」的命令,用来判断有没有**改了但没保存**的配置
     # (Cisco 的 `show startup-config`)。留空 = 这款型号没有这个概念:
     # FortiOS 改完即存,拿它去比对只会得到一堆假的"未保存"
@@ -442,6 +447,8 @@ PROFILES: dict[str, Profile] = {
         vip_cli="show firewall vip",
         address_cli="show firewall address",
         addrgrp_cli="show firewall addrgrp",
+        service_cli="show firewall service custom",
+        servicegrp_cli="show firewall service group",
         optional={"temp_c", "vpn_tunnels_up"},
         notes=(
             "FortiOS 7.x。**推荐 collect_method=api、fallback=snmp**:"
@@ -488,6 +495,8 @@ PROFILES: dict[str, Profile] = {
         vip_cli="show firewall vip",
         address_cli="show firewall address",
         addrgrp_cli="show firewall addrgrp",
+        service_cli="show firewall service custom",
+        servicegrp_cli="show firewall service group",
         optional={"temp_c", "vpn_tunnels_up", "session_rate"},
         notes="没在册的 FortiGate 型号。",
     ),

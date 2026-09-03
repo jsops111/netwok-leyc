@@ -45,6 +45,7 @@ from netcheck.models import (
     DeviceKind,
     FirewallPolicy,
     FirewallAddress,
+    FirewallService,
     FirewallVip,
     PolicyAction,
     Vendor,
@@ -738,6 +739,211 @@ def _addresses_from_ssh(device: Device) -> list[dict]:
     return unique
 
 
+# =========================================================================
+# 服务对象(firewall service custom / group)
+# =========================================================================
+#
+# 「这条策略放开了什么」的第三维:地址回答"谁到谁",服务回答"哪个端口"。
+
+def format_portrange(raw: str, proto: str) -> list[str]:
+    """
+    FortiOS 的 `tcp-portrange` → 人话。
+
+    格式是 **`目的端口:源端口范围`**,而源端口那半几乎总是
+    `1024-65535`(默认)—— 那是客户端的临时端口,不是这条服务开放的端口。
+
+    ⚠ **不能把冒号后面那半当成目的端口。**`443:1024-65535` 开放的是 443,
+    而把它读成 "443 到 1024-65535" 会在页面上显示成一个巨大的端口范围 ——
+    看着像这条策略开了六万个端口,而它只开了一个。
+
+    多个范围之间用空格分隔:`80 443 8080-8090`。
+    """
+
+    out = []
+    for chunk in str(raw or "").replace('"', " ").split():
+        # 冒号前面那半才是目的端口
+        dst = chunk.split(":", 1)[0].strip()
+        if not dst:
+            continue
+        out.append(f"{proto}/{dst}")
+    return out
+
+
+def _service_value(item: dict) -> tuple[str, str]:
+    """(人话的值, 协议)。取不到就留空,不猜。"""
+
+    protocol = str(item.get("protocol") or "").strip().upper()
+    parts: list[str] = []
+
+    for key, label in (("tcp-portrange", "TCP"), ("udp-portrange", "UDP"),
+                       ("sctp-portrange", "SCTP")):
+        parts.extend(format_portrange(item.get(key) or item.get(key.replace("-", "_")) or "", label))
+
+    if not parts and protocol.startswith("ICMP"):
+        icmp_type = item.get("icmptype")
+        icmp_code = item.get("icmpcode")
+        if icmp_type not in (None, ""):
+            # code 为空是**有含义的**:那表示"这个 type 的所有 code"
+            code = "" if icmp_code in (None, "") else f"/{icmp_code}"
+            parts.append(f"{protocol} {icmp_type}{code}")
+        else:
+            parts.append(f"{protocol} 全部")
+
+    if not parts and protocol == "IP":
+        number = item.get("protocol-number") or item.get("protocol_number")
+        parts.append(f"IP 协议号 {number}" if number not in (None, "") else "IP")
+
+    if not parts and (fqdn := item.get("fqdn")):
+        parts.append(f"FQDN {fqdn}")
+
+    return ", ".join(parts), protocol
+
+
+def _services_from_api(device: Device) -> list[dict]:
+    """API 通道。**它能拿到预定义服务**(HTTP/HTTPS/SSH…),SSH 通道拿不到。"""
+
+    out: list[dict] = []
+    seq = 0
+    for item in fortigate_api.fetch_services(device):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        value, protocol = _service_value(item)
+        out.append({
+            "name": name[:128], "seq": seq, "is_group": False,
+            "value": value[:255], "protocol": protocol[:32], "members": [],
+            "category": str(item.get("category") or "")[:64],
+            "comment": str(item.get("comment") or "")[:255],
+            # FortiOS 在 cmdb 里用 `q_origin_key` 之外没有明确的"预定义"位;
+            # 靠有没有 comment 之类去猜是不可靠的。这里只在**明确有** ——
+            # 某些固件给 `proxy`/`visibility` 之外的标记时才置位,
+            # 拿不准就留 False(它只用于解释"为什么 SSH 通道查不到")
+            "predefined": bool(item.get("_predefined")),
+            "raw": item,
+        })
+        seq += 1
+
+    for item in fortigate_api.fetch_service_groups(device):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name[:128], "seq": seq, "is_group": True,
+            "value": "", "protocol": "",
+            "members": fortigate_api._as_names(item.get("member")),
+            "category": "", "comment": str(item.get("comment") or "")[:255],
+            "predefined": False, "raw": item,
+        })
+        seq += 1
+    return out
+
+
+def parse_show_firewall_service(text: str, as_group: bool = False) -> list[dict]:
+    """
+    解析 `show firewall service custom` / `show firewall service group`。
+
+    ⚠ **预定义服务一条都不出现。**FortiOS 自带几百个(HTTP / HTTPS / SSH /
+    DNS …),而 `show` 只打印**被改过的**那些。策略里引用得最多的恰恰是它们。
+
+    所以走 SSH 通道的设备上查 `HTTPS` 必然查不到 —— 而那**不等于**这个
+    服务不存在。调用方要把这个区别带到页面上。
+    """
+
+    out: list[dict] = []
+    current: dict | None = None
+    seq = 0
+
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if m := _RE_EDIT_NAME.match(line):
+            name = m.group(1).strip()
+            if not name:
+                continue
+            current = {
+                "name": name[:128], "seq": seq, "is_group": as_group,
+                "value": "", "protocol": "", "members": [],
+                "category": "", "comment": "", "predefined": False,
+                "raw": {"_channel": "ssh"},
+                "_item": {},
+            }
+            seq += 1
+            continue
+
+        if _RE_NEXT.match(line) and current is not None:
+            item = current.pop("_item")
+            if not current["is_group"]:
+                value, protocol = _service_value(item)
+                current["value"] = value[:255]
+                current["protocol"] = protocol[:32]
+            out.append(current)
+            current = None
+            continue
+
+        if current is None:
+            continue
+
+        m = _RE_SET.match(line)
+        if not m:
+            continue
+        key, raw_value = m.group(1).lower(), m.group(2).strip()
+        values = _split_values(raw_value)
+        one = values[0] if values else ""
+        current["raw"][key] = raw_value
+
+        if key == "member":
+            current["members"] = values
+        elif key == "comment":
+            current["comment"] = raw_value.strip('"')[:255]
+        elif key == "category":
+            current["category"] = one.strip('"')[:64]
+        else:
+            # 端口 / 协议那几项原样收着,收尾时一起算 —— 一条服务可以
+            # 同时有 tcp-portrange 和 udp-portrange
+            current["_item"][key] = raw_value.strip('"')
+
+    if current is not None:
+        log.warning("服务对象输出在 edit %s 处结束但没有 next,该条被丢弃(输出被截断?)",
+                    current["name"])
+    return out
+
+
+def _services_from_ssh(device: Device) -> list[dict]:
+    """SSH 通道。**失败只记日志、返回空**,不抛。"""
+
+    profile = get_profile(device.model, device.vendor)
+    if not profile.service_cli:
+        return []
+
+    client = ssh_cli._connect(device)
+    out: list[dict] = []
+    try:
+        try:
+            raw = ssh_cli._run_exec(client, profile.service_cli, timeout=180.0)
+            out.extend(parse_show_firewall_service(raw, as_group=False))
+        except ssh_cli.SshError as exc:
+            log.info("设备 %s 服务对象同步失败(%s)", device.name, exc)
+        if profile.servicegrp_cli:
+            try:
+                raw = ssh_cli._run_exec(client, profile.servicegrp_cli, timeout=120.0)
+                out.extend(parse_show_firewall_service(raw, as_group=True))
+            except ssh_cli.SshError as exc:
+                log.info("设备 %s 服务组同步失败(%s)", device.name, exc)
+    finally:
+        client.close()
+
+    seen: set[str] = set()
+    unique = []
+    for row in out:
+        if row["name"] in seen:
+            continue
+        seen.add(row["name"])
+        unique.append(row)
+    return unique
+
+
 def _from_ssh(device: Device) -> list[dict]:
     profile = get_profile(device.model, device.vendor)
     if not profile.policy_cli:
@@ -788,6 +994,7 @@ def sync_policies(device: Device) -> dict:
     rows: list[dict] = []
     vips: list[dict] = []
     addresses: list[dict] = []
+    services: list[dict] = []
     method = ""
     api_error = ""
 
@@ -800,6 +1007,7 @@ def sync_policies(device: Device) -> dict:
             # 设备上配错了。**映射拿不到不算失败**,策略照常写
             vips = _vips_from_api(device)
             addresses = _addresses_from_api(device)
+            services = _services_from_api(device)
         except PolicyError as exc:
             api_error = str(exc)
             log.info("设备 %s API 策略同步失败(%s),尝试 SSH", device.name, api_error)
@@ -810,6 +1018,7 @@ def sync_policies(device: Device) -> dict:
             method = "ssh"
             vips = _vips_from_ssh(device)
             addresses = _addresses_from_ssh(device)
+            services = _services_from_ssh(device)
         except PolicyError as exc:
             # 两条都失败时,把 API 的错也带出来 —— 只报 SSH 的错会让人
             # 去修一条自己根本没打算用的通道
@@ -858,6 +1067,14 @@ def sync_policies(device: Device) -> dict:
                 for addr in addresses
             ], batch_size=500)
 
+        # 服务对象同样全量替换、同一个事务
+        FirewallService.objects.filter(device=device, vdom=vdom).delete()
+        if services:
+            FirewallService.objects.bulk_create([
+                FirewallService(device=device, vdom=vdom, synced_at=now, method=method, **svc)
+                for svc in services
+            ], batch_size=1000)
+
     device.policy_count = FirewallPolicy.objects.filter(device=device).count()
     device.last_policy_sync_at = now
     device.last_policy_error = ""
@@ -870,6 +1087,8 @@ def sync_policies(device: Device) -> dict:
         "total": len(rows),
         "vips": len(vips),
         "addresses": len(addresses),
+        "services": len(services),
+        "service_groups": sum(1 for x in services if x.get("is_group")),
         "address_groups": sum(1 for a in addresses if a.get("is_group")),
         # 整机映射的条数单独报 —— 它是这批数据里暴露面最大的那种,
         # 而在列表里它和一条只映射 443 的规则长得几乎一样

@@ -9,7 +9,8 @@ import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
 import { api, errText } from '@/api'
 import type {
-  AddressResolve, AddressRow, PolicyAudit, PolicyRow, PolicySummaryRow, VipSummary,
+  AddressResolve, AddressRow, PolicyAudit, PolicyRow, PolicySummaryRow,
+  ServiceRow, VipSummary,
 } from '@/api'
 import { useMetaStore } from '@/stores/meta'
 import { ago, bytes, dateTimeOf, int } from '@/composables/useFormat'
@@ -78,14 +79,25 @@ const vipSummary = ref<VipSummary | null>(null)
  * **它到底是哪几个网段完全不在策略表里** —— 这个框就是答案。
  * 地址组会递归展开(组能套组),给一棵树和一张拍平的叶子表。
  */
+/**
+ * 查的是**地址**还是**服务**。两套对象在策略里的位置不同(源/目的 vs 服务),
+ * 但形状是同构的 —— 后端共用一个展开器,前端共用一个面板。
+ *
+ * **内置名那一套是分开的**:`ALL` 在服务里是"所有协议所有端口",
+ * 在地址里是 `0.0.0.0/0` —— 说明文案不能共用。
+ */
+const objKind = ref<'address' | 'service'>('address')
 const addrQuery = ref('')
 const addrResult = ref<AddressResolve | null>(null)
 const addrLoading = ref(false)
 const addrList = ref<AddressRow[]>([])
+const svcList = ref<ServiceRow[]>([])
 const addrListLoading = ref(false)
 const addrOpen = ref(false)
 const addrKeyword = ref('')
 const groupOnly = ref(false)
+
+const objLabel = computed(() => (objKind.value === 'service' ? '服务' : '地址'))
 
 const current = computed(() => summary.value.find((s) => s.device_id === selected.value) || null)
 const totals = computed(() => {
@@ -179,7 +191,9 @@ async function lookupAddress() {
   if (selected.value === null || !name) { addrResult.value = null; return }
   addrLoading.value = true
   try {
-    const { data } = await api.resolveAddress(selected.value, name)
+    const { data } = objKind.value === 'service'
+      ? await api.resolveService(selected.value, name)
+      : await api.resolveAddress(selected.value, name)
     addrResult.value = data
   } catch (e) {
     message.error(errText(e))
@@ -190,15 +204,18 @@ async function lookupAddress() {
 }
 
 async function loadAddresses() {
-  if (selected.value === null) { addrList.value = []; return }
+  if (selected.value === null) { addrList.value = []; svcList.value = []; return }
   addrListLoading.value = true
   try {
-    // 地址对象通常几十到几百条,一次取完在前端筛 —— 这一页要的是
-    // "扫一眼全部",分页会让"有哪些组"这个问题要翻好几页
-    const { data } = await api.addresses({
-      device: selected.value, page_size: 1000, ordering: 'name',
-    })
-    addrList.value = data.results
+    // 对象通常几十到几百条(API 通道下服务能到上千,预定义的那批),
+    // 一次取完在前端筛 —— 这一页要的是"扫一眼全部",分页会让
+    // "有哪些组"这个问题要翻好几页
+    const [a, sv] = await Promise.all([
+      api.addresses({ device: selected.value, page_size: 1000, ordering: 'name' }),
+      api.services({ device: selected.value, page_size: 2000, ordering: 'name' }),
+    ])
+    addrList.value = a.data.results
+    svcList.value = sv.data.results
   } catch (e) {
     message.error(errText(e))
   } finally {
@@ -206,9 +223,13 @@ async function loadAddresses() {
   }
 }
 
+/** 当前那一档的全量清单 */
+const objList = computed<Array<AddressRow | ServiceRow>>(() =>
+  objKind.value === 'service' ? svcList.value : addrList.value)
+
 const shownAddresses = computed(() => {
   const kw = addrKeyword.value.trim().toLowerCase()
-  return addrList.value.filter((a) => {
+  return objList.value.filter((a) => {
     if (groupOnly.value && !a.is_group) return false
     if (!kw) return true
     return [a.name, a.value, a.comment, ...(a.members || [])]
@@ -218,9 +239,26 @@ const shownAddresses = computed(() => {
 
 /** 点策略表里的一个地址名 → 直接查它 */
 function lookupFromPolicy(name: string) {
+  objKind.value = 'address'
   addrQuery.value = name
   addrOpen.value = true
   void lookupAddress()
+}
+
+/** 点策略表里的一个服务名 → 查它是哪几个端口 */
+function lookupService(name: string) {
+  objKind.value = 'service'
+  addrQuery.value = name
+  addrOpen.value = true
+  void lookupAddress()
+}
+
+/** 换档时结果作废 —— 上一档的结果留在屏上会被读成这一档的 */
+function switchKind(kind: 'address' | 'service') {
+  if (objKind.value === kind) return
+  objKind.value = kind
+  addrResult.value = null
+  addrKeyword.value = ''
 }
 
 onMounted(async () => {
@@ -436,8 +474,24 @@ const policyColumns: DataTableColumns<PolicyRow> = [
           : null,
       ])),
     ]) },
-  { title: '服务', key: 'service', sorter: 'default', minWidth: 104,
-    render: (r) => listCell(r.service, 'ALL') },
+  { title: '服务', key: 'service', sorter: 'default', minWidth: 120,
+    render: (r) => {
+      const list = r.service || []
+      if (!list.length) {
+        return h('div', { class: 'cell-line dim' }, 'ALL(没写 = 不限制)')
+      }
+      return h('div', { class: 'cell-line' }, list.map((n, i) => {
+        // **`ALL` 单独标出来** —— 它是"所有协议所有端口",不是一个还没查的
+        // 服务名。混在一堆名字里看不出来,而它恰恰是最该看见的一个
+        const any = ['all', 'all_tcp', 'all_udp', 'all_icmp'].includes(String(n).toLowerCase())
+        return h('button', {
+          key: i,
+          class: ['addr-chip', any ? 'any' : ''],
+          title: any ? '所有协议 / 所有端口' : `点一下查「${n}」是哪几个端口`,
+          onClick: (e: Event) => { e.stopPropagation(); if (!any) lookupService(String(n)) },
+        }, String(n))
+      }))
+    } },
   { title: '动作', key: 'action', sorter: 'default', width: 76,
     render: (r) => h(NTag, {
       size: 'tiny', bordered: false,
@@ -535,6 +589,38 @@ const addrColumns: DataTableColumns<AddressRow> = [
   { title: '绑定接口', key: 'interface', sorter: 'default', width: 100,
     render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' },
       r.interface || '—') },
+]
+
+const svcColumns: DataTableColumns<ServiceRow> = [
+  { title: '名称', key: 'name', sorter: 'default', minWidth: 150,
+    render: (r) => h('div', [
+      h('button', { class: 'addr-chip', onClick: () => lookupService(r.name) }, r.name),
+      r.comment
+        ? h('div', { style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.4' }, r.comment)
+        : null,
+    ]) },
+  { title: '协议', key: 'protocol', sorter: 'default', width: 84,
+    render: (r) => r.is_group
+      ? h(NTag, { size: 'tiny', bordered: false, type: 'info' }, () => '服务组')
+      : h('span', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.protocol || '—') },
+  { title: '端口', key: 'display', sorter: 'default', minWidth: 210,
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink)",
+      // FortiOS 的 `443:1024-65535` 里冒号后面那半是**源端口** ——
+      // 后端已经切掉了,这里显示的是真正开放的那几个
+      title: r.is_group ? (r.members || []).join('、') : r.value,
+    }, r.display) },
+  { title: '成员', key: 'member_count', width: 88, className: 'num',
+    sorter: (a, b) => (a.member_count ?? -1) - (b.member_count ?? -1),
+    render: (r) => r.member_count === null
+      ? h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '—')
+      : h('span', {
+          style: "font-size:11.5px;font-family:'JetBrains Mono',monospace",
+          title: (r.members || []).join('、'),
+        }, `${r.member_count} 个`) },
+  { title: '分类', key: 'category', sorter: 'default', width: 110,
+    render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' },
+      r.category || '—') },
 ]
 
 const actionOptions = computed(() => [
@@ -743,32 +829,44 @@ const FINDING_COLORS: Record<string, string> = {
 
     <!-- ============ 地址对象 / 地址组:别名查询 ============ -->
     <CyberPanel
-      title="地址对象" subtitle="策略里那些名字到底是哪几个网段"
+      title="对象查询" subtitle="策略里那些名字到底是什么"
     >
       <template #actions>
         <NButton size="tiny" ghost @click="addrOpen = !addrOpen">
-          {{ addrOpen ? '收起清单' : `展开清单(${addrList.length})` }}
+          {{ addrOpen ? '收起清单' : `展开清单(${objList.length})` }}
         </NButton>
       </template>
 
       <div class="addr-lead">
-        策略表里的源/目的地址是一串<b>名字</b>(<code>内网服务器组</code>)——
-        <b>它到底是哪几个网段完全不在策略表里</b>。在这儿查,或者直接点上面
-        表格里的地址名。<b>地址组会递归展开</b>(组能套组)。
+        策略表里的源/目的地址和服务都是一串<b>名字</b>
+        (<code>内网服务器组</code>、<code>HTTPS</code>)——
+        <b>它们到底是哪几个网段、哪几个端口,完全不在策略表里</b>。
+        在这儿查,或者直接点上面表格里那些名字。<b>组会递归展开</b>(组能套组)。
       </div>
 
       <div class="filters">
+        <!-- 地址 / 服务两档。**换档时上一档的结果作废** ——
+             留在屏上会被读成这一档的 -->
+        <div class="seg">
+          <button :class="{ on: objKind === 'address' }" @click="switchKind('address')">
+            地址 {{ addrList.length }}
+          </button>
+          <button :class="{ on: objKind === 'service' }" @click="switchKind('service')">
+            服务 {{ svcList.length }}
+          </button>
+        </div>
         <NInput
           v-model:value="addrQuery" size="small" clearable
-          placeholder="输入别名,如 内网服务器组" style="width: 260px"
+          :placeholder="objKind === 'service' ? '输入服务名,如 HTTPS' : '输入别名,如 内网服务器组'"
+          style="width: 240px"
           @keyup.enter="lookupAddress"
         />
         <NButton size="small" type="primary" ghost :loading="addrLoading" @click="lookupAddress">
           查
         </NButton>
         <span class="dim small">
-          共同步到 {{ addrList.length }} 个对象,其中
-          {{ addrList.filter((a) => a.is_group).length }} 个是组
+          共同步到 {{ objList.length }} 个{{ objLabel }}对象,其中
+          {{ objList.filter((a) => a.is_group).length }} 个是组
         </span>
       </div>
 
@@ -778,13 +876,20 @@ const FINDING_COLORS: Record<string, string> = {
              **「没同步到」不等于「不存在」** -->
         <template v-if="addrResult.result.kind === 'unknown'">
           <div class="addr-note warn">
-            <b>没有同步到「{{ addrResult.query }}」这个对象。</b>
+            <b>没有同步到「{{ addrResult.query }}」这个{{ objLabel }}对象。</b>
             这<b>不等于</b>它在设备上不存在 —— FortiOS 的
-            <code>show</code> 只打印偏离默认值的项,<b>出厂自带的对象
-            (all / none / FABRIC_DEVICE)根本不会出现在输出里</b>。
+            <code>show</code> 只打印<b>偏离默认值</b>的项。
+            <template v-if="objKind === 'service'">
+              而 FortiOS <b>自带几百个预定义服务</b>(HTTP / HTTPS / SSH / DNS …),
+              没改过的一条都不出现 —— <b>而策略里引用得最多的恰恰是它们</b>。
+            </template>
+            <template v-else>
+              而出厂自带的地址对象(all / none / FABRIC_DEVICE)也不会出现。
+            </template>
             <template v-if="addrResult.method === 'ssh'">
-              这批数据走的是 <b>SSH</b> 通道,拿不到内置对象;
-              配了 API Token 的话 API 通道能拿全。
+              这批数据走的是 <b>SSH</b> 通道,拿不到那一批;
+              配了 API Token 的话 API 通道能拿全 —— 到<b>配置中心 → 网络设备</b>
+              给这台填上 API Token。
             </template>
             也可能是名字打错了,或者这一批同步的时候它还没建。
           </div>
@@ -792,14 +897,14 @@ const FINDING_COLORS: Record<string, string> = {
         <template v-else-if="addrResult.result.kind === 'builtin'">
           <div class="addr-note">
             <b>{{ addrResult.query }}</b> 是 FortiOS 的<b>内置名</b> ——
-            {{ addrResult.result.value }}。引用它的策略对<b>所有地址</b>开放。
+            {{ addrResult.result.value }}。引用它的策略在这一维上是<b>不限制</b>的。
           </div>
         </template>
         <template v-else>
           <div class="addr-head">
             <b class="cy-mono">{{ addrResult.result.name }}</b>
             <NTag size="tiny" :bordered="false">
-              {{ addrResult.result.kind === 'group' ? '地址组' : '地址对象' }}
+              {{ addrResult.result.kind === 'group' ? `${objLabel}组` : `${objLabel}对象` }}
             </NTag>
             <span v-if="addrResult.result.kind === 'address'" class="cy-mono">
               = {{ addrResult.result.value || '—' }}
@@ -841,6 +946,9 @@ const FINDING_COLORS: Record<string, string> = {
           </template>
           <span v-else class="dim">
             <b :style="{ color: STATE.degraded }">没有任何策略引用它</b> —— 配了但不生效,可以清理。
+            <template v-if="objKind === 'service' && addrResult.method === 'api'">
+              (预定义服务大多本来就没被引用,那是正常的。)
+            </template>
           </span>
         </div>
       </div>
@@ -850,22 +958,23 @@ const FINDING_COLORS: Record<string, string> = {
         <div class="filters" style="margin-top: 12px">
           <NInput
             v-model:value="addrKeyword" size="small" clearable
-            placeholder="搜名称 / 地址值 / 备注 / 组成员" style="width: 240px"
+            :placeholder="`搜名称 / ${objKind === 'service' ? '端口' : '地址值'} / 备注 / 组成员`"
+            style="width: 240px"
           />
           <label class="never-toggle">
             <NSwitch v-model:value="groupOnly" size="small" />
-            <span>只看地址组</span>
+            <span>只看{{ objLabel }}组</span>
           </label>
         </div>
         <NDataTable
-          :columns="addrColumns" :data="shownAddresses" :loading="addrListLoading"
+          :columns="objKind === 'service' ? svcColumns : addrColumns" :data="shownAddresses" :loading="addrListLoading"
           size="small" :bordered="false" :single-line="false" :scroll-x="820"
           :pagination="{ pageSize: 20, showSizePicker: true, pageSizes: [20, 50, 100] }"
         />
-        <div v-if="!addrList.length && !addrListLoading" class="cy-empty">
-          没有同步到地址对象。<b>这不等于这台防火墙没有配</b> ——
-          SSH 通道的 <code>show firewall address</code> 可能没跑成,
-          API 通道可能权限不够。点上面那台的「立即同步」再看。
+        <div v-if="!objList.length && !addrListLoading" class="cy-empty">
+          没有同步到{{ objLabel }}对象。<b>这不等于这台防火墙没有配</b> ——
+          SSH 通道的 <code>show firewall {{ objKind === 'service' ? 'service custom' : 'address' }}</code>
+          可能没跑成,API 通道可能权限不够。点上面那台的「立即同步」再看。
         </div>
       </template>
     </CyberPanel>
@@ -988,6 +1097,22 @@ const FINDING_COLORS: Record<string, string> = {
 .addr-chip.any:hover { text-decoration: none; }
 .cell-line { display: flex; gap: 5px; flex-wrap: wrap; line-height: 1.6; }
 .cell-line.dim { color: var(--cy-ink-3); font-size: 11px; }
+
+.seg { display: flex; border: 1px solid var(--cy-line-soft); }
+.seg button {
+  background: transparent;
+  border: none;
+  padding: 3px 12px;
+  font-size: 11.5px;
+  color: var(--cy-ink-3);
+  cursor: pointer;
+  font-family: inherit;
+}
+.seg button + button { border-left: 1px solid var(--cy-line-soft); }
+.seg button.on {
+  background: color-mix(in srgb, var(--cy-cyan) 16%, transparent);
+  color: var(--cy-ink);
+}
 
 .addr-lead {
   font-size: 11.5px;

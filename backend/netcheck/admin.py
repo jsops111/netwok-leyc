@@ -15,6 +15,7 @@ from netcheck.models import (
     Event,
     FirewallPolicy,
     FirewallAddress,
+    FirewallService,
     FirewallVip,
     IdracHost,
     IdracSample,
@@ -145,6 +146,13 @@ class FirewallAddressAdmin(admin.ModelAdmin):
     list_display = ("device", "vdom", "name", "addr_type", "is_group", "display", "synced_at")
     list_filter = ("device", "vdom", "addr_type", "is_group", "method")
     search_fields = ("name", "value", "comment")
+
+
+@admin.register(FirewallService)
+class FirewallServiceAdmin(admin.ModelAdmin):
+    list_display = ("device", "vdom", "name", "protocol", "is_group", "display", "synced_at")
+    list_filter = ("device", "vdom", "is_group", "protocol", "method")
+    search_fields = ("name", "value", "comment", "category")
 
 
 @admin.register(IdracHost)
