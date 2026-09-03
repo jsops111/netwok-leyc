@@ -477,7 +477,10 @@ const probeFields: FieldSpec[] = [
 const needsSsh = (m: Record<string, any>) =>
   [m.collect_method, m.fallback_method].includes('ssh')
   || m.backup_enabled === true
-  || (m.kind === 'firewall' && m.policy_sync_enabled === true)
+  // **不看 kind,看有没有开策略同步** —— 核心交换机上的 ACL 同步只能走
+  // SSH,而它的 kind 是「交换机」。原来那个 kind === 'firewall' 会让
+  // 交换机开了同步之后**找不到填 SSH 凭据的地方**,而后端强制要求填
+  || m.policy_sync_enabled === true
 
 /**
  * API Token 什么时候要显示。除了 api 采集通道,还有两种情况:
@@ -486,6 +489,8 @@ const needsSsh = (m: Record<string, any>) =>
  */
 const needsApi = (m: Record<string, any>) =>
   [m.collect_method, m.fallback_method].includes('api')
+  // **只对 FortiGate**。Cisco 开了策略同步也不需要 Token(IOS 没有只读
+  // REST),显示出来会让人去找一个不存在的东西
   || (m.vendor === 'fortinet' && (m.backup_enabled === true || m.policy_sync_enabled === true))
 
 const deviceFields: FieldSpec[] = [
@@ -592,14 +597,23 @@ const deviceFields: FieldSpec[] = [
     hint: '比对 running-config 和 startup-config,找出「改了但没 write memory」的配置'
       + ' —— 设备一重启那些改动就没了。**代价是每次备份多取一份配置,时间大约翻倍**' },
 
-  // ---- 防火墙策略 ----
-  { key: 'policy_sync_enabled', label: '同步防火墙策略', type: 'switch', full: true,
-    show: (m) => m.kind === 'firewall',
-    hint: '仅防火墙。**强烈建议配 API Token** —— 只有 REST API 拿得到命中计数,'
-      + '而「这条规则从来没命中过」是策略页面最有价值的结论' },
-  { key: 'policy_sync_interval_minutes', label: '策略同步间隔', type: 'number', min: 5, max: 1440,
-    suffix: '分钟', show: (m) => m.kind === 'firewall' && m.policy_sync_enabled,
-    hint: '策略表几百条起,一次同步要拉两个端点;5 分钟以下没有意义' },
+  // ---- 访问控制同步(FortiGate 的策略 / Cisco 的 ACL)----
+  //
+  // **按厂商显示,不按 kind。**核心交换机上挂着 ACL 是常态,而它的 kind
+  // 是「交换机」—— 原来那个 `kind === 'firewall'` 把这种情况整个挡在
+  // 表单外面了:后端放开了,但页面上找不到那个开关。
+  { key: 'policy_sync_enabled', label: '同步访问控制(策略 / ACL)', type: 'switch', full: true,
+    show: (m) => m.vendor === 'fortinet' || m.vendor === 'cisco',
+    hint: 'FortiGate:同步 firewall policy / vip / address(在「防火墙策略」'
+      + '和「防火墙映射」页看)—— **强烈建议配 API Token**,只有 REST API '
+      + '拿得到命中计数。'
+      + 'Cisco:同步 ACL / object-group / 静态 NAT(在「Cisco ACL」页看)'
+      + '—— **只能走 SSH**,IOS 没有等价的只读 REST 接口。'
+      + '**核心交换机也能开** —— 它的类型是「交换机」,但上面挂着 ACL 是常态' },
+  { key: 'policy_sync_interval_minutes', label: '同步间隔', type: 'number', min: 5, max: 1440,
+    suffix: '分钟',
+    show: (m) => (m.vendor === 'fortinet' || m.vendor === 'cisco') && m.policy_sync_enabled,
+    hint: '策略/ACL 表几百条起,一次同步要拉好几个端点;5 分钟以下没有意义' },
 
   // ---- SD-WAN 性能 SLA ----
   // **只对 FortiGate 显示** —— 开在别的厂商上不会报错、只会每拍白走一次

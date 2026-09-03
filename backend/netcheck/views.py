@@ -694,13 +694,11 @@ class DeviceViewSet(DuplicateMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def sync_policies_now(self, request, pk=None):
         device = self.get_object()
-        if device.kind != DeviceKind.FIREWALL:
-            return Response(
-                {"detail": "策略同步只对防火墙有意义"}, status=status.HTTP_400_BAD_REQUEST
-            )
+        # **不看 kind。**核心交换机上的 ACL 同步就是走这条路,而它的 kind
+        # 是「交换机」—— 只看开关有没有开
         if not device.policy_sync_enabled:
             return Response(
-                {"detail": "这台设备没有开启策略同步 —— 先在配置里打开"},
+                {"detail": "这台设备没有开启访问控制同步 —— 先在配置里打开"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         scheduler.schedule_now("policy", device.pk)
@@ -1410,10 +1408,10 @@ class FirewallAddressViewSet(viewsets.ReadOnlyModelViewSet):
     def summary(self, request):
         """按设备一行:同步了多少对象、多少组、走的哪条通道。"""
 
+        # 按**开关**取,不按 kind —— 核心交换机上的 object-group 也在这儿
         devices = list(
-            Device.objects.filter(
-                kind=DeviceKind.FIREWALL, enabled=True, policy_sync_enabled=True
-            ).order_by("order", "id")
+            Device.objects.filter(enabled=True, policy_sync_enabled=True)
+            .order_by("order", "id")
         )
         counts: dict = {}
         for row in FirewallAddress.objects.filter(device__in=devices).only(
@@ -1866,7 +1864,7 @@ class FirewallVipViewSet(viewsets.ReadOnlyModelViewSet):
         # 这批数据覆盖了哪些防火墙 —— 用来分辨"没有映射"和"没同步到映射"
         device_ids = {v.device_id for v in vips}
         firewalls = Device.objects.filter(
-            kind=DeviceKind.FIREWALL, enabled=True, policy_sync_enabled=True
+            enabled=True, policy_sync_enabled=True
         ).values_list("id", "name")
         missing = [name for did, name in firewalls if did not in device_ids]
 
@@ -2359,8 +2357,10 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
         那时候页面上必须说"这批数据没有命中统计",而不是显示一片 0。
         """
 
+        # 策略页的 summary 只看 FortiGate(Cisco 的 ACL 在 /acl 那一页,
+        # 它有自己的 board)—— 但**按厂商判,不按 kind**
         devices = list(
-            Device.objects.filter(kind=DeviceKind.FIREWALL, policy_sync_enabled=True)
+            Device.objects.filter(policy_sync_enabled=True, vendor=Vendor.FORTINET)
             .order_by("order", "id")
         )
         # 一次聚合出所有设备的分布,不是每台一个查询

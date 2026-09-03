@@ -147,10 +147,14 @@ def dispatch_due_backups() -> dict:
 
 @shared_task(name="netcheck.dispatch_due_policies")
 def dispatch_due_policies() -> dict:
+    # **不按 kind 过滤。**核心交换机上挂着 ACL 是常态,而它的 kind 是
+    # 「交换机」—— 这里留着 kind=FIREWALL 的话 Cisco 交换机**永远不会被
+    # 排进到期表**,页面上开关是开的、`sync_schedule` 也不报错,
+    # 而它就是不采。那是最难查的一类。
+    # 开关本身由 Device.clean() / 序列化器按**厂商**把住
     enabled_ids = list(
-        Device.objects.filter(
-            enabled=True, policy_sync_enabled=True, kind=DeviceKind.FIREWALL
-        ).values_list("id", flat=True)
+        Device.objects.filter(enabled=True, policy_sync_enabled=True)
+        .values_list("id", flat=True)
     )
     sync = scheduler.sync_schedule("policy", enabled_ids)
 

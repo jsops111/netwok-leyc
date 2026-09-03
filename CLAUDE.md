@@ -722,6 +722,19 @@ queryset 互相排除):
 **厂商**判。Cisco 只有 SSH 一条路(IOS 没有等价的只读 REST),校验里单独
 说清楚,免得人去找"Cisco 的 API Token 填哪儿"。
 
+⚠ **那道门有六处,改一处不够。**实测踩到:后端的 `sync_policies()` 和
+`Device.clean()` 放开了,但下面这几处还挡着,而症状各不相同、都不报错:
+
+| 漏改的地方 | 症状 |
+|---|---|
+| `tasks.dispatch_due_policies` 的 `kind=FIREWALL` | **最严重**:开关是开的、`sync_schedule` 不报错,但设备**永远不进到期表**,就是不采 |
+| `DeviceViewSet.sync_policies_now` | 「立即同步」按钮点了回 400 |
+| `Config.vue` 里字段的 `show: kind === 'firewall'` | **页面上根本找不到那个开关** |
+| `needsSsh` 里的 `kind === 'firewall' && policy_sync_enabled` | 交换机开了同步之后**找不到填 SSH 凭据的地方**,而后端强制要求填 |
+| 地址对象 / 映射 summary 里的 `kind=FIREWALL` | Cisco 的 object-group 和 NAT 同步进来了,但那两页的概览统计不到 |
+
+加新厂商时把 `DeviceKind.FIREWALL` 全局搜一遍。
+
 ### ⚠ 三个 Cisco 特有的静默出错点
 
 **1. IOS 的 ACL 用通配符掩码,object-group 用子网掩码 —— 同一台设备上两种

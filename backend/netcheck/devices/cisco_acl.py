@@ -599,7 +599,7 @@ def parse_nat(text: str) -> list[dict]:
             port_forward = bool(proto and inside_port)
             out.append({
                 "name": f"{outside_ip}:{outside_port or 'any'}"[:128],
-                "seq": seq, "vip_type": "static-nat", "is_group": False,
+                "seq": seq, "vip_type": "static-nat",
                 "ext_intf": [], 
                 # **外网在前** —— IOS 命令里它排在后面,别抄反了
                 "ext_ip": outside_ip[:128],
@@ -619,7 +619,7 @@ def parse_nat(text: str) -> list[dict]:
             port_forward = bool(proto and mapped_port)
             out.append({
                 "name": (current_obj or mapped)[:128], "seq": seq,
-                "vip_type": "static-nat", "is_group": False,
+                "vip_type": "static-nat",
                 "ext_intf": [outside_if.strip()],
                 "ext_ip": mapped[:128],
                 "ext_port": (mapped_port or "") if port_forward else "",
