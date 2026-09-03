@@ -239,15 +239,29 @@ class PortBank:
     面板上的**一组口**。一台设备的面板通常是两三组:一大片接入口 +
     一小片上行口(SFP/QSFP),它们在物理面板上是分开的两块。
 
-    `pattern` 里必须有一个捕获组,抓出**面板上印着的那个口号**。
+    ## 捕获组:一个是口号,两个是「堆叠成员 + 口号」
+
+    `pattern` 里**必须有捕获组**,抓出**面板上印着的那个口号**。
     Catalyst 上 `GigabitEthernet1/0/24` 的面板号是 24,不是 ifIndex ——
     **ifIndex 和面板位置没有任何关系**,拿 ifIndex 排会排出一个和实物
     对不上的图,而那正是这个功能最危险的失败方式。
+
+    ⚠ **堆叠(StackWise)必须写两个捕获组:`(成员号, 口号)`。**
+    一对堆叠的 C9300 上口名是 `Gi1/0/1..48` 和 `Gi2/0/1..48` ——
+    只抓口号的话两台的第 30 口**都抓出 30**,于是:
+
+      - 96 个口挤成一排,而且因为口号重复被**重新编号** 1..96
+      - 页面上标着"顺序,非面板号",而人照着数第 30 个格子会落在
+        **另一台交换机**上 —— 照着它去拔线,拔的是别人的
+
+    有两个组时 `build()` 会**按成员号拆成一块一块**:「成员 1 接入口」、
+    「成员 2 接入口」,各自用自己的真实口号。这才和机柜里那两台对得上。
     """
 
-    #: 这一组的名字,显示在图上("接入口" / "上行口")
+    #: 这一组的名字,显示在图上("接入口" / "上行口")。
+    #: 堆叠时会自动加上「成员 N」前缀
     label: str
-    #: 接口名 → 面板口号。带一个捕获组
+    #: 接口名 → 面板口号。**一个捕获组 = 口号;两个 = (成员号, 口号)**
     pattern: str
     #: 这一组有几排。接入口通常 2 排,SFP 上行常常 1 排
     rows: int = 2
@@ -334,17 +348,24 @@ _CISCO_VOLATILE = (
 
 _CAT_ACCESS = PortBank(
     label="接入口",
-    # `GigabitEthernet1/0/24` / `Gi1/0/24` —— 抓最后那个口号。
+    # `GigabitEthernet1/0/24` → **(成员号 1, 口号 24)**。
+    #
+    # ⚠ **第一段是堆叠成员号,必须抓出来。**一对堆叠的 C9300 上是
+    # `Gi1/0/1..48` + `Gi2/0/1..48`,只抓口号的话两台的第 24 口都是 24,
+    # 96 个口会挤成一排并被重新编号 —— 而人照着数第 30 个格子会落在
+    # 另一台交换机上。
+    #
     # **不能用 ifIndex 排**:ifIndex 和面板位置没有任何关系
-    pattern=r"^(?:Gi|GigabitEthernet|Te|TenGigabitEthernet)\d+/0/(\d+)$",
+    pattern=r"^(?:Gi|GigabitEthernet|Te|TenGigabitEthernet)(\d+)/0/(\d+)$",
     rows=2,
     column_major=True,
     shape="rj45",
 )
 _CAT_UPLINK = PortBank(
     label="上行口",
-    # 网络模块上的口是 `TenGigabitEthernet1/1/1` —— 中间那一段是 1 不是 0
-    pattern=r"^(?:Te|TenGigabitEthernet|Twe|TwentyFiveGigE|Fo|FortyGigabitEthernet|Ap|AppGigabitEthernet)\d+/1/(\d+)$",
+    # 网络模块上的口是 `TenGigabitEthernet1/1/1` —— 中间那一段是 1 不是 0。
+    # 同样抓成员号:堆叠的两台各有自己的上行模块
+    pattern=r"^(?:Te|TenGigabitEthernet|Twe|TwentyFiveGigE|Fo|FortyGigabitEthernet|Ap|AppGigabitEthernet)(\d+)/1/(\d+)$",
     rows=1,
     column_major=False,
     shape="sfp",
@@ -353,7 +374,7 @@ _CAT_UPLINK = PortBank(
 #: Catalyst 固定口的面板。**verified=False** —— 手边没有实机,这个排布
 #: 是照 Cisco 的规格图推的。页面上会标出来,让人别完全照着它拔线
 _CAT_FACEPLATE = Faceplate(
-    label="固定电口两排(列优先、奇数在上)+ 网络模块上行口",
+    label="固定电口两排(列优先、奇数在上)+ 网络模块上行口;堆叠时按成员分块",
     banks=(_CAT_ACCESS, _CAT_UPLINK),
     verified=False,
 )

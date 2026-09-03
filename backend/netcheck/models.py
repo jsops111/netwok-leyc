@@ -848,6 +848,46 @@ class DeviceInterface(BaseModel):
     def __str__(self) -> str:
         return f"{self.device_id}:{self.if_name}"
 
+    #: 逻辑口的 ifType(SNMP 的 ifType 名字形式)和名字前缀。
+    #:
+    #: **两套判据都要**:`if_type` 是 SNMP 采来的、最可靠,但**它可能是空的**
+    #: (SSH 通道、或者某些固件不报 ifType —— 实测这个库里 56/128 个口是空的)。
+    #: 空的时候退回按名字前缀判,而不是当成物理口 —— 把一个 Vlan 接口算成
+    #: 物理口会让「接口数」和实物上能数出来的口数对不上。
+    _LOGICAL_TYPES = {
+        "propvirtual", "l2vlan", "l3ipvlan", "softwareloopback", "tunnel",
+        "ieee8023adlag", "other", "voiceencapsulation", "mpls", "atmsubinterface",
+    }
+    _LOGICAL_PREFIXES = (
+        "vlan", "port-channel", "po", "loopback", "lo", "tunnel", "tu",
+        "null", "bdi", "nve", "virtual-", "bvi", "dialer", "mgmt-vrf",
+    )
+
+    @property
+    def is_logical(self) -> bool:
+        """
+        这是**逻辑口**吗(Vlan / Port-channel / Loopback / Tunnel …)。
+
+        为什么要分:一台 48 口交换机的接口表里往往有几十个 Vlan 接口和
+        一堆 Port-channel。把它们算进「接口数」的话,**页面上的数字和人在
+        机柜前面能数出来的口数对不上** —— 而"对不上"这件事本身会让人怀疑
+        整个采集,比少一个数字糟得多。
+
+        判据两套(见 `_LOGICAL_TYPES` 的说明):`if_type` 优先,空了退回名字。
+        """
+        kind = (self.if_type or "").strip().lower()
+        if kind:
+            return kind in self._LOGICAL_TYPES
+        name = (self.if_name or "").strip().lower()
+        # `Po1` 和 `Port-channel1` 都要认;但别把 `GigabitEthernet` 里的
+        # 那个 "gi" 当前缀 —— 所以逐个前缀比,而且短前缀要后面跟数字
+        for prefix in self._LOGICAL_PREFIXES:
+            if name.startswith(prefix):
+                rest = name[len(prefix):]
+                if len(prefix) > 3 or (rest and rest[0].isdigit()):
+                    return True
+        return False
+
     @property
     def util_in_pct(self):
         if not self.speed_bps or self.in_bps is None:

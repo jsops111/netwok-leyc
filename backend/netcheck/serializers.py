@@ -386,6 +386,7 @@ class DeviceInterfaceSerializer(serializers.ModelSerializer):
     counter_32bit = serializers.SerializerMethodField()
     # 管理上启用但链路 down —— 这是真正要看的那一类口
     link_problem = serializers.SerializerMethodField()
+    is_logical = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = DeviceInterface
@@ -393,7 +394,10 @@ class DeviceInterfaceSerializer(serializers.ModelSerializer):
             "id", "device", "device_name", "if_index", "if_name", "if_alias", "if_type",
             "mac", "speed_bps", "admin_up", "oper_up", "last_change", "monitored",
             "in_bps", "out_bps", "in_err_delta", "out_err_delta",
-            "util_in_pct", "util_out_pct", "counter_32bit", "link_problem", "updated_at",
+            "util_in_pct", "util_out_pct", "counter_32bit", "link_problem",
+            # **实体口还是逻辑口**(Vlan / Port-channel / Loopback …)。
+            # 逻辑口没有物理位置,面板图上画不出来,「接口数」也该分开算
+            "is_logical", "updated_at",
         ]
         read_only_fields = [
             "if_index", "if_name", "if_alias", "if_type", "mac", "speed_bps",

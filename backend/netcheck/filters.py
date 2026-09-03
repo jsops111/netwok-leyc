@@ -70,6 +70,31 @@ class DeviceInterfaceFilter(filters.FilterSet):
     # 而 admin down 是人为关的、不是故障
     problem = filters.BooleanFilter(method="filter_problem", label="仅异常接口")
     keyword = filters.CharFilter(method="filter_keyword", label="接口名或描述")
+    # 「只看实体口」—— 逻辑口(Vlan / Port-channel / Loopback)没有物理位置,
+    # 面板图上画不出来,巡检和交维要的是能在机柜前面数出来的那些。
+    #
+    # ⚠ **判据在 models.DeviceInterface.is_logical 上,而它是 Python 属性、
+    # SQL 认不了** —— 所以这里按 ifType + 名字前缀重写了一遍。
+    # 改那个属性时**这里要一起改**(和 filter_permissive 同一类问题:
+    # 页面上标 104 个、筛选筛出 72 个,不报任何错)
+    physical = filters.BooleanFilter(method="filter_physical", label="只看实体口")
+
+    def filter_physical(self, queryset, name, value):
+        from django.db.models import Q
+
+        if value is None:
+            return queryset
+        # ifType 明确是逻辑类型的
+        logical_type = Q(if_type__iregex=(
+            r"^(propVirtual|l2vlan|l3ipvlan|softwareLoopback|tunnel"
+            r"|ieee8023adLag|other)$"))
+        # ifType 为空时按名字前缀。**空的不能当成实体口** —— 那会让 Vlan
+        # 接口混进"机柜前面能数出来的口"里(实测这个库里一半的口 ifType 是空的)
+        logical_name = Q(if_type="") & Q(if_name__iregex=(
+            r"^(Vlan|Port-channel|Po[0-9]|Loopback|Lo[0-9]|Tunnel|Tu[0-9]"
+            r"|Null|BDI|nve|Virtual-|BVI|Dialer)"))
+        cond = logical_type | logical_name
+        return queryset.exclude(cond) if value else queryset.filter(cond)
 
     def filter_active(self, queryset, name, value):
         if value:

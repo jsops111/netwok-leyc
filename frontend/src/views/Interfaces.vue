@@ -51,6 +51,8 @@ const pageSize = ref(50)
 const keyword = ref('')
 const problemOnly = ref(false)
 const activeOnly = ref(false)
+/** 只看实体口 —— 逻辑口(Vlan / Port-channel)没有物理位置,巡检时是噪声 */
+const physicalOnly = ref(false)
 const ordering = ref('if_index')
 
 const current = computed(() => summary.value.find((s) => s.device_id === selected.value) || null)
@@ -147,6 +149,7 @@ async function loadRows() {
       keyword: keyword.value || undefined,
       problem: problemOnly.value ? true : undefined,
       active: activeOnly.value ? true : undefined,
+      physical: physicalOnly.value ? true : undefined,
     })
     rows.value = data.results
     total.value = data.count
@@ -163,7 +166,7 @@ onMounted(async () => {
   await loadFaceplate()
 })
 
-watch([selected, keyword, problemOnly, activeOnly, ordering], () => {
+watch([selected, keyword, problemOnly, activeOnly, physicalOnly, ordering], () => {
   page.value = 1
   void loadRows()
 })
@@ -227,21 +230,35 @@ const summaryColumns: DataTableColumns<InterfaceSummaryRow> = [
   // **几个数要加得起来**:total = 通 + 人为关闭 + 该通没通 + 未采到。
   // 原来只显示 `48 / up 28`,人一减发现少了 20 个口、不知道去哪了 ——
   // 那 20 个是人为关掉的,而这个数原来在页面上根本不存在
-  { title: '接口数', key: 'total', sorter: 'default', width: 132, className: 'num',
+  // **实体口和逻辑口分开。**一台 48 口交换机的接口表里往往还有几十个
+  // Vlan 和一堆 Port-channel —— 混在一个「接口数」里的话,页面上的数字
+  // 和人在机柜前面能数出来的口数对不上,而"对不上"本身会让人怀疑整个采集
+  { title: '实体口', key: 'physical', sorter: 'default', width: 128, className: 'num',
     render: (r) => h('div', [
-      h('div', { style: 'font-size:12.5px;font-weight:700' }, String(r.total)),
+      h('div', {
+        style: 'font-size:12.5px;font-weight:700',
+        title: '能在机柜前面数出来的那些 —— 和面板图上画的一致',
+      }, String(r.physical ?? r.total)),
       h('div', {
         style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.5',
+        // 几个数要加得起来 —— 见 views.py 里那段注释
         title: `通 ${r.up} + 人为关闭 ${r.admin_down ?? 0}`
-          + ` + 该通没通 ${r.problem} + 未采到 ${r.unknown ?? 0} = ${r.total}`,
+          + ` + 该通没通 ${r.problem} + 未采到 ${r.unknown ?? 0} = ${r.total}(含逻辑口)`,
       }, [
-        h('span', { style: `color:${STATE.up}` }, `${r.up} 通`),
+        h('span', { style: `color:${STATE.up}` }, `${r.physical_up ?? r.up} 通`),
         ' · ',
         // 人为关闭是**灰的不是红的** —— 48 口交换机上一半的口是关着的,
         // 标红会让真正断掉的那个淹在里面
         h('span', null, `${r.admin_down ?? 0} 关`),
-        ...(r.unknown ? [' · ', h('span', null, `${r.unknown} 未采到`)] : []),
       ]),
+    ]) },
+  { title: '逻辑口', key: 'logical', sorter: 'default', width: 92, className: 'num',
+    render: (r) => h('div', [
+      h('div', {
+        style: `font-size:12px;color:${(r.logical ?? 0) ? 'var(--cy-ink-2)' : 'var(--cy-ink-3)'}`,
+        title: 'Vlan / Port-channel / Loopback / Tunnel —— 没有物理位置,面板图上画不出来',
+      }, String(r.logical ?? 0)),
+      h('div', { style: 'font-size:9.5px;color:var(--cy-ink-3)' }, `共 ${r.total}`),
     ]) },
   { title: '异常', key: 'problem', sorter: 'default', width: 72, className: 'num',
     render: (r) => h('span', {
@@ -432,6 +449,10 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
         <label class="tgl">
           <NSwitch v-model:value="activeOnly" size="small" />
           <span>只看 up 的</span>
+        </label>
+        <label class="tgl">
+          <NSwitch v-model:value="physicalOnly" size="small" />
+          <span>只看实体口</span>
         </label>
         <a :href="exportUrl" class="csv-link" download>导出 CSV(当前筛选)</a>
       </div>

@@ -560,6 +560,13 @@ export interface FacePort extends InterfaceRow {
 
 export interface FaceBank {
   label: string
+  /**
+   * 堆叠成员号(StackWise)。**两台堆叠 = 两块面板** ——
+   * `Gi1/0/30` 和 `Gi2/0/30` 是两台不同机器上的口,画成一排的话
+   * 人照着数第 30 个格子会落在另一台上。
+   * 不是堆叠时为 null。
+   */
+  member: number | null
   rows: number
   cols: number
   shape: string
@@ -1103,6 +1110,14 @@ export interface InterfaceSummaryRow {
   admin_down: number
   /** 状态没采到。**单独一档**,不并进通也不并进不通 */
   unknown: number
+  /**
+   * **实体口**(能在机柜前面数出来的那些)。逻辑口(Vlan / Port-channel /
+   * Loopback / Tunnel)不算 —— 混在一个「接口数」里的话页面上的数字和
+   * 实物对不上,而"对不上"本身会让人怀疑整个采集。
+   */
+  physical: number
+  physical_up: number
+  logical: number
   device_id: number
   device_name: string
   mgmt_ip: string

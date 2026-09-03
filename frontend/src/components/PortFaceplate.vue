@@ -82,30 +82,50 @@ function bankHeight(bank: FaceBank) {
   return LABEL_H + bank.rows * H + Math.max(0, bank.rows - 1) * GAP
 }
 
-/** 每组的左上角 x —— 组是横着排的,和物理面板一致 */
-const bankOffsets = computed(() => {
+/**
+ * 按**堆叠成员**分成几台机箱,每台一个 SVG。
+ *
+ * ⚠ **两台堆叠必须画成上下两个机箱,不能横着接成一排。**
+ * `Gi1/0/30` 和 `Gi2/0/30` 是两台不同机器上的口 —— 接成一排的话人照着
+ * 数第 30 个格子会落在另一台上,而这张图存在的全部意义就是"照着它去
+ * 机柜里找那个口"。
+ */
+const chassisList = computed(() => {
+  const groups = new Map<number | null, FaceBank[]>()
+  for (const bank of props.data.banks) {
+    const key = bank.member
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key)!.push(bank)
+  }
+  return [...groups.entries()]
+    .sort((a, b) => (a[0] ?? 0) - (b[0] ?? 0))
+    .map(([member, banks]) => ({ member, banks }))
+})
+
+/** 一台机箱里,各组的左上角 x —— 组是横着排的,和物理面板一致 */
+function offsetsOf(banks: FaceBank[]) {
   const out: number[] = []
   let x = PAD + PLATE
-  for (const bank of props.data.banks) {
+  for (const bank of banks) {
     out.push(x)
     x += bankWidth(bank) + BANK_GAP
   }
   return out
-})
+}
 
-const boxW = computed(() => {
-  const banks = props.data.banks
+function boxWOf(banks: FaceBank[]) {
   if (!banks.length) return 300
-  return bankOffsets.value[banks.length - 1] + bankWidth(banks[banks.length - 1]) + PAD
-})
-const boxH = computed(() => {
-  const banks = props.data.banks
+  const off = offsetsOf(banks)
+  return off[banks.length - 1] + bankWidth(banks[banks.length - 1]) + PAD
+}
+function boxHOf(banks: FaceBank[]) {
   return (banks.length ? Math.max(...banks.map(bankHeight)) : 40) + PAD * 2
-})
-const viewBox = computed(() => `0 0 ${boxW.value} ${boxH.value}`)
-
-function portX(bankIndex: number, port: FacePort) {
-  return bankOffsets.value[bankIndex] + colOffset(port.col)
+}
+function viewBoxOf(banks: FaceBank[]) {
+  return `0 0 ${boxWOf(banks)} ${boxHOf(banks)}`
+}
+function portX(banks: FaceBank[], bankIndex: number, port: FacePort) {
+  return offsetsOf(banks)[bankIndex] + colOffset(port.col)
 }
 function portY(bank: FaceBank, port: FacePort) {
   return PAD + LABEL_H + port.row * (H + GAP)
@@ -173,6 +193,13 @@ function bps(value: number | null | undefined): string {
 
     <div class="fp-head">
       <span class="fp-label">{{ data.label }}</span>
+      <!-- **端口对账**:库里多少个、面板上画了多少个。"为什么不显示所有
+           端口"这个问题要能一眼看完 —— 差额一定在「不在物理面板上」那一行 -->
+      <span class="fp-total">
+        共 {{ data.counts.total + data.unplaced.length }} 个口 ·
+        面板上 {{ data.counts.total }}
+        <template v-if="data.unplaced.length"> · 非物理口 {{ data.unplaced.length }}</template>
+      </span>
       <span class="fp-legend">
         <i :style="{ background: STATE.up }"></i>通 {{ data.counts.up }}
         <i :style="{ background: STATE.down }"></i>断 {{ data.counts.down }}
@@ -184,21 +211,27 @@ function bps(value: number | null | undefined): string {
       </span>
     </div>
 
-    <div class="fp-box">
-      <svg :viewBox="viewBox" class="fp-svg" role="img" aria-label="端口面板图">
-        <defs>
-          <!-- 机箱面板:上亮下暗的金属渐变 -->
+    <!-- **一台机箱一个 SVG。**两台堆叠画成上下两块 —— 接成一排的话
+         人照着数第 30 个格子会落在另一台上,而这张图存在的全部意义
+         就是"照着它去机柜里找那个口" -->
+    <div v-for="ch in chassisList" :key="ch.member ?? 'single'" class="fp-box">
+      <div v-if="ch.member !== null && chassisList.length > 1" class="fp-member">
+        堆叠成员 {{ ch.member }}
+        <span class="dim">
+          {{ ch.banks.reduce((n, b) => n + b.ports.length, 0) }} 个口
+        </span>
+      </div>
+      <svg :viewBox="viewBoxOf(ch.banks)" class="fp-svg" role="img" aria-label="端口面板图">
+        <defs v-if="ch.member === null || ch.member <= 1">
           <linearGradient id="fp-chassis" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stop-color="var(--cy-raised)" />
             <stop offset="42%" stop-color="var(--cy-card)" />
             <stop offset="100%" stop-color="var(--cy-body)" />
           </linearGradient>
-          <!-- 端口凹进去的那圈阴影 -->
           <linearGradient id="fp-socket" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stop-color="var(--cy-body)" />
             <stop offset="100%" stop-color="var(--cy-card)" />
           </linearGradient>
-          <!-- 通风孔纹理:铭牌那块用 -->
           <pattern id="fp-vent" width="4" height="4" patternUnits="userSpaceOnUse">
             <circle cx="2" cy="2" r="0.7" fill="var(--cy-ink-3)" opacity="0.25" />
           </pattern>
@@ -206,46 +239,50 @@ function bps(value: number | null | undefined): string {
 
         <!-- 机箱 -->
         <rect
-          x="0.5" y="0.5" :width="boxW - 1" :height="boxH - 1" rx="3"
+          x="0.5" y="0.5" :width="boxWOf(ch.banks) - 1" :height="boxHOf(ch.banks) - 1" rx="3"
           fill="url(#fp-chassis)" stroke="var(--cy-line)" stroke-width="1"
         />
-        <!-- 上沿高光:一条很淡的亮线,金属感全靠它 -->
-        <line x1="3" y1="1.6" :x2="boxW - 3" y2="1.6" class="fp-gloss" />
+        <line x1="3" y1="1.6" :x2="boxWOf(ch.banks) - 3" y2="1.6" class="fp-gloss" />
 
-        <!-- 左边铭牌:厂商 + 型号 + 两颗安装螺丝 + 通风孔 -->
+        <!-- 铭牌 -->
         <g class="fp-plate">
           <rect
-            :x="PAD - 4" :y="PAD - 4" :width="PLATE - 10" :height="boxH - PAD * 2 + 8"
+            :x="PAD - 4" :y="PAD - 4" :width="PLATE - 10"
+            :height="boxHOf(ch.banks) - PAD * 2 + 8"
             rx="2" fill="var(--cy-body)" stroke="var(--cy-line-soft)"
           />
           <rect
-            :x="PAD - 1" :y="boxH - PAD - 10" :width="PLATE - 16" height="9"
+            :x="PAD - 1" :y="boxHOf(ch.banks) - PAD - 10" :width="PLATE - 16" height="9"
             fill="url(#fp-vent)"
           />
           <text :x="PAD" :y="PAD + 6" class="fp-vendor">{{ plateVendor }}</text>
           <text :x="PAD" :y="PAD + 17" class="fp-model">{{ plateText }}</text>
-          <!-- 状态灯:实物上那排 SYST/STAT。这里只画一颗,亮的是整机状态 -->
+          <!-- 堆叠成员号印在铭牌上,和实物上那个 STACK 号一个意思 -->
+          <text
+            v-if="ch.member !== null && chassisList.length > 1"
+            :x="PAD" :y="PAD + 26" class="fp-stack"
+          >SW {{ ch.member }}</text>
           <circle
-            :cx="PAD + 3" :cy="PAD + 27" r="2.2"
+            :cx="PAD + 3" :cy="PAD + 35" r="2.2"
             :fill="data.device.state === 'up' ? STATE.up
               : data.device.state === 'down' ? STATE.down : STATE.unknown"
           />
-          <text :x="PAD + 9" :y="PAD + 29.5" class="fp-syst">SYST</text>
+          <text :x="PAD + 9" :y="PAD + 37.5" class="fp-syst">SYST</text>
           <circle :cx="PAD - 1" :cy="PAD - 1" r="1.3" class="fp-screw" />
           <circle :cx="PAD + PLATE - 15" :cy="PAD - 1" r="1.3" class="fp-screw" />
         </g>
 
         <!-- 端口 -->
-        <g v-for="(bank, bi) in data.banks" :key="bank.label">
-          <text :x="bankOffsets[bi]" :y="PAD + 5" class="fp-bank-label">
-            {{ bank.label }}<tspan v-if="bank.renumbered" class="fp-warn"> (顺序,非面板号)</tspan>
+        <g v-for="(bank, bi) in ch.banks" :key="bank.label">
+          <text :x="offsetsOf(ch.banks)[bi]" :y="PAD + 5" class="fp-bank-label">
+            {{ bank.label.replace(/^成员 \d+ · /, '') }}<tspan
+              v-if="bank.renumbered" class="fp-warn"> (顺序,非面板号)</tspan>
           </text>
 
-          <!-- 每组 6 个口下面一条短横线 —— 实物上那条丝印分隔,数口靠它 -->
           <line
             v-for="g in Math.ceil(bank.cols / GROUP)" :key="`g${g}`"
-            :x1="bankOffsets[bi] + colOffset((g - 1) * GROUP)"
-            :x2="bankOffsets[bi] + colOffset(Math.min(g * GROUP, bank.cols) - 1) + W"
+            :x1="offsetsOf(ch.banks)[bi] + colOffset((g - 1) * GROUP)"
+            :x2="offsetsOf(ch.banks)[bi] + colOffset(Math.min(g * GROUP, bank.cols) - 1) + W"
             :y1="PAD + LABEL_H + bank.rows * H + (bank.rows - 1) * GAP + 3"
             :y2="PAD + LABEL_H + bank.rows * H + (bank.rows - 1) * GAP + 3"
             class="fp-groupline"
@@ -259,16 +296,14 @@ function bps(value: number | null | undefined): string {
             @mouseleave="hovered = null"
             @click="emit('pick', p)"
           >
-            <!-- 插座底(凹进去的那圈) -->
             <rect
-              :x="portX(bi, p) - 1" :y="portY(bank, p) - 1"
+              :x="portX(ch.banks, bi, p) - 1" :y="portY(bank, p) - 1"
               :width="W + 2" :height="portH(bank) + 2" rx="1.5"
               fill="url(#fp-socket)" stroke="var(--cy-line-soft)" stroke-width="0.6"
             />
-            <!-- 口本身。RJ45 画卡扣缺口,SFP 画扁笼子 -->
             <path
               v-if="bank.shape !== 'sfp'"
-              :d="rjPath(portX(bi, p), portY(bank, p), portH(bank), p.row % 2 === 1)"
+              :d="rjPath(portX(ch.banks, bi, p), portY(bank, p), portH(bank), p.row % 2 === 1)"
               :fill="STATE_COLOR[p.state]"
               :fill-opacity="p.state === 'up' || p.state === 'down' ? 0.88 : 0.3"
               :stroke="activeId === p.id ? 'var(--cy-cyan)' : STATE_COLOR[p.state]"
@@ -276,29 +311,25 @@ function bps(value: number | null | undefined): string {
             />
             <rect
               v-else
-              :x="portX(bi, p)" :y="portY(bank, p)"
+              :x="portX(ch.banks, bi, p)" :y="portY(bank, p)"
               :width="W" :height="portH(bank)" rx="1"
               :fill="STATE_COLOR[p.state]"
               :fill-opacity="p.state === 'up' || p.state === 'down' ? 0.88 : 0.3"
               :stroke="activeId === p.id ? 'var(--cy-cyan)' : STATE_COLOR[p.state]"
               :stroke-width="activeId === p.id ? 1.5 : 0.6"
             />
-            <!-- 口号 -->
             <text
-              :x="portX(bi, p) + W / 2"
+              :x="portX(ch.banks, bi, p) + W / 2"
               :y="portY(bank, p) + portH(bank) / 2 + 3"
               class="fp-num"
               :class="{ dimtext: p.state !== 'up' && p.state !== 'down' }"
             >{{ shortName(p) }}</text>
-            <!-- 链路灯:通的口才亮。实物上每个 RJ45 上方那颗绿灯 -->
             <circle
               v-if="p.state === 'up'"
-              :cx="portX(bi, p) + 2.6"
+              :cx="portX(ch.banks, bi, p) + 2.6"
               :cy="portY(bank, p) + (p.row % 2 === 1 ? portH(bank) - 2.4 : 2.4)"
               r="1" :fill="STATE.up" class="fp-led"
             />
-            <!-- 原生 title:鼠标停住就有,不依赖任何 JS。
-                 **信息以接口名为主** —— 名字才是印在设备上的 -->
             <title>{{ p.if_name }} · {{ STATE_TEXT[p.state] }}{{ p.if_alias ? ` · ${p.if_alias}` : '' }}</title>
           </g>
         </g>
@@ -381,6 +412,15 @@ function bps(value: number | null | undefined): string {
   padding: 2px 0;
 }
 .fp-svg { display: block; width: 100%; min-width: 720px; height: auto; }
+/* 堆叠时每台之间留一道缝,一眼看出是两台不是一台 */
+.fp-box + .fp-box { margin-top: 6px; }
+.fp-member {
+  font-size: 10.5px; color: var(--cy-ink-2); padding: 0 0 2px 2px;
+  letter-spacing: 0.06em;
+}
+.fp-member .dim { color: var(--cy-ink-3); margin-left: 6px; }
+.fp-total { font-size: 10.5px; color: var(--cy-ink-2); }
+.fp-stack { font-size: 6.5px; fill: var(--cy-cyan); letter-spacing: 0.1em; }
 
 /* 机箱细节 */
 .fp-gloss { stroke: var(--cy-ink-3); stroke-width: 0.6; opacity: 0.28; }

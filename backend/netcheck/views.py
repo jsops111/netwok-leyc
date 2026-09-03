@@ -813,6 +813,31 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
             )
         )
         stats = {r["device_id"]: r for r in rows}
+
+        # ---- 实体口 / 逻辑口分开数 ----
+        #
+        # 一台 48 口交换机的接口表里往往还有几十个 Vlan 接口和一堆
+        # Port-channel。混在一个「接口数」里的话,**页面上的数字和人在机柜
+        # 前面能数出来的口数对不上** —— 而"对不上"本身会让人怀疑整个采集。
+        #
+        # 判据在 `DeviceInterface.is_logical` 上(if_type 优先、空了退回名字),
+        # **在 Python 里数**:那是个属性,SQL 认不了它;而接口总数是几十到
+        # 几百,一次取出来数完全够(和下面 counter_32bit 那段同一个理由)。
+        # ⚠ 判据只有那一份 —— 别在这儿按名字再写第二遍
+        split: dict[int, dict] = {}
+        for iface in DeviceInterface.objects.filter(device__in=devices).only(
+            "device_id", "if_name", "if_type", "admin_up", "oper_up"
+        ):
+            slot = split.setdefault(iface.device_id, {
+                "physical": 0, "logical": 0, "physical_up": 0,
+            })
+            if iface.is_logical:
+                slot["logical"] += 1
+            else:
+                slot["physical"] += 1
+                if iface.oper_up:
+                    slot["physical_up"] += 1
+
         # counter_32bit 在 meta 里,SQL 里筛 JSON 不如直接数 —— 接口总数
         # 是几十到几百,一次取出来在 Python 里数完全够
         legacy: dict[int, int] = {}
@@ -832,6 +857,11 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
                 "total": row.get("total", 0), "up": row.get("up", 0),
                 "admin_down": row.get("admin_down", 0),
                 "unknown": row.get("unknown", 0),
+                # **实体口 / 逻辑口分开** —— 实体口那个数才是机柜前面
+                # 能数出来的口数,和面板图上画的一致
+                "physical": split.get(device.pk, {}).get("physical", 0),
+                "physical_up": split.get(device.pk, {}).get("physical_up", 0),
+                "logical": split.get(device.pk, {}).get("logical", 0),
                 "problem": row.get("problem", 0), "errors": row.get("errors", 0),
                 "unmonitored": row.get("unmonitored", 0),
                 "counter_32bit": legacy.get(device.pk, 0),

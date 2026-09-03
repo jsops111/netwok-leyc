@@ -88,14 +88,77 @@ def _place(number: int, rows: int, column_major: bool, span: int) -> tuple[int, 
     return index // per_row, index % per_row
 
 
-def _match_bank(name: str, bank: PortBank) -> int | None:
+def _match_bank(name: str, bank: PortBank) -> tuple[int | None, int] | None:
+    """
+    接口名 → `(堆叠成员号, 面板口号)`。不匹配返回 None。
+
+    **一个捕获组 = 只有口号**(成员号为 None);
+    **两个 = (成员号, 口号)** —— 堆叠必须这么写,见 `PortBank` 的说明。
+    """
+
     m = re.match(bank.pattern, name) if bank.pattern.startswith("^") else re.search(bank.pattern, name)
     if not m:
         return None
+    groups = m.groups()
     try:
-        return int(m.group(1))
-    except (IndexError, ValueError):
+        if len(groups) >= 2:
+            return int(groups[0]), int(groups[1])
+        return None, int(groups[0])
+    except (IndexError, ValueError, TypeError):
         return None
+
+
+def _emit_bank(bank: PortBank, entries: list, member: int | None,
+               schematic: bool, out_banks: list) -> None:
+    """把一个成员(或整组)的口摆好,追加成一块面板。"""
+
+    # **按面板号排,不按 ifIndex** —— 见模块开头第 2 条
+    entries.sort(key=lambda e: (e[0], str(e[1].get("if_name"))))
+    # 分完成员之后口号还重复,那才是真的要重编(兜底排布的情形)
+    renumber = schematic or len({n for n, _ in entries}) != len(entries)
+
+    # 一排放几个要看**最大的面板号**,不是口的个数:一台 48 口交换机只有
+    # 24 个口在线时,剩下 24 个位置应该是空的(那才和实物对得上)
+    span = len(entries) if renumber else max(n for n, _ in entries)
+
+    ports = []
+    for seq, (number, row) in enumerate(entries, start=1):
+        slot = seq if renumber else number
+        r, c = _place(slot, bank.rows, bank.column_major, span)
+        ports.append({
+            **row, "row": r, "col": c,
+            # 面板上印的那个号。重编号时这个数只是顺序,页面上
+            # **要以接口名为准**(名字才是印在设备上的东西)
+            "port_no": number,
+            "state": port_state(row.get("admin_up"), row.get("oper_up")),
+        })
+
+    cols = max((p["col"] for p in ports), default=0) + 1
+    out_banks.append({
+        # 堆叠时**标出是第几台** —— 「成员 2 接入口」。不标的话两块一模一样
+        # 的面板叠在一起,人分不出哪块是哪台
+        "label": f"成员 {member} · {bank.label}" if member is not None else bank.label,
+        "member": member,
+        "rows": bank.rows,
+        "cols": cols,
+        "shape": bank.shape,
+        # 重编过号的话,面板号和实物对不上 —— 说出来
+        "renumbered": renumber,
+        "ports": ports,
+    })
+
+
+def _finish(out_banks: list) -> None:
+    """
+    按 (成员号, 组名) 排一遍 —— 让「成员 1 接入口 / 成员 1 上行口 /
+    成员 2 接入口 / 成员 2 上行口」这个顺序和机柜里从上往下的顺序一致。
+
+    没有成员号的(非堆叠)保持原来的组顺序。
+    """
+
+    if any(b["member"] is not None for b in out_banks):
+        out_banks.sort(key=lambda b: (b["member"] if b["member"] is not None else 0,
+                                      0 if "接入" in b["label"] else 1))
 
 
 def build(interfaces: list[dict], profile: Profile | None) -> dict:
@@ -122,55 +185,33 @@ def build(interfaces: list[dict], profile: Profile | None) -> dict:
     out_banks = []
 
     for bank in banks:
-        entries = []
+        # 按**堆叠成员**分桶。成员号为 None 的(pattern 只有一个捕获组)
+        # 全落进同一桶,行为和以前一样
+        buckets: dict[int | None, list] = {}
         for row in interfaces:
             name = str(row.get("if_name") or "")
             if not name or name in placed_names:
                 continue
-            number = _match_bank(name, bank)
-            if number is None:
+            hit = _match_bank(name, bank)
+            if hit is None:
                 continue
-            entries.append((number, row))
+            member, number = hit
+            buckets.setdefault(member, []).append((number, row))
             placed_names.add(name)
 
-        if not entries:
+        if not buckets:
             continue
 
-        # **按面板号排,不按 ifIndex** —— 见模块开头第 2 条。
-        # 兜底排布时面板号可能不连续(Gi1/0/1 和 Gi2/0/1 都抓出 1),
-        # 所以重新编号成 1..N,并在返回里带上原始号让页面能显示
-        entries.sort(key=lambda e: (e[0], str(e[1].get("if_name"))))
-        renumber = schematic or len({n for n, _ in entries}) != len(entries)
-
-        # 一排放几个要看**最大的面板号**,不是口的个数:一台 48 口交换机
-        # 只有 24 个口在线时,剩下 24 个位置应该是空的(那才和实物对得上),
-        # 而不是把 24 个口摊满整排
-        span = len(entries) if renumber else max(n for n, _ in entries)
-
-        ports = []
-        for seq, (number, row) in enumerate(entries, start=1):
-            slot = seq if renumber else number
-            r, c = _place(slot, bank.rows, bank.column_major, span)
-            ports.append({
-                **row,
-                "row": r,
-                "col": c,
-                # 面板上印的那个号。重编号时这个数只是顺序,页面上
-                # **要以接口名为准**(名字才是印在设备上的东西)
-                "port_no": number,
-                "state": port_state(row.get("admin_up"), row.get("oper_up")),
-            })
-
-        cols = max((p["col"] for p in ports), default=0) + 1
-        out_banks.append({
-            "label": bank.label,
-            "rows": bank.rows,
-            "cols": cols,
-            "shape": bank.shape,
-            # 重编过号的话,面板号和实物对不上 —— 说出来
-            "renumbered": renumber,
-            "ports": ports,
-        })
+        # **一个成员一块面板。**堆叠的两台是两台独立的交换机,画成一排的话
+        # 人照着数第 30 个格子会落在另一台上 —— 照着它去拔线,拔的是别人的。
+        #
+        # **只有真的堆叠(多于一个成员)才加「成员 N」前缀** —— 单台交换机
+        # 上标着「成员 1」是凭空多出来的概念,人会去想"那成员 2 呢"
+        multi = len(buckets) > 1
+        for member in sorted(buckets, key=lambda x: (x is None, x)):
+            entries = buckets[member]
+            _emit_bank(bank, entries, member if multi else None, schematic, out_banks)
+    _finish(out_banks)
 
     # 没落到任何一组的口。**必须列出来** —— 图上少一个口,
     # 人会以为那个口不存在(Vlan / Port-channel / Loopback 都会落这里,
