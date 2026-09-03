@@ -16,6 +16,7 @@ from netcheck.models import (
     DeviceNeighbor,
     Event,
     FirewallPolicy,
+    FirewallVip,
     Notifier,
     ProbeTarget,
     Server,
@@ -220,6 +221,40 @@ class FirewallPolicyFilter(filters.FilterSet):
             Q(log_traffic="") | Q(log_traffic__iexact="disable") | Q(log_traffic__iexact="disabled")
         )
         return queryset.filter(cond) if value else queryset.exclude(cond)
+
+
+
+class FirewallVipFilter(filters.FilterSet):
+    device = filters.NumberFilter(field_name="device_id")
+    keyword = filters.CharFilter(method="filter_keyword", label="名称/地址/备注")
+    # 「整机映射」—— 外网地址的所有端口都通到内网那台机器上。这是这张表里
+    # 唯一值得单独筛的风险,而它在列表里和一条只映射 443 的规则长得几乎一样。
+    # **在 SQL 里重写 models.whole_host 那条判定**(数据库不认识 Python 属性),
+    # 改模型上那个属性时这里要一起改 —— 和 filter_permissive 同一类问题
+    whole_host = filters.BooleanFilter(method="filter_whole_host", label="整机映射")
+
+    class Meta:
+        model = FirewallVip
+        fields = ["device", "vdom", "vip_type", "port_forward", "protocol", "method"]
+
+    def filter_whole_host(self, queryset, name, value):
+        """`whole_host` 就是 `port_forward` 取反(见 models.FirewallVip)。"""
+        if value is None:
+            return queryset
+        return queryset.filter(port_forward=not value)
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(comment__icontains=value)
+            | Q(ext_ip__icontains=value)
+            | Q(mapped_ip__icontains=value)
+            | Q(ext_port__icontains=value)
+            | Q(mapped_port__icontains=value)
+            | Q(ext_intf__icontains=value)
+        )
 
 
 class EventFilter(filters.FilterSet):

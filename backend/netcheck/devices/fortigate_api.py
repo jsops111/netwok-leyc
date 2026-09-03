@@ -403,6 +403,27 @@ def fetch_policies(device: Device) -> list[dict]:
     return results
 
 
+def fetch_vips(device: Device) -> list[dict]:
+    """
+    映射表(firewall vip)。**取不到时返回空列表,不抛** ——
+    一台没有配任何映射的防火墙是完全正常的,而把"没有映射"变成
+    "策略同步失败"会让整批策略一起丢掉。
+
+    ⚠ 权限不够时这个端点返回 403,而那和"没有映射"是两件事。
+    `_safe()` 把两者都吞成 None,所以调用方拿到的空列表**不能**被说成
+    "这台没有映射";页面上那句话是"没有同步到映射",区别在于前者是结论、
+    后者是状态。
+    """
+
+    data = _safe(device, "/cmdb/firewall/vip")
+    if not data:
+        return []
+    results = data.get("results")
+    if not isinstance(results, list):
+        return []
+    return results
+
+
 def fetch_policy_stats(device: Device) -> dict[int, dict]:
     """
     每条策略的命中统计,按 policyid 索引。

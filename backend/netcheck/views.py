@@ -35,6 +35,7 @@ from netcheck.filters import (
     DeviceNeighborFilter,
     EventFilter,
     FirewallPolicyFilter,
+    FirewallVipFilter,
     NotifierFilter,
     ProbeTargetFilter,
     ServerFilter,
@@ -52,6 +53,7 @@ from netcheck.models import (
     Event,
     EventKind,
     FirewallPolicy,
+    FirewallVip,
     InterfaceSample,
     LinkState,
     Notifier,
@@ -83,6 +85,7 @@ from netcheck.serializers import (
     EventSerializer,
     FirewallPolicyDetailSerializer,
     FirewallPolicySerializer,
+    FirewallVipSerializer,
     InterfaceSampleSerializer,
     NotifierSerializer,
     NotifyLogSerializer,
@@ -847,6 +850,114 @@ class ServerViewSet(viewsets.ModelViewSet):
         })
 
 
+class FirewallVipViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    防火墙**映射**(FortiOS 的 firewall vip)只读快照。写入只有一条路:
+    和策略同一次的同步任务。
+
+    这张表回答的是策略表回答不了的那个问题:**外面的 1.2.3.4:443 到底进到
+    内网哪台机器的哪个端口**。策略的目的地址里只有一个 VIP 的名字。
+    """
+
+    serializer_class = FirewallVipSerializer
+    filterset_class = FirewallVipFilter
+    search_fields = ["name", "comment", "ext_ip", "mapped_ip"]
+    ordering_fields = ["seq", "name", "ext_ip", "synced_at"]
+
+    def get_queryset(self):
+        return FirewallVip.objects.select_related("device")
+
+    def _usage_index(self, queryset):
+        """
+        (设备, vdom, 映射名) → 引用它的策略列表。
+
+        **一条没有任何策略引用的映射是不生效的** —— 和"从未命中"同一类
+        结论,能直接拿去清理。所以这个索引值得为它多查一次策略表。
+
+        名字**精确比较**:`web-vip-old` 和 `web-vip` 是两条不同的规则。
+        """
+        device_ids = set(queryset.values_list("device_id", flat=True))
+        if not device_ids:
+            return {}
+        index: dict = {}
+        policies = FirewallPolicy.objects.filter(device_id__in=device_ids).only(
+            "id", "device_id", "vdom", "policy_id", "seq", "name",
+            "dst_addr", "enabled", "action",
+        )
+        for p in policies:
+            for name in (p.dst_addr or []):
+                key = (p.device_id, p.vdom, str(name))
+                index.setdefault(key, []).append({
+                    "id": p.pk, "policy_id": p.policy_id, "seq": p.seq,
+                    "name": p.name, "enabled": p.enabled, "action": p.action,
+                })
+        return index
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action in ("list", "retrieve"):
+            context["vip_usage"] = self._usage_index(
+                self.filter_queryset(self.get_queryset())
+            )
+        return context
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """
+        映射概览。三个数字,每个都直接对应一个动作:
+
+          - **整机映射**:外网地址的所有端口都通到内网那台机器 —— 该收窄成端口映射
+          - **没有策略引用**:配了但不生效 —— 可以清理
+          - **没有同步到映射**:这批数据里一条映射都没有。**这不等于
+            "这台防火墙没有映射"** —— SSH 通道的 `show firewall vip` 可能
+            没跑成、API 通道可能权限不够。两者在页面上的说法完全不同:
+            前者是结论,后者是状态(和「这批数据没有命中统计」同一条)
+        """
+
+        queryset = self.filter_queryset(self.get_queryset())
+        vips = list(queryset)
+        usage = self._usage_index(queryset)
+
+        unused = [
+            v for v in vips
+            if not usage.get((v.device_id, v.vdom, v.name))
+        ]
+        whole_host = [v for v in vips if v.whole_host]
+
+        def brief(v):
+            return {
+                "id": v.pk, "device_id": v.device_id, "device_name": v.device.name,
+                "vdom": v.vdom, "name": v.name, "endpoint_text": v.endpoint_text,
+                "vip_type": v.vip_type, "whole_host": v.whole_host,
+                "comment": v.comment,
+            }
+
+        # 这批数据覆盖了哪些防火墙 —— 用来分辨"没有映射"和"没同步到映射"
+        device_ids = {v.device_id for v in vips}
+        firewalls = Device.objects.filter(
+            kind=DeviceKind.FIREWALL, enabled=True, policy_sync_enabled=True
+        ).values_list("id", "name")
+        missing = [name for did, name in firewalls if did not in device_ids]
+
+        return Response({
+            "generated_at": timezone.now(),
+            "total": len(vips),
+            "whole_host": {
+                "count": len(whole_host),
+                "hint": "外网地址的**所有端口**都通到内网那台机器上,暴露面比端口映射大得多",
+                "items": [brief(v) for v in whole_host[:100]],
+            },
+            "unused": {
+                "count": len(unused),
+                "hint": "没有任何策略的目的地址引用它 —— 配了但不生效,可以清理",
+                "items": [brief(v) for v in unused[:100]],
+            },
+            # **不说"这几台没有映射"**,只说没同步到 —— 我们分不出是真没有
+            # 还是没拉到,而说成前者会让人以为已经确认过了
+            "devices_without_vips": missing,
+        })
+
+
 class DeviceNeighborViewSet(viewsets.ReadOnlyModelViewSet):
     """
     邻居关系只读 —— 它是采集产物(LLDP / CDP)。
@@ -1104,6 +1215,38 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return FirewallPolicyDetailSerializer
         return FirewallPolicySerializer
+
+    def get_serializer_context(self):
+        """
+        把映射表按 (设备, vdom, 名字) 建索引塞进 context。
+
+        **在这里做而不是在序列化器里**:序列化器一次只看得到一行,逐行去查
+        映射就是每页 20 次查询,而这一页是要翻的。一台防火墙的映射通常几十到
+        几百条,整张表一次查回来比什么都便宜。
+
+        `device` 过滤存在时只取那台的 —— 页面上绝大多数请求都带着设备。
+        """
+        context = super().get_serializer_context()
+        if self.action not in ("list", "retrieve"):
+            return context
+
+        vips = FirewallVip.objects.all()
+        if device_id := self.request.query_params.get("device"):
+            vips = vips.filter(device_id=device_id)
+        context["vip_index"] = {
+            (v.device_id, v.vdom, v.name): {
+                "id": v.pk, "name": v.name, "endpoint_text": v.endpoint_text,
+                "ext_ip": v.ext_ip, "ext_port_text": v.ext_port_text,
+                "mapped_ip": v.mapped_ip, "mapped_port_text": v.mapped_port_text,
+                "protocol": v.protocol, "vip_type": v.vip_type,
+                "whole_host": v.whole_host,
+            }
+            for v in vips.only(
+                "id", "device_id", "vdom", "name", "ext_ip", "ext_port",
+                "mapped_ip", "mapped_port", "protocol", "port_forward", "vip_type",
+            )
+        }
+        return context
 
     @action(detail=False, methods=["get"])
     def audit(self, request):

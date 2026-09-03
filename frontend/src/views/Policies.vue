@@ -8,7 +8,7 @@ import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
 import { api, errText } from '@/api'
-import type { PolicyAudit, PolicyRow, PolicySummaryRow } from '@/api'
+import type { PolicyAudit, PolicyRow, PolicySummaryRow, VipRow, VipSummary } from '@/api'
 import { useMetaStore } from '@/stores/meta'
 import { ago, bytes, dateTimeOf, int } from '@/composables/useFormat'
 import { STATE } from '@/theme'
@@ -63,6 +63,15 @@ const auditOpen = ref(false)
 // 审计里点某条规则 → 把它筛到表格里
 const permissiveOnly = ref(false)
 const noLogOnly = ref(false)
+
+// 映射(firewall vip)。和策略同一次同步拿回来,所以不需要单独的刷新按钮
+const vips = ref<VipRow[]>([])
+const vipsLoading = ref(false)
+const vipSummary = ref<VipSummary | null>(null)
+const vipsOpen = ref(false)
+const vipKeyword = ref('')
+const wholeHostOnly = ref(false)
+const unusedOnly = ref(false)
 
 const current = computed(() => summary.value.find((s) => s.device_id === selected.value) || null)
 const totals = computed(() => {
@@ -138,11 +147,43 @@ async function loadAudit() {
   }
 }
 
+async function loadVips() {
+  if (selected.value === null) { vips.value = []; vipSummary.value = null; return }
+  vipsLoading.value = true
+  try {
+    // 映射通常几十到几百条,一次取完在前端筛 —— 这一页要的是"扫一眼全部",
+    // 分页会让"有没有整机映射"这个问题要翻好几页才答得出来
+    const [list, sum] = await Promise.all([
+      api.vips({ device: selected.value, page_size: 500, ordering: 'name' }),
+      api.vipSummary(selected.value),
+    ])
+    vips.value = list.data.results
+    vipSummary.value = sum.data
+  } catch (e) {
+    message.error(errText(e))
+  } finally {
+    vipsLoading.value = false
+  }
+}
+
+/** 前端筛选。**未被引用**只在 used_by 不是 null 时才筛得动 —— null 是"没查" */
+const shownVips = computed(() => {
+  const kw = vipKeyword.value.trim().toLowerCase()
+  return vips.value.filter((v) => {
+    if (wholeHostOnly.value && !v.whole_host) return false
+    if (unusedOnly.value && (v.used_by === null || v.used_by.length)) return false
+    if (!kw) return true
+    return [v.name, v.ext_ip, v.mapped_ip, v.comment, v.endpoint_text]
+      .some((t) => (t || '').toLowerCase().includes(kw))
+  })
+})
+
 onMounted(async () => {
   await meta.load()
   await loadSummary()
   await loadPolicies()
   await loadAudit()
+  await loadVips()
 })
 
 // 换设备/换筛选都回到第一页 —— 停在第 7 页看另一台设备是没有意义的
@@ -152,7 +193,7 @@ watch([selected, keyword, actionFilter, enabledFilter, neverHitOnly,
   void loadPolicies()
 })
 // 换设备要重算审计 —— 审计是按设备算的(影子规则要看那台设备的完整顺序)
-watch(selected, () => void loadAudit())
+watch(selected, () => { void loadAudit(); void loadVips() })
 watch([page, pageSize], () => void loadPolicies())
 
 async function syncNow(deviceId: number) {
@@ -292,8 +333,32 @@ const policyColumns: DataTableColumns<PolicyRow> = [
     ]) },
   { title: '源', key: 'src', minWidth: 130,
     render: (r) => h('div', [listCell(r.src_intf, 'any'), listCell(r.src_addr, 'any')]) },
-  { title: '目的', key: 'dst', minWidth: 130,
-    render: (r) => h('div', [listCell(r.dst_intf, 'any'), listCell(r.dst_addr, 'any')]) },
+  { title: '目的', key: 'dst', minWidth: 178,
+    render: (r) => h('div', [
+      listCell(r.dst_intf, 'any'),
+      listCell(r.dst_addr, 'any'),
+      // **映射**。策略的目的地址里只有一个 `web-vip` 这样的名字,它指向内网
+      // 哪台机器的哪个端口完全不在策略表里 —— 这一行就是答案。
+      // mappings 为 null 是"这次没查映射表",空数组是"目的地址里没有映射",
+      // 两者都不画,但含义不同(前端不该把它们说成同一件事,所以只在
+      // 有内容时才渲染)
+      ...(r.mappings || []).map((m) => h('div', {
+        class: 'map-line',
+        title: `映射 ${m.name}:${m.endpoint_text}`,
+      }, [
+        h('span', { class: 'map-arrow' }, '↳'),
+        h('span', { class: 'map-text' }, m.endpoint_text),
+        // 整机映射:外网地址的所有端口都通到那台机器上。它和一条只映射
+        // 443 的规则在列表里长得几乎一样,不标出来看不见
+        m.whole_host
+          ? h(NTag, {
+              size: 'tiny', bordered: false,
+              style: `color:${STATE.degraded};border:1px solid ${STATE.degraded};margin-left:4px`,
+              title: '整机映射 —— 外网地址的所有端口都通到内网那台机器上,暴露面比端口映射大得多',
+            }, () => '整机')
+          : null,
+      ])),
+    ]) },
   { title: '服务', key: 'service', minWidth: 104,
     render: (r) => listCell(r.service, 'ALL') },
   { title: '动作', key: 'action', width: 76,
@@ -362,6 +427,65 @@ const policyColumns: DataTableColumns<PolicyRow> = [
   { title: '', key: 'act', width: 62, fixed: 'right',
     render: (r) => h(NButton, { size: 'tiny', text: true, type: 'primary',
       onClick: () => openDetail(r) }, () => '详情') },
+]
+
+const vipColumns: DataTableColumns<VipRow> = [
+  { title: '名称', key: 'name', minWidth: 130,
+    render: (r) => h('div', [
+      h('div', { style: "font-size:11.5px;color:var(--cy-ink);font-family:'JetBrains Mono',monospace" },
+        r.name),
+      r.comment
+        ? h('div', { style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.4' }, r.comment)
+        : null,
+    ]) },
+  { title: '外面看到的', key: 'ext', minWidth: 176,
+    render: (r) => h('div', [
+      h('div', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink)" },
+        `${r.protocol ? r.protocol.toLowerCase() + '/' : ''}${r.ext_ip || '?'}:${r.ext_port_text}`),
+      h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
+        r.ext_intf.length ? r.ext_intf.join(', ') : 'any'),
+    ]) },
+  { title: '进到哪里', key: 'mapped', minWidth: 176,
+    render: (r) => h('div', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-cyan)" },
+      // 负载均衡型没有 mappedip(后端在 realservers 里,是一组机器)——
+      // 后端已经把这句话拼进 endpoint_text 了,这里取箭头右边那半
+      r.endpoint_text.split(' → ')[1] || '?') },
+  { title: '类型', key: 'vip_type', width: 96,
+    render: (r) => h('div', [
+      h('div', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.vip_type_label),
+      // 整机映射是这张表里唯一值得标出来的风险:它把那台机器的**每一个**
+      // 监听端口都暴露到了外面,而在列表里它和一条只映射 443 的规则
+      // 长得几乎一样
+      r.whole_host
+        ? h(NTag, {
+            size: 'tiny', bordered: false,
+            style: `color:${STATE.degraded};border:1px solid ${STATE.degraded}`,
+            title: '外网地址的所有端口都通到内网那台机器上 —— 该收窄成端口映射',
+          }, () => '整机映射')
+        : h('span', { style: 'font-size:10px;color:var(--cy-ink-3)' }, '端口映射'),
+    ]) },
+  { title: '被哪些策略引用', key: 'used_by', minWidth: 168,
+    render: (r) => {
+      // 三态,和「命中计数」同一条规矩:
+      //   null  = 这次没查引用关系 → 「未知」
+      //   []    = 确实没有策略引用 → **这条映射不生效**,可以清理
+      //   [...] = 列出来
+      if (r.used_by === null) {
+        return h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '未知')
+      }
+      if (!r.used_by.length) {
+        return h('span', {
+          style: `font-size:11px;color:${STATE.degraded};font-weight:700`,
+          title: '没有任何策略的目的地址引用它 —— 配了但不生效,可以清理',
+        }, '没有策略引用')
+      }
+      return h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap' },
+        r.used_by.slice(0, 6).map((u) => h(NTag, {
+          size: 'tiny', bordered: false,
+          style: u.enabled ? '' : `color:${STATE.degraded};opacity:.8`,
+          title: `#${u.seq + 1} ${u.name || '(未命名)'}${u.enabled ? '' : '(已停用)'}`,
+        }, () => `#${u.policy_id}`)))
+    } },
 ]
 
 const actionOptions = computed(() => [
@@ -568,6 +692,78 @@ const FINDING_COLORS: Record<string, string> = {
       </div>
     </CyberPanel>
 
+    <!-- ============ 映射(firewall vip) ============ -->
+    <CyberPanel title="映射" :subtitle="`外面的地址端口进到内网哪台机器 · ${vips.length} 条`">
+      <template #actions>
+        <NButton size="tiny" ghost @click="vipsOpen = !vipsOpen">
+          {{ vipsOpen ? '收起' : '展开' }}
+        </NButton>
+      </template>
+
+      <!-- 收起时也要给出那两个数 —— 它们是这张表存在的理由,
+           藏在折叠里等于没有 -->
+      <div class="vip-head">
+        <div class="vip-tiles">
+          <StatTile label="映射总数" :value="vipSummary?.total ?? vips.length" unit="条"
+                    :dim-zero="false" />
+          <StatTile
+            label="整机映射" :value="vipSummary?.whole_host.count ?? 0" unit="条"
+            :color="STATE.degraded"
+            foot="所有端口都通进去 —— 该收窄成端口映射"
+          />
+          <StatTile
+            label="没有策略引用" :value="vipSummary?.unused.count ?? 0" unit="条"
+            :color="STATE.degraded"
+            foot="配了但不生效,可以清理"
+          />
+        </div>
+        <div class="vip-notes">
+          <div v-if="(vipSummary?.whole_host.count ?? 0) > 0" class="vip-note warn">
+            <b>{{ vipSummary?.whole_host.count }} 条整机映射</b> ——
+            外网地址的<b>所有端口</b>都通到内网那台机器上,暴露面比端口映射大得多。
+            列表里它和一条只映射 443 的规则长得几乎一样,所以这里单独标出来。
+          </div>
+          <div v-if="(vipSummary?.unused.count ?? 0) > 0" class="vip-note">
+            <b>{{ vipSummary?.unused.count }} 条没有任何策略引用</b> ——
+            配了但不生效,可以清理。
+          </div>
+          <!-- **"没同步到映射"和"这台没有映射"是两件事。**我们分不出是真没有
+               还是没拉到(SSH 的 show 没跑成 / API 权限不够),所以只说前者 -->
+          <div v-if="!vips.length && !vipsLoading" class="vip-note">
+            这台防火墙<b>没有同步到映射</b>。这不等于"它没有配映射" ——
+            SSH 通道的 <code>show firewall vip</code> 可能没跑成,API 通道可能权限不够。
+            要确认得登上去看一眼。
+          </div>
+        </div>
+      </div>
+
+      <template v-if="vipsOpen">
+        <div class="filters">
+          <NInput
+            v-model:value="vipKeyword" size="small" clearable
+            placeholder="搜名称 / 外部地址 / 内部地址 / 备注" style="width: 260px"
+          />
+          <label class="never-toggle">
+            <NSwitch v-model:value="wholeHostOnly" size="small" />
+            <span>只看整机映射</span>
+          </label>
+          <label class="never-toggle">
+            <NSwitch v-model:value="unusedOnly" size="small" />
+            <span>只看没有策略引用的</span>
+          </label>
+        </div>
+
+        <NDataTable
+          :columns="vipColumns" :data="shownVips" :loading="vipsLoading"
+          size="small" :bordered="false" :single-line="false" :scroll-x="800"
+          :pagination="{ pageSize: 20 }"
+        />
+        <div v-if="!shownVips.length && !vipsLoading" class="cy-empty">
+          没有匹配的映射。
+        </div>
+      </template>
+    </CyberPanel>
+
     <!-- ============ 详情 ============ -->
     <NModal
       v-model:show="detailOpen" preset="card" :bordered="false"
@@ -586,6 +782,22 @@ const FINDING_COLORS: Record<string, string> = {
           <div class="kv"><span>目的接口</span><b class="cy-mono">{{ detail.dst_intf.join(', ') || 'any' }}</b></div>
           <div class="kv full"><span>源地址</span><b class="cy-mono">{{ detail.src_addr.join(', ') || 'any' }}</b></div>
           <div class="kv full"><span>目的地址</span><b class="cy-mono">{{ detail.dst_addr.join(', ') || 'any' }}</b></div>
+          <!-- 映射:目的地址里的名字实际指向哪里。null 是"没查",空是"没有映射" -->
+          <div v-if="detail.mappings === null" class="kv full">
+            <span>映射</span><b class="dim">这次没有查映射表</b>
+          </div>
+          <div v-else-if="detail.mappings.length" class="kv full">
+            <span>映射</span>
+            <b class="cy-mono">
+              <div v-for="m in detail.mappings" :key="m.id" class="map-detail">
+                {{ m.name }} · {{ m.endpoint_text }}
+                <NTag
+                  v-if="m.whole_host" size="tiny" :bordered="false"
+                  :style="`color:${STATE.degraded};border:1px solid ${STATE.degraded}`"
+                >整机映射</NTag>
+              </div>
+            </b>
+          </div>
           <div class="kv full"><span>服务</span><b class="cy-mono">{{ detail.service.join(', ') || 'ALL' }}</b></div>
           <div class="kv"><span>命中次数</span><b class="cy-mono">
             {{ detail.hit_count === null ? '未知(SSH 通道无统计)' : int(detail.hit_count) }}
@@ -624,6 +836,47 @@ const FINDING_COLORS: Record<string, string> = {
 </template>
 
 <style scoped>
+/* 映射那一行 —— 缩进 + 箭头,让人一眼看出它是挂在目的地址下面的解释,
+   不是又一个并列的地址 */
+.map-line {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--cy-cyan);
+  font-family: 'JetBrains Mono', monospace;
+}
+.map-arrow { color: var(--cy-ink-3); }
+.map-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-detail { display: flex; align-items: center; gap: 6px; line-height: 1.7; }
+
+.vip-head { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
+.vip-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.vip-notes { display: flex; flex-direction: column; gap: 6px; }
+.vip-note {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--cy-ink-2);
+  padding: 5px 10px;
+  border-left: 2px solid var(--cy-line);
+  background: rgba(var(--cy-raised-rgb), 0.5);
+}
+.vip-note.warn {
+  color: var(--cy-degraded);
+  border-left-color: var(--cy-degraded);
+  background: rgba(var(--cy-degraded-rgb), 0.06);
+}
+.vip-note code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  color: var(--cy-cyan);
+}
+
 .pol { display: flex; flex-direction: column; gap: 14px; }
 .tiles {
   display: grid;

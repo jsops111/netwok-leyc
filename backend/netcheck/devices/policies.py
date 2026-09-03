@@ -43,8 +43,10 @@ from netcheck.models import (
     Device,
     DeviceKind,
     FirewallPolicy,
+    FirewallVip,
     PolicyAction,
     Vendor,
+    VipType,
 )
 
 from . import fortigate_api, ssh_cli
@@ -273,6 +275,201 @@ def parse_show_firewall_policy(text: str) -> list[dict]:
     return out
 
 
+# =========================================================================
+# 映射(firewall vip)
+# =========================================================================
+#
+# 策略表回答"允不允许",映射表回答"外面的 1.2.3.4:443 到底进到哪台机器"。
+# 后者完全不在策略表里 —— 策略的 dstaddr 里只有一个 VIP 的**名字**。
+# 没有这张表的话页面上就是 `web-vip` 这么一个字符串,而它指向哪里
+# 只有登上设备才知道。
+
+# `edit "web-vip"` —— 策略是 `edit 3`(数字),VIP 是带引号的名字
+_RE_EDIT_NAME = re.compile(r'^\s*edit\s+"?([^"\n]+?)"?\s*$')
+
+# FortiOS 里 VIP 的 type。认不出的落到 other,**不猜成 static-nat** ——
+# 把一条负载均衡 VIP 显示成"1.2.3.4:443 → 10.0.0.5:443"会让人以为
+# 后面只有一台机器
+_VIP_TYPES = {
+    "static-nat": VipType.STATIC_NAT,
+    "server-load-balance": VipType.LOAD_BALANCE,
+    "dns-translation": VipType.DNS_TRANSLATION,
+    "fqdn": VipType.FQDN,
+}
+
+
+def normalize_vip_type(raw: str) -> str:
+    return _VIP_TYPES.get(str(raw or "").strip().lower(), VipType.OTHER)
+
+
+def _mapped_ip_text(value) -> str:
+    """
+    `mappedip` 的形状在版本之间不一样,三种都要认:
+
+        "10.0.0.5"                              老版本 / show 输出
+        [{"range": "10.0.0.5"}]                 6.x 以后的 cmdb
+        [{"range": "10.0.0.5-10.0.0.9"}, ...]   一条 VIP 映到一段地址
+
+    **只认一种的话升级固件后这一列会变成空的**,而空的目标地址在页面上
+    看着像"这条映射没配好"——而它其实好好地在把外网流量放进内网。
+    """
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return str(value.get("range") or value.get("name") or value.get("q_origin_key") or "").strip()
+    if isinstance(value, list):
+        parts = [_mapped_ip_text(v) for v in value]
+        return ", ".join(p for p in parts if p)
+    return str(value)
+
+
+def _ext_ip_text(value) -> str:
+    """`extip` 同样可能是字符串或列表(一段范围)。"""
+    return _mapped_ip_text(value)
+
+
+def _vips_from_api(device: Device) -> list[dict]:
+    """API 通道的映射。**拿不到就是空列表**,不让它把策略同步拖失败。"""
+
+    out: list[dict] = []
+    for seq, item in enumerate(fortigate_api.fetch_vips(device)):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        port_forward = str(item.get("portforward") or "disable").lower() == "enable"
+        out.append({
+            "name": name[:128],
+            "seq": seq,
+            "vip_type": normalize_vip_type(item.get("type")),
+            "ext_intf": fortigate_api._as_names(item.get("extintf")),
+            "ext_ip": _ext_ip_text(item.get("extip"))[:128],
+            # **端口只在 portforward 开着时才有意义。**关着时设备上这两个
+            # 字段可能残留着上次的值,原样存下来会在页面上显示成一条
+            # "只映射 443 的规则",而它实际上是整机映射 —— 暴露面差很多
+            "ext_port": (str(item.get("extport") or "")[:64] if port_forward else ""),
+            "mapped_ip": _mapped_ip_text(item.get("mappedip"))[:256],
+            "mapped_port": (str(item.get("mappedport") or "")[:64] if port_forward else ""),
+            "protocol": (str(item.get("protocol") or "")[:12] if port_forward else ""),
+            "port_forward": port_forward,
+            "comment": str(item.get("comment") or "")[:255],
+            "uuid": str(item.get("uuid") or "")[:64],
+            "raw": item,
+        })
+    return out
+
+
+def parse_show_firewall_vip(text: str) -> list[dict]:
+    """
+    解析 FortiOS `show firewall vip`。
+
+    和策略那个解析器同一条规矩:**默认值不会出现在输出里**。
+
+        没有 `set portforward enable`  → 关,也就是**整机 1:1 映射**
+        没有 `set protocol ...`        → tcp(但只在 portforward 开着时有意义)
+        没有 `set type ...`            → static-nat
+
+    最容易搞错的是第一条:没有 portforward 那一行时**不能**把
+    `extport` / `mappedport` 当成"没解析到"而留空再显示成端口未知 ——
+    它是"所有端口都进去",那是这张表里暴露面最大的一种,必须看得出来。
+    """
+
+    out: list[dict] = []
+    current: dict | None = None
+    seq = 0
+
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if m := _RE_EDIT_NAME.match(line):
+            name = m.group(1).strip()
+            # `config firewall vip` 这种行也会被 edit 正则漏进来?不会 ——
+            # 但空名字要挡掉,否则会造出一条名字为空、什么都指不到的映射
+            if not name:
+                continue
+            current = {
+                "name": name[:128], "seq": seq,
+                # 默认值在这里给全,后面只覆盖 show 里出现的项
+                "vip_type": VipType.STATIC_NAT, "ext_intf": [], "ext_ip": "",
+                "ext_port": "", "mapped_ip": "", "mapped_port": "", "protocol": "",
+                "port_forward": False, "comment": "", "uuid": "",
+                "raw": {"_channel": "ssh"},
+            }
+            seq += 1
+            continue
+
+        if _RE_NEXT.match(line) and current is not None:
+            # portforward 关着 = 整机映射,端口字段没有意义。设备上偶尔会
+            # 残留 extport(改配置时留下的),原样存会显示成端口映射
+            if not current["port_forward"]:
+                current["ext_port"] = current["mapped_port"] = current["protocol"] = ""
+            out.append(current)
+            current = None
+            continue
+
+        if current is None:
+            continue
+
+        m = _RE_SET.match(line)
+        if not m:
+            continue
+        key, raw_value = m.group(1).lower(), m.group(2).strip()
+        values = _split_values(raw_value)
+        one = values[0] if values else ""
+        current["raw"][key] = raw_value
+
+        if key == "type":
+            current["vip_type"] = normalize_vip_type(one)
+        elif key == "extintf":
+            current["ext_intf"] = values
+        elif key == "extip":
+            current["ext_ip"] = raw_value.strip('"')[:128]
+        elif key == "extport":
+            current["ext_port"] = raw_value.strip('"')[:64]
+        elif key == "mappedip":
+            # `set mappedip "10.0.0.5"` 或 `set mappedip 10.0.0.5 10.0.0.6`
+            current["mapped_ip"] = ", ".join(values)[:256] if values else raw_value[:256]
+        elif key == "mappedport":
+            current["mapped_port"] = raw_value.strip('"')[:64]
+        elif key == "protocol":
+            current["protocol"] = one[:12]
+        elif key == "portforward":
+            current["port_forward"] = one.lower() == "enable"
+        elif key == "comment":
+            current["comment"] = raw_value.strip('"')[:255]
+        elif key == "uuid":
+            current["uuid"] = one[:64]
+
+    if current is not None:
+        # 和策略那边一样:半条映射(比如缺了 mappedip)在页面上看着像
+        # "映射到空",而那是个会让人下错结论的显示
+        log.warning("映射输出在 edit %s 处结束但没有 next,该条被丢弃(输出被截断?)",
+                    current["name"])
+    return out
+
+
+def _vips_from_ssh(device: Device) -> list[dict]:
+    """
+    SSH 通道的映射。**失败只记日志、返回空**,不抛 ——
+    策略已经拿到了,不该因为映射没拿到而把整批策略一起丢掉。
+    """
+
+    profile = get_profile(device.model, device.vendor)
+    if not profile.vip_cli:
+        return []
+    client = ssh_cli._connect(device)
+    try:
+        raw = ssh_cli._run_exec(client, profile.vip_cli, timeout=120.0)
+    except ssh_cli.SshError as exc:
+        log.info("设备 %s 映射同步失败(%s),这次只更新策略", device.name, exc)
+        return []
+    finally:
+        client.close()
+    return parse_show_firewall_vip(raw)
+
+
 def _from_ssh(device: Device) -> list[dict]:
     profile = get_profile(device.model, device.vendor)
     if not profile.policy_cli:
@@ -321,6 +518,7 @@ def sync_policies(device: Device) -> dict:
         )
 
     rows: list[dict] = []
+    vips: list[dict] = []
     method = ""
     api_error = ""
 
@@ -328,6 +526,10 @@ def sync_policies(device: Device) -> dict:
         try:
             rows = _from_api(device)
             method = "api"
+            # 映射和策略走同一条通道、同一次同步 —— 两边不同步的话页面上会
+            # 出现"策略引用了一个不存在的映射"或者反过来,而那看起来像
+            # 设备上配错了。**映射拿不到不算失败**,策略照常写
+            vips = _vips_from_api(device)
         except PolicyError as exc:
             api_error = str(exc)
             log.info("设备 %s API 策略同步失败(%s),尝试 SSH", device.name, api_error)
@@ -336,6 +538,7 @@ def sync_policies(device: Device) -> dict:
         try:
             rows = _from_ssh(device)
             method = "ssh"
+            vips = _vips_from_ssh(device)
         except PolicyError as exc:
             # 两条都失败时,把 API 的错也带出来 —— 只报 SSH 的错会让人
             # 去修一条自己根本没打算用的通道
@@ -363,6 +566,17 @@ def sync_policies(device: Device) -> dict:
             for row in rows
         ], batch_size=500)
 
+        # 映射同样是全量替换,而且**和策略在同一个事务里** —— 分两个事务的话
+        # 中间那一刻页面上会看到"策略引用了一个不存在的映射",看起来像
+        # 设备上配错了。设备上删掉的映射也必须在这边消失,理由和策略一样:
+        # 留着一条现实中不存在的映射,有人会照着它判断"这个端口是通的"
+        FirewallVip.objects.filter(device=device, vdom=vdom).delete()
+        if vips:
+            FirewallVip.objects.bulk_create([
+                FirewallVip(device=device, vdom=vdom, synced_at=now, method=method, **vip)
+                for vip in vips
+            ], batch_size=500)
+
     device.policy_count = FirewallPolicy.objects.filter(device=device).count()
     device.last_policy_sync_at = now
     device.last_policy_error = ""
@@ -373,6 +587,10 @@ def sync_policies(device: Device) -> dict:
     return {
         "method": method,
         "total": len(rows),
+        "vips": len(vips),
+        # 整机映射的条数单独报 —— 它是这批数据里暴露面最大的那种,
+        # 而在列表里它和一条只映射 443 的规则长得几乎一样
+        "vips_whole_host": sum(1 for v in vips if not v.get("port_forward")),
         "vdom": vdom,
         "has_hit_stats": with_hits > 0,
         "never_hit": never_hit if with_hits else None,

@@ -24,6 +24,7 @@ from netcheck.models import (
     DeviceSample,
     Event,
     FirewallPolicy,
+    FirewallVip,
     InterfaceSample,
     Notifier,
     NotifierKind,
@@ -591,6 +592,8 @@ class FirewallPolicySerializer(serializers.ModelSerializer):
     # 规则审计:过宽 / 不记日志。只对"启用且放行"的规则判(见 models.py)
     permissive_level = serializers.CharField(read_only=True)
     logging_off = serializers.BooleanField(read_only=True)
+    # 这条策略的目的地址里引用到的**映射**。见 get_mappings()
+    mappings = serializers.SerializerMethodField()
 
     class Meta:
         model = FirewallPolicy
@@ -600,10 +603,36 @@ class FirewallPolicySerializer(serializers.ModelSerializer):
             "action", "action_label", "enabled", "nat", "log_traffic", "comments", "uuid",
             "hit_count", "bytes_count", "packets", "sessions",
             "first_hit_at", "last_hit_at", "never_hit",
-            "permissive_level", "logging_off",
+            "permissive_level", "logging_off", "mappings",
             "synced_at", "method",
         ]
         read_only_fields = fields
+
+    def get_mappings(self, obj) -> list:
+        """
+        目的地址里那几个名字,哪些其实是**映射**(VIP)。
+
+        这是「网络策略那里能不能显示映射」的答案所在:一条入站策略的
+        `dst_addr` 里只有 `web-vip` 这么一个名字,**它指向内网哪台机器的
+        哪个端口完全不在策略表里**。这里把同一次同步拿回来的映射表按名字
+        接上去,页面上那一列才能直接显示 `1.2.3.4:443 → 10.0.0.5:8443`。
+
+        **名字精确比较,不做子串匹配** —— 和 `_is_any()` 那条同一个道理:
+        `web-vip-old` 和 `web-vip` 是两条不同的规则,模糊匹配会把一条
+        已经停用的旧映射显示到在用的策略上。
+
+        索引拿不到时回 **None(不是空列表)**:空列表的含义是"这条策略的
+        目的地址里没有映射",而 None 是"这次没查映射表"。
+        """
+        index = self.context.get("vip_index")
+        if index is None:
+            return None
+        out = []
+        for name in (obj.dst_addr or []):
+            vip = index.get((obj.device_id, obj.vdom, str(name)))
+            if vip is not None:
+                out.append(vip)
+        return out
 
 
 class FirewallPolicyDetailSerializer(FirewallPolicySerializer):
@@ -612,6 +641,51 @@ class FirewallPolicyDetailSerializer(FirewallPolicySerializer):
     class Meta(FirewallPolicySerializer.Meta):
         fields = FirewallPolicySerializer.Meta.fields + ["raw"]
         read_only_fields = fields
+
+
+class FirewallVipSerializer(serializers.ModelSerializer):
+    """
+    一条映射。
+
+    `*_text` 那三个是**模型属性**,不是数据库列 —— 端口为空时它们说
+    「所有端口」而不是留白。这一步刻意放在后端:前端各自判一遍空字符串
+    的话,总有一处会把整机映射渲染成一个空格子,而那看着像"没配好"。
+    """
+
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    vip_type_label = serializers.CharField(source="get_vip_type_display", read_only=True)
+    ext_port_text = serializers.CharField(read_only=True)
+    mapped_port_text = serializers.CharField(read_only=True)
+    endpoint_text = serializers.CharField(read_only=True)
+    whole_host = serializers.BooleanField(read_only=True)
+    # 引用这条映射的策略。**一条没有任何策略引用的映射是不生效的** ——
+    # 和"从未命中"同一类结论:它能直接拿去清理,所以值得单独回一个字段。
+    # 由视图注入(序列化器里拿不到整台设备的策略表)
+    used_by = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FirewallVip
+        fields = [
+            "id", "device", "device_name", "vdom", "name", "seq",
+            "vip_type", "vip_type_label", "ext_intf", "ext_ip", "ext_port", "ext_port_text",
+            "mapped_ip", "mapped_port", "mapped_port_text", "protocol", "port_forward",
+            "endpoint_text", "whole_host", "comment", "uuid", "used_by",
+            "synced_at", "method",
+        ]
+        read_only_fields = fields
+
+    def get_used_by(self, obj) -> list:
+        """
+        [{policy_id, name, enabled, action}]。
+
+        **拿不到引用关系时回 None 而不是空列表** —— 空列表的含义是
+        "确实没有策略引用它"(可以清理),而 None 是"这次没查"。
+        两者混成一个空列表会让人去删一条正在生效的映射。
+        """
+        index = self.context.get("vip_usage")
+        if index is None:
+            return None
+        return index.get((obj.device_id, obj.vdom, obj.name), [])
 
 
 # =========================================================================

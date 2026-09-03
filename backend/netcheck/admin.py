@@ -14,6 +14,7 @@ from netcheck.models import (
     DeviceNeighbor,
     Event,
     FirewallPolicy,
+    FirewallVip,
     Notifier,
     NotifyLog,
     ProbeGroup,
@@ -123,6 +124,17 @@ class FirewallPolicyAdmin(admin.ModelAdmin):
                     "enabled", "nat", "hit_count", "synced_at")
     list_filter = ("device", "vdom", "action", "enabled", "method")
     search_fields = ("name", "comments")
+
+
+@admin.register(FirewallVip)
+class FirewallVipAdmin(admin.ModelAdmin):
+    # endpoint_text 是模型属性,列表里显示它而不是分散的四列 ——
+    # `1.2.3.4:443 → 10.0.0.5:8443` 一眼能读,而且端口为空时它说
+    # 「所有端口」而不是留白
+    list_display = ("device", "vdom", "name", "endpoint_text", "vip_type",
+                    "port_forward", "synced_at")
+    list_filter = ("device", "vdom", "vip_type", "port_forward", "method")
+    search_fields = ("name", "comment", "ext_ip", "mapped_ip")
 
 
 @admin.register(DeviceNeighbor)

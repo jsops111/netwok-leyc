@@ -450,9 +450,92 @@ export interface PolicyRow {
   permissive_level: string
   /** 放行但不记日志 —— 出事之后查不出来源 */
   logging_off: boolean
+  /**
+   * 目的地址里那几个名字中,哪些其实是**映射**(VIP)。
+   *
+   * 策略表里 `dst_addr` 只有一个 `web-vip` 这样的名字,**它指向内网哪台机器
+   * 的哪个端口完全不在策略表里** —— 这个字段就是把同一次同步拿回来的映射表
+   * 接上去的结果。
+   *
+   * ⚠ `null` 是「这次没查映射表」,`[]` 是「目的地址里没有映射」。
+   * 混成一个空数组会让人以为这条策略直接指向一个真实地址。
+   */
+  mappings: PolicyMapping[] | null
   synced_at: string
   method: string
   raw?: Record<string, any>
+}
+
+/** 策略的目的地址上接出来的一条映射,字段是 VipRow 的子集 */
+export interface PolicyMapping {
+  id: number
+  name: string
+  /** `tcp/1.2.3.4:443 → 10.0.0.5:8443` —— 端口为空时说「所有端口」,由后端拼好 */
+  endpoint_text: string
+  ext_ip: string
+  ext_port_text: string
+  mapped_ip: string
+  mapped_port_text: string
+  protocol: string
+  vip_type: string
+  /** 整机映射:外网地址的**所有端口**都通到内网那台机器上 */
+  whole_host: boolean
+}
+
+export interface VipRow {
+  id: number
+  device: number
+  device_name: string
+  vdom: string
+  name: string
+  seq: number
+  vip_type: string
+  vip_type_label: string
+  ext_intf: string[]
+  ext_ip: string
+  ext_port: string
+  /** 端口为空时是「所有端口」而不是空串 —— 后端算好,前端不要再判一遍 */
+  ext_port_text: string
+  mapped_ip: string
+  mapped_port: string
+  mapped_port_text: string
+  protocol: string
+  port_forward: boolean
+  endpoint_text: string
+  whole_host: boolean
+  comment: string
+  uuid: string
+  /**
+   * 引用这条映射的策略。**空数组 = 没有策略引用它 = 这条映射不生效**(可以清理);
+   * `null` = 这次没查引用关系。两者不能混 —— 后者拿去删规则会删掉在用的。
+   */
+  used_by: Array<{
+    id: number; policy_id: number; seq: number
+    name: string; enabled: boolean; action: string
+  }> | null
+  synced_at: string
+  method: string
+}
+
+export interface VipSummary {
+  generated_at: string
+  total: number
+  whole_host: { count: number; hint: string; items: VipBrief[] }
+  unused: { count: number; hint: string; items: VipBrief[] }
+  /** 这批数据里一条映射都没有的防火墙。**不等于"这几台没有映射"** —— 见后端注释 */
+  devices_without_vips: string[]
+}
+
+export interface VipBrief {
+  id: number
+  device_id: number
+  device_name: string
+  vdom: string
+  name: string
+  endpoint_text: string
+  vip_type: string
+  whole_host: boolean
+  comment: string
 }
 
 export interface PolicySummaryRow {
@@ -1016,6 +1099,11 @@ export const api = {
   syncPoliciesNow: (id: number) => http.post<{ detail: string }>(`/devices/${id}/sync_policies_now/`),
   policyAudit: (deviceId?: number) =>
     http.get<PolicyAudit>('/firewall-policies/audit/', { params: { device: deviceId } }),
+
+  // 映射(firewall vip)—— 和策略同一次同步拿回来的
+  vips: (params?: object) => http.get<Paged<VipRow>>('/firewall-vips/', { params }),
+  vipSummary: (deviceId?: number) =>
+    http.get<VipSummary>('/firewall-vips/summary/', { params: { device: deviceId } }),
   /** CSV 导出走普通链接,不经过 axios —— 同 backupDownloadUrl 的理由 */
   policyExportUrl: (params: Record<string, any> = {}) => {
     const q = new URLSearchParams()

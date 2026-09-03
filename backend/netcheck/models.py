@@ -1402,6 +1402,152 @@ class FirewallPolicy(models.Model):
 
 
 # =========================================================================
+# 防火墙映射 / VIP(只读快照)
+# =========================================================================
+
+
+class VipType(models.TextChoices):
+    """
+    映射的种类。**认不出的落到 OTHER,不猜成端口映射** —— 和策略动作
+    那条同一个道理:把一条负载均衡 VIP 显示成"1.2.3.4:443 → 10.0.0.5:443"
+    会让人以为后面只有一台机器。
+    """
+
+    STATIC_NAT = "static-nat", "静态 NAT"
+    LOAD_BALANCE = "server-load-balance", "负载均衡"
+    DNS_TRANSLATION = "dns-translation", "DNS 转换"
+    FQDN = "fqdn", "FQDN"
+    OTHER = "other", "其它"
+
+
+class FirewallVip(models.Model):
+    """
+    一条**映射**(FortiOS 的 firewall vip:目的 NAT / 端口映射 / 静态 NAT)。
+
+    和 `FirewallPolicy` 同一个定位:**只读快照、全量替换**,同一次
+    `sync_policies()` 里一起拉、一起换。分成两张表而不是往策略上加几列,
+    是因为**两者是多对多**:一条策略的 `dstaddr` 里可以写好几个 VIP,
+    一个 VIP 也可以被好几条策略引用。塞进策略行里的话,一个 VIP 改一次
+    要去改 N 行,而漏掉一行的表现是页面上两条策略对同一个 VIP 显示不同的
+    目标地址 —— 看不出哪个是对的。
+
+    ## 为什么这张表值得单独存在
+
+    `FirewallPolicy.nat` 只是个布尔,它说的是**源 NAT**(出去的时候换成
+    出口地址)。而人在页面上问"映射"时问的几乎总是另一件事:
+    **外面的 1.2.3.4:443 到底进到内网哪台机器的哪个端口**。那个答案完全
+    不在策略表里 —— 策略的 `dstaddr` 只有一个 VIP 的**名字**,
+    没有这张表的话页面上就是一个 `web-vip` 这样的字符串,
+    而它指向哪里只有登上设备才知道。
+
+    ## 端口为空 = 所有端口,不是"没配"
+
+    `portforward` 关着时这是一条 **1:1 的整机映射**,外网地址的**所有端口**
+    都落到内网那台机器上。这时 `ext_port` / `mapped_port` 在设备上根本不存在,
+    存成空字符串,页面上要显示「所有端口」——
+    **显示成空白或者 0 是错的**:前者看着像"没配好",后者是一个具体的端口号。
+    一条整机映射的暴露面比一条端口映射大得多,这个区别必须看得见。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="vips", verbose_name="设备"
+    )
+    vdom = models.CharField("VDOM", max_length=64, blank=True, default="root")
+    name = models.CharField("名称", max_length=128, help_text="策略的目的地址里引用的就是这个名字")
+    seq = models.IntegerField("顺序", default=0)
+
+    vip_type = models.CharField(
+        "类型", max_length=24, choices=VipType.choices, default=VipType.STATIC_NAT
+    )
+    # ---- 外面看到的 ----
+    ext_intf = models.JSONField("外部接口", default=list, blank=True)
+    ext_ip = models.CharField("外部地址", max_length=128, blank=True, help_text="可能是一段范围")
+    ext_port = models.CharField(
+        "外部端口", max_length=64, blank=True,
+        help_text="**空 = 所有端口**(整机映射),不是「没配」。也可能是 8080-8090 这样的范围",
+    )
+    # ---- 里面真正的目标 ----
+    mapped_ip = models.CharField("内部地址", max_length=256, blank=True)
+    mapped_port = models.CharField("内部端口", max_length=64, blank=True)
+    protocol = models.CharField(
+        "协议", max_length=12, blank=True, help_text="tcp / udp / sctp / icmp。空表示所有协议"
+    )
+    port_forward = models.BooleanField(
+        "端口映射", default=False,
+        help_text="关 = 整机 1:1 映射(所有端口都进去),开 = 只映射指定端口",
+    )
+
+    comment = models.CharField("备注", max_length=255, blank=True)
+    uuid = models.CharField("UUID", max_length=64, blank=True)
+
+    raw = models.JSONField("原始记录", default=dict, blank=True)
+    synced_at = models.DateTimeField("同步时间", db_index=True)
+    method = models.CharField("同步通道", max_length=8, blank=True, help_text="api / ssh")
+
+    class Meta:
+        verbose_name = verbose_name_plural = "防火墙映射"
+        ordering = ["device_id", "vdom", "seq", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "vdom", "name"], name="uniq_vip_per_device_vdom"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["device", "seq"], name="idx_vip_device_seq"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} {self.endpoint_text}"
+
+    @property
+    def ext_port_text(self) -> str:
+        """外部端口的**人话**。空要说"所有端口",不能留白 —— 见类文档。"""
+        if not self.port_forward:
+            return "所有端口"
+        return self.ext_port or "所有端口"
+
+    @property
+    def mapped_port_text(self) -> str:
+        """
+        内部端口。端口映射开着但 `mappedport` 没写时,FortiOS 的默认行为是
+        **和外部端口相同** —— 显示成空白会让人以为它没配。
+        """
+        if not self.port_forward:
+            return "所有端口"
+        return self.mapped_port or self.ext_port or "同外部端口"
+
+    @property
+    def endpoint_text(self) -> str:
+        """
+        `1.2.3.4:443 → 10.0.0.5:8443` 这一行,给列表和告警消息用。
+
+        负载均衡型的 VIP **没有 mappedip**(后端在 `realservers` 里,是一组
+        机器)。那种情况下右边写「后端服务器组」而不是一个 `?` 或者空白 ——
+        `?` 看着像解析失败,而它其实是这类 VIP 本来就没有单一目标。
+        realservers 没有同步过来,所以这里也不假装知道是哪几台。
+        """
+        proto = f"{self.protocol.lower()}/" if self.protocol else ""
+        left = f"{self.ext_ip or '?'}:{self.ext_port_text}"
+        if not self.mapped_ip and self.vip_type == VipType.LOAD_BALANCE:
+            return f"{proto}{left} → 后端服务器组"
+        right = f"{self.mapped_ip or '?'}:{self.mapped_port_text}"
+        return f"{proto}{left} → {right}"
+
+    @property
+    def whole_host(self) -> bool:
+        """
+        整机映射 —— 外网地址的**所有端口**都通到内网那台机器上。
+
+        单独一个属性是因为它是这张表里唯一值得标出来的风险:一条
+        `1.2.3.4 → 10.0.0.5`(不带端口)把那台机器的每一个监听端口都
+        暴露到了外面,而页面上它和一条只映射 443 的规则长得几乎一样。
+        判断依据是 `portforward` 关着,**不是"端口字段是空的"** ——
+        后者在解析失败时也是空的,那会把一条正常的端口映射误标成整机映射。
+        """
+        return not self.port_forward
+
+
+# =========================================================================
 # 事件 —— 需求里的「事件报告」表
 # =========================================================================
 
