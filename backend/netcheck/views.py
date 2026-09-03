@@ -1674,6 +1674,113 @@ class SdwanLinkViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
+class CiscoAclViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    **Cisco 访问控制**(ACL / object-group / 静态 NAT)只读快照。
+
+    ## 为什么单独一个视图和一页
+
+    和 FortiGate 的策略**存在同一张表**(它们回答同一个问题),但
+    **看的方式完全不一样**:
+
+    - FortiGate 的一条策略自带源/目的接口对;**ACL 不带** —— 它是一张
+      规则表,作用在哪要看 `ip access-group`。所以这一页的第一层是
+      **ACL 名字**,第二层才是规则,还要显示"绑在哪几个接口的哪个方向"
+    - ACL 末尾有一条**隐含的 `deny ip any any`**,`show` 里不出现 ——
+      我们补出来了,而它必须标出来,否则人会去设备上找这一行然后找不到
+    - **一个接口都没绑的 ACL 完全不生效** —— 这是 FortiGate 上不存在的
+      一种状态,而它是最值得先看见的一条
+
+    塞进策略页的话,这三件事要么说不清楚、要么把那一页搞乱。
+    """
+
+    serializer_class = FirewallPolicySerializer
+    filterset_class = FirewallPolicyFilter
+    search_fields = ["acl_name", "name", "comments"]
+    ordering_fields = ["acl_name", "policy_id", "seq", "hit_count", "action"]
+
+    def get_queryset(self):
+        # **只给 Cisco 的**(acl_name 非空)—— FortiGate 的策略在
+        # /policies 那一页,两边混着看会让人以为它们是同一种东西
+        return FirewallPolicy.objects.select_related("device").exclude(acl_name="")
+
+    @action(detail=False, methods=["get"])
+    def board(self, request):
+        """
+        这一页的唯一数据源:按设备 → ACL 两层分组,带绑定关系和统计。
+        """
+
+        device_id = request.query_params.get("device")
+        queryset = self.get_queryset()
+        if device_id:
+            queryset = queryset.filter(device_id=device_id)
+        rows = list(queryset.order_by("device_id", "acl_name", "policy_id"))
+
+        by_device: dict = {}
+        for row in rows:
+            dev = by_device.setdefault(row.device_id, {
+                "device_id": row.device_id,
+                "device_name": row.device.name,
+                "mgmt_ip": row.device.mgmt_ip,
+                "model_label": row.device.get_model_display(),
+                "kind": row.device.kind,
+                "state": row.device.state,
+                "synced_at": row.synced_at,
+                "last_error": row.device.last_policy_error,
+                "acls": {},
+            })
+            acl = dev["acls"].setdefault(row.acl_name, {
+                "name": row.acl_name,
+                "bindings": row.bindings or [],
+                "rules": [],
+            })
+            acl["rules"].append(FirewallPolicySerializer(row).data)
+
+        devices = []
+        for dev in by_device.values():
+            acls = []
+            for acl in dev["acls"].values():
+                rules = acl["rules"]
+                real = [r for r in rules if not r["implicit"]]
+                acls.append({
+                    **acl,
+                    "rule_count": len(real),
+                    "permit": sum(1 for r in real if r["action"] == "accept"),
+                    "deny": sum(1 for r in real if r["action"] == "deny"),
+                    # **一个接口都没绑 = 完全不生效**,这是这一页最该先看见的
+                    "unbound": not acl["bindings"],
+                    "wide_open": sum(1 for r in real if r["permissive_level"] == "critical"),
+                    "no_log": sum(1 for r in real if r["logging_off"]),
+                    "never_hit": sum(1 for r in real if r["never_hit"]),
+                    "has_hit_stats": any(r["hit_count"] is not None for r in real),
+                })
+            dev["acls"] = sorted(acls, key=lambda a: a["name"])
+            devices.append(dev)
+
+        return Response({
+            "generated_at": timezone.now(),
+            "devices": devices,
+            "totals": {
+                "devices": len(devices),
+                "acls": sum(len(d["acls"]) for d in devices),
+                "rules": sum(1 for r in rows if not r.implicit),
+                "unbound_acls": sum(
+                    1 for d in devices for a in d["acls"] if a["unbound"]),
+                "wide_open": sum(1 for r in rows if r.permissive_level == "critical"),
+                "no_log": sum(1 for r in rows if r.logging_off),
+            },
+            # 开了策略同步的 Cisco 设备里,一条 ACL 都没同步到的那些。
+            # **"没同步到"不是"这台没有 ACL"**
+            "devices_without_data": [
+                {"device_id": d.pk, "device_name": d.name,
+                 "last_error": d.last_policy_error}
+                for d in Device.objects.filter(
+                    enabled=True, policy_sync_enabled=True, vendor=Vendor.CISCO)
+                if d.pk not in by_device
+            ],
+        })
+
+
 class FirewallVipViewSet(viewsets.ReadOnlyModelViewSet):
     """
     防火墙**映射**(FortiOS 的 firewall vip)只读快照。写入只有一条路:
@@ -2033,7 +2140,10 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ["seq", "policy_id", "hit_count", "bytes_count", "sessions", "last_hit_at"]
 
     def get_queryset(self):
-        return FirewallPolicy.objects.select_related("device")
+        # **只给 FortiGate 的**(acl_name 为空)—— Cisco 的 ACL 在 /acl
+        # 那一页。混着看会让人以为它们是同一种东西,而 ACL 没有接口对、
+        # 末尾还有一条隐含 deny,那两件事在这一页说不清楚
+        return FirewallPolicy.objects.select_related("device").filter(acl_name="")
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -2145,8 +2255,11 @@ class FirewallPolicyViewSet(viewsets.ReadOnlyModelViewSet):
                 continue
             # 任何动作的 any-any-any 都会挡住后面(拒绝的兜底规则同样如此,
             # 而兜底规则本来就该放在最后 —— 它后面还有规则就是配错了)
+            # **服务那一维带 svc=True** —— Cisco 的 `ip` 是"所有 IP 流量"。
+            # 影子规则判定完全依赖这个:`permit ip any any` 之后的规则
+            # 全都到不了,而漏认它的话这条最典型的 catch-all 抓不出来
             if (p.enabled and p._is_any(p.src_addr) and p._is_any(p.dst_addr)
-                    and p._is_any(p.service)):
+                    and p._is_any(p.service, svc=True)):
                 catch_all[key] = p
 
         # 没有命中统计时,"从未命中"这一项没有意义 —— 明确说出来,

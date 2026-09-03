@@ -216,6 +216,11 @@ class Profile:
     #: 只写一条的话老固件上这一项永远是空的而且不报错。
     #: 这条通道拿不到带宽/会话数/SLA 档数,所以 SD-WAN **建议配 API Token**
     sdwan_cli: str = ""
+    #: Cisco 的接口绑定 / NAT / 对象组要从 running-config 的片段里拿。
+    #: **`show ip access-lists` 不带绑定关系** —— 一条不知道作用在哪个接口上
+    #: 的 ACL 在页面上会被当成全局生效,那是完全错的
+    acl_binding_cli: str = ""
+    nat_cli: str = ""
     # 「启动配置」的命令,用来判断有没有**改了但没保存**的配置
     # (Cisco 的 `show startup-config`)。留空 = 这款型号没有这个概念:
     # FortiOS 改完即存,拿它去比对只会得到一堆假的"未保存"
@@ -367,6 +372,13 @@ PROFILES: dict[str, Profile] = {
         backup_volatile=_CISCO_VOLATILE,
         startup_cli=_CISCO_STARTUP_CLI,
         faceplate=_CAT_FACEPLATE,
+        policy_cli="show ip access-lists",
+        # 绑定关系、NAT、对象组都在 running-config 里。**用 `| section` /
+        # `| include` 只取需要的那几段** —— 一份完整的 running-config 在
+        # 48 口交换机上几千行,而这三样加起来通常几十行
+        acl_binding_cli="show running-config | include ^interface|access-group",
+        nat_cli="show running-config | include ^ip nat inside source static",
+        address_cli="show running-config | section object-group",
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes=(
             "48 个千兆电口。**必须用 ifHC* 64 位计数器**:48 口满速时 32 位的 "
@@ -385,6 +397,13 @@ PROFILES: dict[str, Profile] = {
         backup_volatile=_CISCO_VOLATILE,
         startup_cli=_CISCO_STARTUP_CLI,
         faceplate=_CAT_FACEPLATE,
+        policy_cli="show ip access-lists",
+        # 绑定关系、NAT、对象组都在 running-config 里。**用 `| section` /
+        # `| include` 只取需要的那几段** —— 一份完整的 running-config 在
+        # 48 口交换机上几千行,而这三样加起来通常几十行
+        acl_binding_cli="show running-config | include ^interface|access-group",
+        nat_cli="show running-config | include ^ip nat inside source static",
+        address_cli="show running-config | section object-group",
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes="和 C9300-48T 同一套采集,区别只是口数。",
     ),
@@ -399,6 +418,13 @@ PROFILES: dict[str, Profile] = {
         backup_volatile=_CISCO_VOLATILE,
         startup_cli=_CISCO_STARTUP_CLI,
         faceplate=_CAT_FACEPLATE,
+        policy_cli="show ip access-lists",
+        # 绑定关系、NAT、对象组都在 running-config 里。**用 `| section` /
+        # `| include` 只取需要的那几段** —— 一份完整的 running-config 在
+        # 48 口交换机上几千行,而这三样加起来通常几十行
+        acl_binding_cli="show running-config | include ^interface|access-group",
+        nat_cli="show running-config | include ^ip nat inside source static",
+        address_cli="show running-config | section object-group",
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         # 温度和电源在 C9200L 上经常采不到:它是固定配置的入门款,
         # 入风口传感器和内置电源不一定注册进 ENVMON MIB。
@@ -519,6 +545,13 @@ PROFILES: dict[str, Profile] = {
         vendor=Vendor.GENERIC,
         metrics={"uptime_s": MetricSpec([SYS["sysUpTime"]], scale=0.01)},
         optional={"cpu_pct", "mem_pct", "temp_c"},
+        policy_cli="show ip access-lists",
+        # 绑定关系、NAT、对象组都在 running-config 里。**用 `| section` /
+        # `| include` 只取需要的那几段** —— 一份完整的 running-config 在
+        # 48 口交换机上几千行,而这三样加起来通常几十行
+        acl_binding_cli="show running-config | include ^interface|access-group",
+        nat_cli="show running-config | include ^ip nat inside source static",
+        address_cli="show running-config | section object-group",
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         # backup_cli 故意留空:不知道是什么设备就不知道该敲什么命令,
         # 而随便敲一条命令把输出当配置存起来是在制造一份假备份

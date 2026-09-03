@@ -457,6 +457,18 @@ export interface PolicyRow {
   permissive_level: string
   /** 放行但不记日志 —— 出事之后查不出来源 */
   logging_off: boolean
+  /** Cisco 才有:这条 ACE 属于哪个 ACL。FortiGate 上是空串 */
+  acl_name: string
+  /** 这个 ACL 绑在哪些接口的哪个方向。**空 = 完全不生效** */
+  bindings: Array<{ interface: string; direction: string }>
+  binding_text: string
+  /**
+   * 这一条是**我们补出来的隐含 `deny ip any any`**,设备的 show 里没有。
+   * 不补的话人看着一张全是 permit 的表会以为没写到的流量是放行的;
+   * 但必须标出来,否则人会去设备上找这一行然后找不到。
+   */
+  implicit: boolean
+  is_acl: boolean
   /**
    * 目的地址里那几个名字中,哪些其实是**映射**(VIP)。
    *
@@ -665,6 +677,37 @@ export interface ServiceRow {
   predefined: boolean
   synced_at: string
   method: string
+}
+
+// ------------------------------------------------- Cisco 访问控制(ACL)
+
+export interface AclBoard {
+  generated_at: string
+  totals: {
+    devices: number; acls: number; rules: number
+    /** **一个接口都没绑的 ACL = 完全不生效**,这一页最该先看见的数 */
+    unbound_acls: number
+    wide_open: number; no_log: number
+  }
+  devices: Array<{
+    device_id: number; device_name: string; mgmt_ip: string
+    model_label: string; kind: string; state: string
+    synced_at: string; last_error: string
+    acls: Array<{
+      name: string
+      bindings: Array<{ interface: string; direction: string }>
+      /** 不含补出来的隐含规则 */
+      rule_count: number
+      permit: number; deny: number
+      /** 一个接口都没绑 —— 这个 ACL 不生效 */
+      unbound: boolean
+      wide_open: number; no_log: number; never_hit: number
+      has_hit_stats: boolean
+      rules: PolicyRow[]
+    }>
+  }>
+  /** 开了同步但一条 ACL 都没拿到的 Cisco 设备 —— **"没同步到"不是"没有 ACL"** */
+  devices_without_data: Array<{ device_id: number; device_name: string; last_error: string }>
 }
 
 // ------------------------------------------------- SD-WAN 性能 SLA
@@ -1555,6 +1598,10 @@ export const api = {
   resolveService: (deviceId: number, name: string) =>
     http.get<AddressResolve>('/firewall-services/resolve/',
       { params: { device: deviceId, name } }),
+
+  // Cisco 访问控制(ACL / object-group / 静态 NAT)
+  aclBoard: (deviceId?: number) =>
+    http.get<AclBoard>('/cisco-acl/board/', { params: { device: deviceId } }),
 
   // SD-WAN 性能 SLA —— 防火墙自己从出口探出来的延迟/抖动/丢包
   sdwanBoard: (hours = 6) =>

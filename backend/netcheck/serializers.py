@@ -343,15 +343,19 @@ class DeviceSerializer(serializers.ModelSerializer):
                         "选一个在册型号,或在 devices/profiles.py 里补一条 backup_cli"
                     )
 
+        # **Device.clean() 的镜像,两边一起改。**不再要求是防火墙 ——
+        # 核心交换机上挂 ACL 是常态,而它的 kind 是「交换机」
         if _merged(self, attrs, "policy_sync_enabled", False):
-            if kind != DeviceKind.FIREWALL:
-                errors["policy_sync_enabled"] = "策略同步只对防火墙有意义"
-            elif vendor != Vendor.FORTINET:
+            if vendor not in (Vendor.FORTINET, Vendor.CISCO):
                 errors["policy_sync_enabled"] = (
-                    "策略同步目前只实现了 FortiGate(FortiOS)。"
-                    "加别的厂商要在 devices/policies.py 里补一个解析器"
+                    f"访问控制同步目前支持 FortiGate 和 Cisco,这个厂商的解析器还没有"
                 )
-            elif not (has_api or has_ssh):
+            elif vendor == Vendor.CISCO and not has_ssh:
+                errors["policy_sync_enabled"] = (
+                    "Cisco 的 ACL 同步只能走 SSH(IOS 没有只读 REST 接口)——"
+                    "要填 SSH 用户名 + 密码/私钥"
+                )
+            elif vendor == Vendor.FORTINET and not (has_api or has_ssh):
                 errors["policy_sync_enabled"] = (
                     "策略同步需要 API Token(推荐,只有 API 有命中计数)或 SSH 凭据"
                 )
@@ -608,6 +612,9 @@ class FirewallPolicySerializer(serializers.ModelSerializer):
     # 规则审计:过宽 / 不记日志。只对"启用且放行"的规则判(见 models.py)
     permissive_level = serializers.CharField(read_only=True)
     logging_off = serializers.BooleanField(read_only=True)
+    # Cisco 专有的两个只读属性
+    binding_text = serializers.CharField(read_only=True)
+    is_acl = serializers.BooleanField(read_only=True)
     # 这条策略的目的地址里引用到的**映射**。见 get_mappings()
     mappings = serializers.SerializerMethodField()
 
@@ -620,6 +627,9 @@ class FirewallPolicySerializer(serializers.ModelSerializer):
             "hit_count", "bytes_count", "packets", "sessions",
             "first_hit_at", "last_hit_at", "never_hit",
             "permissive_level", "logging_off", "mappings",
+            # Cisco 专有。FortiGate 上 acl_name 是空串、bindings 是空数组、
+            # implicit 恒为 False
+            "acl_name", "bindings", "binding_text", "implicit", "is_acl",
             "synced_at", "method",
         ]
         read_only_fields = fields

@@ -52,7 +52,7 @@ from netcheck.models import (
     VipType,
 )
 
-from . import fortigate_api, ssh_cli
+from . import cisco_acl, fortigate_api, ssh_cli
 from .profiles import get_profile
 
 log = logging.getLogger("netcheck.policies")
@@ -974,22 +974,194 @@ def _from_ssh(device: Device) -> list[dict]:
 # =========================================================================
 
 
+def _sync_cisco(device: Device) -> dict:
+    """
+    Cisco 的同步。**只走 SSH** —— IOS 没有等价的只读 REST 接口。
+
+    四条命令,**每条独立 try**:某一条不支持(比如这台上没配 NAT)只让
+    对应的那一部分空着,不该让整次同步失败。这和 devices/collector 那条
+    "通道降级只在通道级失败时触发"是同一条规矩。
+    """
+
+    profile = get_profile(device.model, device.vendor)
+    if not profile.policy_cli:
+        raise PolicyError(
+            f"型号 {device.get_model_display()} 的画像没有定义 ACL 命令 —— "
+            "在 devices/profiles.py 里补 policy_cli"
+        )
+    if not device.ssh_username or not (device.ssh_password or device.ssh_private_key):
+        raise PolicyError("Cisco 的访问控制同步需要 SSH 用户名 + 密码/私钥")
+
+    client = ssh_cli._connect(device)
+    raw_acl = raw_bind = raw_nat = raw_obj = ""
+    try:
+        try:
+            raw_acl = ssh_cli._run_exec(client, profile.policy_cli, timeout=180.0)
+        except ssh_cli.SshError as exc:
+            raise PolicyError(f"`{profile.policy_cli}` 失败:{exc}") from exc
+
+        for command, slot in (
+            (profile.acl_binding_cli, "bind"),
+            (profile.nat_cli, "nat"),
+            (profile.address_cli, "obj"),
+        ):
+            if not command:
+                continue
+            try:
+                text = ssh_cli._run_exec(client, command, timeout=120.0)
+            except ssh_cli.SshError as exc:
+                log.info("设备 %s `%s` 失败(%s),对应的那部分留空", device.name, command, exc)
+                continue
+            if slot == "bind":
+                raw_bind = text
+            elif slot == "nat":
+                raw_nat = text
+            else:
+                raw_obj = text
+    finally:
+        client.close()
+
+    # ---- ACL。IOS 和 ASA 的格式不一样,按输出里的特征分派 ----
+    # **不按型号猜**:同一个 vendor 下 Catalyst 和 ASA 都可能出现,而
+    # 画像里的型号常常是 GENERIC_CISCO(设备是后加的、型号没填准)
+    if re.search(r"^access-list\s+\S+\s+line\s+\d+", raw_acl, re.M):
+        rows = cisco_acl.parse_asa_acl(raw_acl)
+    else:
+        rows = cisco_acl.parse_ios_acl(raw_acl)
+    if not rows:
+        head = raw_acl.strip().replace("\n", " ")[:160]
+        raise PolicyError(f"`{profile.policy_cli}` 没有解析出 ACL:{head or '(空输出)'}")
+
+    bindings = cisco_acl.parse_access_groups(raw_bind) if raw_bind else {}
+    for row in rows:
+        row["bindings"] = bindings.get(row["acl_name"], [])
+        # ACL 的"接口"就是它绑在哪儿。**填进 src_intf/dst_intf** 让审计里的
+        # 影子规则判定(按接口对分组)能用上 —— 不填的话所有 ACL 会被
+        # 当成同一个接口对,一条 permit ip any any 会把别的 ACL 全判成影子
+        ins = [b["interface"] for b in row["bindings"] if b.get("direction") == "in"]
+        outs = [b["interface"] for b in row["bindings"] if b.get("direction") != "in"]
+        # **没绑定时用 ACL 名当分组键**,不要留空 —— 留空的话所有未绑定的
+        # ACL 会挤进同一个 (any, any) 接口对里互相判影子
+        row["src_intf"] = ins or [f"(未绑定:{row['acl_name']})"]
+        row["dst_intf"] = outs or [f"(未绑定:{row['acl_name']})"]
+        row.setdefault("seq", 0)
+
+    # seq 按 (ACL 名, 行号) 重排 —— 影子规则判定完全依赖这个顺序
+    rows.sort(key=lambda r: (r["acl_name"], r["policy_id"]))
+    for i, row in enumerate(rows):
+        row["seq"] = i
+        row.setdefault("schedule", "")
+        row.setdefault("bytes_count", None)
+        row.setdefault("packets", None)
+        row.setdefault("sessions", None)
+        row.setdefault("first_hit_at", None)
+        row.setdefault("last_hit_at", None)
+        row.setdefault("uuid", "")
+
+    vips = cisco_acl.parse_nat(raw_nat) if raw_nat else []
+    objects = cisco_acl.parse_object_groups(raw_obj) if raw_obj else []
+    addresses = [
+        {k: v for k, v in o.items() if k != "_kind"} | {"seq": i, "uuid": "", "interface": "",
+                                                        "raw": {"_channel": "ssh"}}
+        for i, o in enumerate(o for o in objects if o["_kind"] == "address")
+    ]
+    services = [
+        {k: v for k, v in o.items() if k != "_kind"} | {"seq": i, "category": "",
+                                                        "predefined": False,
+                                                        "raw": {"_channel": "ssh"}}
+        for i, o in enumerate(o for o in objects if o["_kind"] == "service")
+    ]
+
+    now = timezone.now()
+    vdom = "root"
+    with transaction.atomic():
+        FirewallPolicy.objects.filter(device=device, vdom=vdom).delete()
+        FirewallPolicy.objects.bulk_create([
+            FirewallPolicy(device=device, vdom=vdom, synced_at=now, method="ssh", **row)
+            for row in rows
+        ], batch_size=500)
+
+        FirewallVip.objects.filter(device=device, vdom=vdom).delete()
+        if vips:
+            FirewallVip.objects.bulk_create([
+                FirewallVip(device=device, vdom=vdom, synced_at=now, method="ssh", **v)
+                for v in vips
+            ], batch_size=500)
+
+        FirewallAddress.objects.filter(device=device, vdom=vdom).delete()
+        if addresses:
+            FirewallAddress.objects.bulk_create([
+                FirewallAddress(device=device, vdom=vdom, synced_at=now, method="ssh", **a)
+                for a in addresses
+            ], batch_size=500)
+
+        FirewallService.objects.filter(device=device, vdom=vdom).delete()
+        if services:
+            FirewallService.objects.bulk_create([
+                FirewallService(device=device, vdom=vdom, synced_at=now, method="ssh", **s)
+                for s in services
+            ], batch_size=500)
+
+    device.policy_count = FirewallPolicy.objects.filter(device=device).count()
+    device.last_policy_sync_at = now
+    device.last_policy_error = ""
+    device.save(update_fields=["policy_count", "last_policy_sync_at", "last_policy_error"])
+
+    unbound = sorted({r["acl_name"] for r in rows if not r["bindings"]})
+    return {
+        "method": "ssh", "vendor": "cisco",
+        "total": len(rows),
+        "acls": len({r["acl_name"] for r in rows}),
+        # **一个接口都没绑的 ACL = 完全不生效**,单独报出来 —— 那是个
+        # 该被看见的结论(有人配了忘了挂上去)
+        "unbound_acls": unbound,
+        "implicit_rules": sum(1 for r in rows if r["implicit"]),
+        "vips": len(vips), "addresses": len(addresses), "services": len(services),
+        "vdom": vdom,
+        # Cisco 的 matches 是自设备启动以来的累计,而且 clear 会归零 ——
+        # 语义和 FortiGate 的 hit_count 接近但不一样
+        "has_hit_stats": any(r.get("hit_count") is not None for r in rows),
+        "never_hit": sum(1 for r in rows if r.get("hit_count") == 0),
+        "disabled": 0, "truncated": False, "degraded_from_api": False,
+    }
+
+
 def sync_policies(device: Device) -> dict:
     """
-    同步一台防火墙的策略。返回统计。
+    同步一台设备的访问控制规则。返回统计。
 
-    通道:有 API Token 走 API(带命中计数),失败或没有 token 退回 SSH。
-    **降级会被记下来**(返回值里的 method),页面上要能看出这批数据
-    有没有命中计数 —— 否则一列空白的"命中"会被当成"全都没命中过"。
+    ## 两个厂商,两套东西,一张表
+
+    | | FortiGate | Cisco |
+    |---|---|---|
+    | 规则 | `firewall policy` | ACL 里的 ACE |
+    | 映射 | `firewall vip` | `ip nat inside source static` |
+    | 对象 | `firewall address` / `addrgrp` | `object-group network` |
+
+    存进同一批表(`FirewallPolicy` / `FirewallVip` / `FirewallAddress`),
+    因为它们回答的是同一个问题。分表意味着策略页、审计、导出、对象查询
+    全要写第二遍。
+
+    ## **不再要求 kind 是防火墙**
+
+    核心交换机上挂着 ACL 是常态,而它的 kind 是「交换机」。原来那道
+    `kind != FIREWALL` 的门把这种情况整个挡在外面了 —— 而"看不到核心交换机
+    上的 ACL"正是这个页面最该覆盖的场景之一。
+
+    改成按**厂商**分派:认得出解析器就同步,认不出才拒绝。
+
+    通道:FortiGate 有 API Token 走 API(带命中计数),否则 SSH;
+    Cisco 只有 SSH(IOS 没有等价的只读 REST)。
     """
 
-    if device.kind != DeviceKind.FIREWALL:
-        raise PolicyError("策略同步只对防火墙有意义")
-    if device.vendor != Vendor.FORTINET:
+    if device.vendor not in (Vendor.FORTINET, Vendor.CISCO):
         raise PolicyError(
-            f"策略同步目前只实现了 FortiGate。{device.get_vendor_display()} 的解析器"
-            "要在 devices/policies.py 里补"
+            f"访问控制同步目前支持 FortiGate 和 Cisco。"
+            f"{device.get_vendor_display()} 的解析器要在 devices/policies.py 里补"
         )
+
+    if device.vendor == Vendor.CISCO:
+        return _sync_cisco(device)
 
     rows: list[dict] = []
     vips: list[dict] = []

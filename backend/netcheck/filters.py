@@ -210,7 +210,15 @@ class FirewallPolicyFilter(filters.FilterSet):
 
         if value is None:
             return queryset
-        svc_any = Q(service__icontains='"all"') | Q(service__icontains='"any"') | Q(service=[])
+        # **服务那一维要多认 Cisco 的 `ip`**(协议 IP、不限端口 = 所有流量)。
+        # 漏掉的话 `permit ip any any` 这条最典型的 ACL 过宽规则筛不出来 ——
+        # 而模型上那个属性认得,于是页面标红 1 条、筛选筛出 0 条,不报任何错。
+        # 这就是「判定写了三遍必须一起改」那类问题
+        svc_any = (
+            Q(service__icontains='"all"') | Q(service__icontains='"any"')
+            | Q(service__icontains='"ip"') | Q(service__icontains='"ip/')
+            | Q(service=[])
+        )
         src_any = Q(src_addr__icontains='"all"') | Q(src_addr__icontains='"any"') | Q(src_addr=[])
         dst_any = Q(dst_addr__icontains='"all"') | Q(dst_addr__icontains='"any"') | Q(dst_addr=[])
         cond = Q(enabled=True, action="accept") & svc_any & (src_any | dst_any)

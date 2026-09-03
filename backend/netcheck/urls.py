@@ -18,6 +18,7 @@ router.register("firewall-vips", views.FirewallVipViewSet, basename="firewall-vi
 router.register("firewall-addresses", views.FirewallAddressViewSet, basename="firewall-address")
 router.register("firewall-services", views.FirewallServiceViewSet, basename="firewall-service")
 router.register("sdwan", views.SdwanLinkViewSet, basename="sdwan")
+router.register("cisco-acl", views.CiscoAclViewSet, basename="cisco-acl")
 router.register("idrac", views.IdracHostViewSet, basename="idrac")
 router.register("events", views.EventViewSet, basename="event")
 router.register("notifiers", views.NotifierViewSet, basename="notifier")

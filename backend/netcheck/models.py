@@ -740,14 +740,22 @@ class Device(BaseModel):
                         "给这款型号补一条 backup_cli"
                     )
         if self.policy_sync_enabled:
-            if self.kind != DeviceKind.FIREWALL:
-                errors["policy_sync_enabled"] = "策略同步只对防火墙有意义"
-            elif self.vendor != Vendor.FORTINET:
+            # **不再要求是防火墙。**核心交换机上挂着 ACL 是常态,而它的 kind
+            # 是「交换机」—— 原来那道门把"看核心交换机上的 ACL"这个场景
+            # 整个挡在外面了。改成按**厂商**判:认得出解析器就放行
+            if self.vendor not in (Vendor.FORTINET, Vendor.CISCO):
                 errors["policy_sync_enabled"] = (
-                    "策略同步目前只实现了 FortiGate(FortiOS)。"
-                    "加别的厂商在 devices/policies.py 里补一个解析器"
+                    f"访问控制同步目前支持 FortiGate 和 Cisco。"
+                    f"{self.get_vendor_display()} 的解析器要在 devices/policies.py 里补"
                 )
-            elif not (has_api or has_ssh):
+            elif self.vendor == Vendor.CISCO and not has_ssh:
+                # Cisco 只有 SSH 一条路 —— IOS 没有等价的只读 REST。
+                # 单独说清楚,免得人去找"Cisco 的 API Token 填哪儿"
+                errors["policy_sync_enabled"] = (
+                    "Cisco 的 ACL 同步只能走 SSH(IOS 没有只读 REST 接口)——"
+                    "要填 SSH 用户名 + 密码/私钥"
+                )
+            elif self.vendor == Vendor.FORTINET and not (has_api or has_ssh):
                 errors["policy_sync_enabled"] = "策略同步需要 API Token(推荐,带命中计数)或 SSH 凭据"
 
         # SD-WAN 是 FortiGate 特有的东西。开在一台 Cisco 交换机上不会报错、
@@ -1351,6 +1359,32 @@ class FirewallPolicy(models.Model):
     comments = models.CharField("备注", max_length=255, blank=True)
     uuid = models.CharField("UUID", max_length=64, blank=True)
 
+    # ---- Cisco ACL 专有 ----
+    #
+    # **复用这张表而不是另开一张**:一条 ACE 和一条 FortiGate 策略回答的是
+    # 同一个问题(谁到谁、什么服务、放行还是拒绝),而分两张表意味着策略页、
+    # 规则审计、CSV 导出、地址对象关联全都要写第二遍 —— 那正是"判定写了
+    # 两遍必须一起改"那类问题的产地。
+    acl_name = models.CharField(
+        "ACL 名称", max_length=128, blank=True,
+        help_text="Cisco 才有。FortiGate 的策略不属于任何 ACL,这里是空的",
+    )
+    #: 这条 ACL **绑在哪些接口的哪个方向**。[{"interface": "Gi1/0/1", "direction": "in"}]
+    #:
+    #: ⚠ **这是 Cisco 和 FortiGate 最大的结构差别。**FortiGate 的一条策略
+    #: 自带源/目的接口对,而 ACL 只是一张规则表 —— 它作用在哪要另查
+    #: `show running-config | include access-group`。**不拼上去的话页面上
+    #: 是一堆不知道作用在哪儿的规则,那比没有更糟**:人会以为它在全局生效。
+    bindings = models.JSONField("接口绑定", default=list, blank=True)
+    #: 这一条是**我们补出来的隐含规则**,不是设备上真有的一行。
+    #:
+    #: 每个 IOS ACL 末尾都有一条隐含的 `deny ip any any`,**它不出现在
+    #: `show` 的输出里**。不把它补上去的话:
+    #:   - 影子规则判定会漏掉"这条规则后面其实什么都到不了"
+    #:   - 人看着一张全是 permit 的表,会以为没写到的流量是放行的
+    #: 但它必须**标出来**,否则人会去设备上找这一行然后找不到。
+    implicit = models.BooleanField("隐含规则", default=False)
+
     # ---- 命中统计(只有 API 通道有;SSH 通道是 null,不是 0) ----
     hit_count = models.BigIntegerField("命中次数", null=True, blank=True)
     bytes_count = models.BigIntegerField("字节数", null=True, blank=True)
@@ -1369,8 +1403,15 @@ class FirewallPolicy(models.Model):
         verbose_name = verbose_name_plural = "防火墙策略"
         ordering = ["device_id", "vdom", "seq", "policy_id"]
         constraints = [
+            # **acl_name 必须进唯一键。**Cisco 上 `policy_id` 是 ACL 里的行号
+            # (10 / 20 / 30),**不同 ACL 会重号** —— 不加这一列的话第二个
+            # ACL 的第 10 行会覆盖第一个 ACL 的第 10 行,而页面上只是少了
+            # 几条规则,不报任何错。
+            # FortiGate 那边 acl_name 恒为空字符串(不是 NULL),所以这条
+            # 约束对它等价于原来的三元组 —— 不需要 Coalesce
             models.UniqueConstraint(
-                fields=["device", "vdom", "policy_id"], name="uniq_policy_per_device_vdom"
+                fields=["device", "vdom", "acl_name", "policy_id"],
+                name="uniq_policy_per_device_vdom",
             )
         ]
         indexes = [
@@ -1403,16 +1444,42 @@ class FirewallPolicy(models.Model):
     # 一条拒绝规则写成 any-any-any 不是风险(前者不生效,后者是兜底拒绝,
     # 那正是该有的写法)。把它们也标红会让真正的问题淹在噪声里。
 
-    # FortiOS 里"任意"有两种写法:地址是 all,服务是 ALL,接口是 any。
-    # 大小写不统一(实测两种都见过),所以一律折成小写比
-    _ANY = {"all", "any"}
+    # 「任意」在两个厂商上是**不同的词**:
+    #   FortiOS  地址 all / 服务 ALL / 接口 any
+    #   Cisco    地址 any / **服务是 `ip`**(协议 IP、不限端口)
+    #
+    # ⚠ **漏掉 Cisco 的 `ip` 会让 `permit ip any any` 判不出来** —— 而那是
+    # ACL 里最典型的 any-any-any,也是这一整套审计最该抓到的一条。
+    # 实测踩出来的:加 Cisco 支持时这条判定静默失效了,页面上过宽规则是 0。
+    _ANY_ADDR = {"all", "any"}
+    #: 服务那一维多认 `ip` / `ip4` / `ipv4` —— 它们在 ACL 里的含义是
+    #: "所有 IP 流量"。**地址那一维不能加 `ip`**(那不是一个地址写法)
+    _ANY_SVC = {"all", "any", "ip", "ip4", "ipv4"}
 
-    def _is_any(self, values) -> bool:
+    def _is_any(self, values, svc: bool = False) -> bool:
         if not values:
             # 空数组也是"任意" —— 策略里没写这一维就等于不限制。
             # 把空当成"已限制"是这里最危险的误判
             return True
-        return any(str(v).strip().lower() in self._ANY for v in values)
+        allow = self._ANY_SVC if svc else self._ANY_ADDR
+        return any(str(v).strip().lower() in allow for v in values)
+
+    @property
+    def is_acl(self) -> bool:
+        """这一条是 Cisco 的 ACE 吗。页面上要分开显示(结构不一样)。"""
+        return bool(self.acl_name)
+
+    @property
+    def binding_text(self) -> str:
+        """
+        `Gi1/0/1 in、Gi1/0/2 out`。**空的时候说"没查到绑定"而不是留白** ——
+        一条没绑在任何接口上的 ACL **是不生效的**,那是个该被看见的结论;
+        而"我们没查到"是另一回事。两者页面上分开说(见 policies 页)。
+        """
+        return "、".join(
+            f"{b.get('interface', '?')} {b.get('direction', '?')}"
+            for b in (self.bindings or [])
+        )
 
     @property
     def permissive_level(self) -> str:
@@ -1431,7 +1498,8 @@ class FirewallPolicy(models.Model):
             return ""
         src_any = self._is_any(self.src_addr)
         dst_any = self._is_any(self.dst_addr)
-        svc_any = self._is_any(self.service)
+        # **服务那一维用 _ANY_SVC** —— Cisco 的 `ip` 就是"所有 IP 流量"
+        svc_any = self._is_any(self.service, svc=True)
         if src_any and dst_any and svc_any:
             return "critical"
         if svc_any and (src_any or dst_any):

@@ -65,6 +65,12 @@ const routes = [
     meta: { title: '防火墙策略', nav: '防火墙策略' },
   },
   {
+    path: '/acl',
+    name: 'acl',
+    component: () => import('@/views/Acl.vue'),
+    meta: { title: 'Cisco ACL', nav: 'Cisco ACL' },
+  },
+  {
     path: '/sdwan',
     name: 'sdwan',
     component: () => import('@/views/Sdwan.vue'),

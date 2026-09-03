@@ -226,6 +226,8 @@ devices/sdwan.py  **纯函数**:SD-WAN 健康检查的响应 → 每条链路一
                   三种响应形状 + SSH 兜底。跟着设备采集的节拍走
 devices/addresses **纯函数**:地址/服务对象的**递归展开**(带环检测)。
                   两者同构,共用一个展开器,只有内置名那一套是分开的
+devices/cisco_acl **纯函数**:IOS/ASA 的 ACL、object-group、静态 NAT。
+                  两种掩码方向相反、隐含 deny 要补出来 —— 都在这个文件里
 devices/faceplate **纯函数**:接口表 + 画像的几何 → 每个口的 (排, 列) 和档位。
                   画错的面板比没有面板危险,schematic/verified 要一路带到页面上
 servers/linux.py  **纯函数**:Linux 采集命令的拼装和 /proc、df 输出的解析。不碰网络也不碰库
@@ -690,6 +692,77 @@ FortiOS 的 `show`(相对 `show full-configuration`)**只打印偏离默认值�
 
 动作要归一化(`deny` / `drop` / `block` 都是拒绝),但**认不出的落到 `other`,
 不猜成 accept**:把一条不认识的规则显示成"允许"是这个页面能犯的最严重的错。
+
+### Cisco 的 ACL:同一张表,单独一页
+
+`FirewallPolicy.acl_name` 非空 = 这是一条 Cisco 的 ACE。**存在同一张表**
+(它和 FortiGate 的策略回答同一个问题:谁到谁、什么服务、放行还是拒绝),
+分表意味着策略页、审计、CSV 导出、对象查询全要写第二遍。
+
+但**看的方式不一样,所以是两个页面**(`/policies` 和 `/acl`,两边的
+queryset 互相排除):
+
+1. **ACL 不带接口对。**FortiGate 的一条策略自带源/目的接口,ACL 只是一张
+   规则表 —— 作用在哪要另查 `ip access-group`。所以 `/acl` 的第一层是
+   **ACL 名字**。绑定关系存在 `bindings` 里。
+2. **一个接口都没绑的 ACL 完全不生效。**FortiGate 上不存在这种状态,
+   而它是这一页最值得先看见的一条(有人配了忘了挂上去)。
+3. **末尾那条 `deny ip any any` 是隐含的**,`show` 里不出现。我们补出来
+   (标 `implicit=True`)—— 不补的话人看着一张全是 permit 的表会以为
+   没写到的流量是放行的,而影子规则判定也会漏掉"这条后面什么都到不了"。
+   但**必须标出来**,否则人会去设备上找这一行然后找不到。
+
+**`acl_name` 必须进那条唯一约束。**Cisco 上 `policy_id` 是 ACL 里的行号
+(10/20/30),**不同 ACL 会重号** —— 不加这一列的话第二个 ACL 的第 10 行
+会覆盖第一个的第 10 行,而页面上只是少了几条规则,不报任何错。
+(FortiGate 那边 `acl_name` 恒为空字符串**不是 NULL**,所以不需要 Coalesce。)
+
+**策略同步不再要求 kind 是防火墙。**核心交换机上挂 ACL 是常态,而它的 kind
+是「交换机」—— 原来那道门把"看核心交换机上的 ACL"整个挡在外面了。改成按
+**厂商**判。Cisco 只有 SSH 一条路(IOS 没有等价的只读 REST),校验里单独
+说清楚,免得人去找"Cisco 的 API Token 填哪儿"。
+
+### ⚠ 三个 Cisco 特有的静默出错点
+
+**1. IOS 的 ACL 用通配符掩码,object-group 用子网掩码 —— 同一台设备上两种
+混着用。**
+
+    access-list  ... 10.0.0.0 0.0.0.255      ← 通配符,= /24
+    object-group ... 10.0.0.0 255.255.255.0  ← 子网掩码,= /24
+
+把通配符当子网掩码算得到 `/0`(全网);反过来得到 `/24` 的补集。**两种错都
+会显示成一个看起来完全正常的网段**,而它和实际范围差几个数量级。
+ASA 的 access-list 用的是**子网掩码**(和 IOS 相反),所以
+`wildcard_to_cidr()` 和 `netmask_to_cidr()` **是两个函数,不要合并** ——
+合并就得靠"看起来像哪种"去猜,而 `255.0.0.0` 和 `0.255.255.255` 都合法、
+含义相反。由调用方按上下文决定。
+
+非连续通配符(`0.0.255.0`,按奇偶网段匹配,合法写法)**返回原文不硬折** ——
+折成一个前缀长度会把一条精巧的规则显示成一个平平无奇的网段。
+
+**2. 「任意服务」在两个厂商上是不同的词。**FortiOS 是 `ALL`,**Cisco 是
+`ip`**(协议 IP、不限端口)。漏掉 `ip` 的话 `permit ip any any` ——
+ACL 里最典型的 any-any-any —— **判不出来**。实测踩到:加 Cisco 支持时这条
+判定静默失效,页面上过宽规则是 0。所以 `_ANY_ADDR` 和 `_ANY_SVC` 是**两个
+集合**(地址那一维不能加 `ip`,那不是一个地址写法),而且这条判定的
+**三份实现**(模型属性 / `filters.py` 的 SQL / `views.py` 的 audit)
+要一起改。
+
+**3. `show ip access-lists` 不带绑定关系。**绑定在 `ip access-group` 里,
+而 IOS 是**按接口块**写的 —— 只 grep `access-group` 那一行拿不到接口名,
+而**没有接口名的绑定等于没有绑定**。所以解析器要记住"当前在哪个 interface
+块里"。接口名实在拿不到时记一条「未知接口」而不是丢掉:丢掉的话页面上
+这个 ACL 会显示成"没绑在任何接口上"(= 不生效),那是完全相反的结论。
+
+另外 **IOS 的 `matches` 是自设备启动以来的累计**,`clear ip access-list
+counters` 会归零 —— 和 FortiGate 的 `hit_count` 语义接近但不一样,
+页面上的 tooltip 说明了这一点,别直接拿去下"从来没用过"的结论。
+
+**Cisco 的映射和主机组**也一起同步了:`ip nat inside source static` →
+`FirewallVip`(⚠ **IOS 那条命令是"内 → 外",而 VIP 是"外 → 内",
+照位置抄会把方向搞反**),`object-group network/service` →
+`FirewallAddress` / `FirewallService`,所以「对象查询」那套递归展开
+一行都不用改就能用。
 
 ### 规则审计:判定写了两遍,必须一起改
 
