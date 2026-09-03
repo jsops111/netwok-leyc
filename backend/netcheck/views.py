@@ -78,6 +78,7 @@ from netcheck.models import (
     SnmpVersion,
     SourceType,
     Vendor,
+    VipType,
 )
 from netcheck.serializers import (
     DeviceBackupDetailSerializer,
@@ -286,6 +287,43 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return Device.objects.annotate(interface_count_ann=Count("interfaces"))
+
+    @action(detail=True, methods=["get"])
+    def faceplate(self, request, pk=None):
+        """
+        端口面板图。**接口的数量和名字来自设备,几何来自型号画像。**
+
+        每个口带的是**和 `/interfaces` 那一页完全同一份字段**(同一个
+        序列化器)—— 点一个口弹出来的信息必须和那张表对得上,否则同一个口
+        在两个地方显示不同的速率,而看不出哪个是对的。
+
+        ⚠ **画错的面板比没有面板危险**:有人会照着它去机房拔线,而拔错的是
+        别人的。所以返回里带着 `schematic` / `verified` / `note` ——
+        页面上必须原样把那句话显示出来,让人自己决定信到什么程度。
+        """
+
+        from netcheck.devices import faceplate as faceplate_mod
+        from netcheck.devices.profiles import get_profile
+
+        device = self.get_object()
+        interfaces = list(
+            device.interfaces.all().order_by("if_index")
+        )
+        rows = DeviceInterfaceSerializer(interfaces, many=True).data
+        profile = get_profile(device.model, device.vendor)
+        layout = faceplate_mod.build([dict(r) for r in rows], profile)
+
+        return Response({
+            "device": {
+                "id": device.pk, "name": device.name, "mgmt_ip": device.mgmt_ip,
+                "model": device.model, "model_label": device.get_model_display(),
+                "vendor": device.vendor, "kind": device.kind,
+                "state": device.state,
+                "last_collected_at": device.last_collected_at,
+            },
+            **layout,
+            "counts": faceplate_mod.summarize(layout["banks"]),
+        })
 
     def perform_create(self, serializer):
         device = serializer.save()
@@ -2315,6 +2353,7 @@ def meta_choices(request):
         "notify_status": pack(NotifyLog.Status),
         "backup_status": pack(BackupStatus),
         "policy_action": pack(PolicyAction),
+        "vip_type": pack(VipType),
         # 顶部统计的顺序,前端照这个渲染
         "top_kinds": [
             {"value": k, "label": EventKind(k).label} for k in TOP_KINDS

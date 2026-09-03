@@ -517,6 +517,58 @@ export interface VipRow {
   method: string
 }
 
+// ------------------------------------------------- 端口面板图
+
+/**
+ * 面板上的一个口。**继承 InterfaceRow 的全部字段** —— 点一个口弹出来的信息
+ * 必须和 `/interfaces` 那张表对得上,否则同一个口在两个地方显示不同的速率,
+ * 而看不出哪个是对的。
+ */
+export interface FacePort extends InterfaceRow {
+  row: number
+  col: number
+  /** 面板上印的那个号。`renumbered` 为真时它只是顺序,以接口名为准 */
+  port_no: number
+  /**
+   * `up` 通 / `down` **admin up 但链路 down**(该通没通)/
+   * `admin_down` 人为关掉的 / `unknown` 没采到。
+   *
+   * ⚠ `admin_down` **不是红色**:48 口交换机上一半的口是人为关掉的,
+   * 全画红的话真正断掉的那一个就淹在里面了。
+   */
+  state: 'up' | 'down' | 'admin_down' | 'unknown'
+}
+
+export interface FaceBank {
+  label: string
+  rows: number
+  cols: number
+  shape: string
+  /** 面板号重新编过 —— 那时位置只表示顺序,和实物对不上 */
+  renumbered: boolean
+  ports: FacePort[]
+}
+
+export interface Faceplate {
+  device: {
+    id: number; name: string; mgmt_ip: string
+    model: string; model_label: string
+    vendor: string; kind: string; state: string
+    last_collected_at: string | null
+  }
+  /** 这个布局在实机上核对过吗 */
+  verified: boolean
+  /** 没有这款型号的面板几何 —— 位置只表示顺序 */
+  schematic: boolean
+  label: string
+  banks: FaceBank[]
+  /** 没落到面板上的口(Vlan / Port-channel / Loopback)。**必须显示** */
+  unplaced: FacePort[]
+  /** 页面上要**原样显示**的那句话 —— 画错的面板比没有面板危险 */
+  note: string
+  counts: { up: number; down: number; admin_down: number; unknown: number; total: number }
+}
+
 // ------------------------------------------------- 带外硬件(iDRAC)
 
 export interface IdracRow {
@@ -1274,6 +1326,9 @@ export const api = {
   syncPoliciesNow: (id: number) => http.post<{ detail: string }>(`/devices/${id}/sync_policies_now/`),
   policyAudit: (deviceId?: number) =>
     http.get<PolicyAudit>('/firewall-policies/audit/', { params: { device: deviceId } }),
+
+  // 端口面板图 —— 几何来自型号画像,口的名字和状态来自设备
+  deviceFaceplate: (id: number) => http.get<Faceplate>(`/devices/${id}/faceplate/`),
 
   // 带外硬件(iDRAC)
   idracHosts: (params?: object) => http.get<Paged<IdracRow>>('/idrac/', { params }),

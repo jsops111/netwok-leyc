@@ -58,6 +58,7 @@ const NAV = [
   { to: '/backups', label: '配置备份' },
   { to: '/compliance', label: '配置合规' },
   { to: '/policies', label: '防火墙策略' },
+  { to: '/mappings', label: '防火墙映射' },
   { to: '/events', label: '事件记录' },
   { to: '/config', label: '配置中心' },
   { to: '/manage', label: '管理后台' },

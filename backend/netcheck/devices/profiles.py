@@ -205,7 +205,53 @@ class Profile:
     # (Cisco 的 `show startup-config`)。留空 = 这款型号没有这个概念:
     # FortiOS 改完即存,拿它去比对只会得到一堆假的"未保存"
     startup_cli: str = ""
+    #: 面板图。**留空 = 没有这款型号的实测面板布局**,页面上会明说"这是按
+    #: 接口名排的示意图,不是真实面板"—— 不要为了好看随便给一个。
+    #: 画错的面板比没有面板危险:有人会照着它去拔线,而拔错的是别人的。
+    #: 端口的**数量和名字永远来自设备本身**,这里只描述几何排布
+    faceplate: "Faceplate | None" = None
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class PortBank:
+    """
+    面板上的**一组口**。一台设备的面板通常是两三组:一大片接入口 +
+    一小片上行口(SFP/QSFP),它们在物理面板上是分开的两块。
+
+    `pattern` 里必须有一个捕获组,抓出**面板上印着的那个口号**。
+    Catalyst 上 `GigabitEthernet1/0/24` 的面板号是 24,不是 ifIndex ——
+    **ifIndex 和面板位置没有任何关系**,拿 ifIndex 排会排出一个和实物
+    对不上的图,而那正是这个功能最危险的失败方式。
+    """
+
+    #: 这一组的名字,显示在图上("接入口" / "上行口")
+    label: str
+    #: 接口名 → 面板口号。带一个捕获组
+    pattern: str
+    #: 这一组有几排。接入口通常 2 排,SFP 上行常常 1 排
+    rows: int = 2
+    #: 排布方向。Catalyst 的接入口是**列优先、奇数在上**:
+    #: 1 在左上、2 在左下、3 在第二列上…… 按行优先排会得到一个横竖颠倒的图
+    column_major: bool = True
+    #: 口的画法,只影响形状:rj45 画方口,sfp 画扁口
+    shape: str = "rj45"
+
+
+@dataclass(frozen=True)
+class Faceplate:
+    """
+    一款型号的面板几何。**只描述排布,不描述有几个口** ——
+    口的数量和名字来自设备自己上报的接口表,这样一台 48 口交换机插了
+    扩展模块之后图上就会多出那几个口,不需要改代码。
+    """
+
+    #: 人话描述,显示在图的旁边("48 口千兆 + 4 个 SFP+ 上行")
+    label: str
+    banks: tuple[PortBank, ...]
+    #: 这个布局是**实测确认过的**还是照着规格书推的。False 时页面上要
+    #: 明说"未在实机核对过",让人别完全照着它拔线
+    verified: bool = False
 
 
 # ---------------------------------------------------------------- 画像定义
@@ -257,6 +303,42 @@ _CISCO_VOLATILE = (
     r"^\s*!\s*Time:",
 )
 
+# ---- 面板布局 ----
+#
+# **口的数量和名字永远来自设备上报的接口表**,这里只描述几何。所以一台
+# C9300 插了扩展模块之后图上就会多出那几个口,不用改代码。
+#
+# Catalyst 固定电口是**两排、列优先、奇数在上**:1 在左上、2 在左下、
+# 3 在第二列上……这是这一系列的物理排布。按行优先排会得到一个横竖颠倒的图,
+# 而它**看起来完全正常** —— 只有对着实物数才会发现。
+
+_CAT_ACCESS = PortBank(
+    label="接入口",
+    # `GigabitEthernet1/0/24` / `Gi1/0/24` —— 抓最后那个口号。
+    # **不能用 ifIndex 排**:ifIndex 和面板位置没有任何关系
+    pattern=r"^(?:Gi|GigabitEthernet|Te|TenGigabitEthernet)\d+/0/(\d+)$",
+    rows=2,
+    column_major=True,
+    shape="rj45",
+)
+_CAT_UPLINK = PortBank(
+    label="上行口",
+    # 网络模块上的口是 `TenGigabitEthernet1/1/1` —— 中间那一段是 1 不是 0
+    pattern=r"^(?:Te|TenGigabitEthernet|Twe|TwentyFiveGigE|Fo|FortyGigabitEthernet|Ap|AppGigabitEthernet)\d+/1/(\d+)$",
+    rows=1,
+    column_major=False,
+    shape="sfp",
+)
+
+#: Catalyst 固定口的面板。**verified=False** —— 手边没有实机,这个排布
+#: 是照 Cisco 的规格图推的。页面上会标出来,让人别完全照着它拔线
+_CAT_FACEPLATE = Faceplate(
+    label="固定电口两排(列优先、奇数在上)+ 网络模块上行口",
+    banks=(_CAT_ACCESS, _CAT_UPLINK),
+    verified=False,
+)
+
+
 PROFILES: dict[str, Profile] = {
     # ---- 需求点名必须支持的四款 ----
     DeviceModel.C9300_48T: Profile(
@@ -269,6 +351,7 @@ PROFILES: dict[str, Profile] = {
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
         startup_cli=_CISCO_STARTUP_CLI,
+        faceplate=_CAT_FACEPLATE,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes=(
             "48 个千兆电口。**必须用 ifHC* 64 位计数器**:48 口满速时 32 位的 "
@@ -286,6 +369,7 @@ PROFILES: dict[str, Profile] = {
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
         startup_cli=_CISCO_STARTUP_CLI,
+        faceplate=_CAT_FACEPLATE,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         notes="和 C9300-48T 同一套采集,区别只是口数。",
     ),
@@ -299,6 +383,7 @@ PROFILES: dict[str, Profile] = {
         backup_cli=_CISCO_BACKUP_CLI,
         backup_volatile=_CISCO_VOLATILE,
         startup_cli=_CISCO_STARTUP_CLI,
+        faceplate=_CAT_FACEPLATE,
         absent={"session_count", "session_rate", "ha_state", "vpn_tunnels_up"},
         # 温度和电源在 C9200L 上经常采不到:它是固定配置的入门款,
         # 入风口传感器和内置电源不一定注册进 ENVMON MIB。

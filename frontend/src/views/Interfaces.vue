@@ -8,8 +8,9 @@ import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
 import MeterBar from '@/components/cyber/MeterBar.vue'
+import PortFaceplate from '@/components/PortFaceplate.vue'
 import { api, errText } from '@/api'
-import type { InterfaceRow, InterfaceSummaryRow } from '@/api'
+import type { Faceplate as FaceplateData, InterfaceRow, InterfaceSummaryRow } from '@/api'
 import { ago, bps, dateTimeOf, int, pct } from '@/composables/useFormat'
 import { STATE } from '@/theme'
 
@@ -81,6 +82,45 @@ async function loadSummary() {
   }
 }
 
+/**
+ * 面板图。**几何来自型号画像,口的名字和状态来自设备本身** ——
+ * 所以一台插了扩展模块的交换机图上会多出那几个口,不用改代码。
+ *
+ * ⚠ 画错的面板比没有面板危险:有人会照着它去机房拔线,而拔错的是别人的。
+ * 后端返回的 `note` 里说明了这张图可信到什么程度(有没有实机核对过 /
+ * 是不是只是按接口名排的示意图),**组件里原样显示,不许收进折叠**。
+ */
+const faceplate = ref<FaceplateData | null>(null)
+const faceLoading = ref(false)
+/** 图上选中的口 —— 点一下就把它筛到下面的表里 */
+const pickedId = ref<number | null>(null)
+
+async function loadFaceplate() {
+  if (selected.value === null) { faceplate.value = null; return }
+  faceLoading.value = true
+  try {
+    const { data } = await api.deviceFaceplate(selected.value)
+    faceplate.value = data
+  } catch (e) {
+    // **面板拿不到不该让整页打不开** —— 下面那张接口表才是主体
+    faceplate.value = null
+  } finally {
+    faceLoading.value = false
+  }
+}
+
+/**
+ * 点了图上一个口:把它筛到下面的表里。
+ *
+ * **用接口名去筛,不用 id** —— 名字是人在设备上看到的东西,而且筛完
+ * 那个词还留在搜索框里,人能看出"现在这张表是被筛过的"。用 id 静默筛
+ * 会让人以为这台设备只有一个口。
+ */
+function pickPort(port: { id: number; if_name: string }) {
+  pickedId.value = port.id
+  keyword.value = port.if_name
+}
+
 async function loadRows() {
   if (selected.value === null) { rows.value = []; return }
   rowsLoading.value = true
@@ -106,12 +146,17 @@ async function loadRows() {
 onMounted(async () => {
   await loadSummary()
   await loadRows()
+  await loadFaceplate()
 })
 
 watch([selected, keyword, problemOnly, activeOnly, ordering], () => {
   page.value = 1
   void loadRows()
 })
+// 换设备要重画面板 —— 面板是按设备取的。**筛选变了不用重取**:
+// 图上永远画这台设备的全部口,筛选只作用于下面那张表。
+// 图跟着筛选变的话,"只看异常"会让面板上剩下三个孤零零的口 —— 那不是面板
+watch(selected, () => { pickedId.value = null; void loadFaceplate() })
 watch([page, pageSize], () => void loadRows())
 
 async function toggleMonitor(row: InterfaceRow) {
@@ -316,6 +361,19 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
         </span>
       </template>
 
+      <!-- ============ 端口面板图 ============ -->
+      <div v-if="faceLoading" class="face-loading">读取面板…</div>
+      <PortFaceplate
+        v-else-if="faceplate && faceplate.banks.length"
+        :data="faceplate" :active-id="pickedId"
+        class="face"
+        @pick="pickPort"
+      />
+      <div v-else-if="!faceLoading && faceplate" class="face-empty">
+        这台设备还没有采到接口,画不出面板图 —— 接口清单是采出来的,
+        设备刚加进来时是空的。
+      </div>
+
       <div class="filters">
         <NInput v-model:value="keyword" size="small" clearable placeholder="搜接口名 / 描述"
                 style="width: 200px" />
@@ -350,6 +408,11 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
 </template>
 
 <style scoped>
+.face { margin: 0 0 12px; }
+.face-loading, .face-empty {
+  font-size: 11.5px; color: var(--cy-ink-3); padding: 8px 0;
+}
+
 .ifs { display: flex; flex-direction: column; gap: 14px; }
 .tiles {
   display: grid;

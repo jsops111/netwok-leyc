@@ -208,6 +208,8 @@ devices/collector 通道选择、降级、写库、判阈值
 devices/backup    配置备份:取配置、清洗、按内容哈希判"变没变"、算 diff
 devices/policies  防火墙策略同步:API/SSH 两条通道 + 全量替换写库。
                   **映射(firewall vip)也在这里**,和策略同一次、同一个事务
+devices/faceplate **纯函数**:接口表 + 画像的几何 → 每个口的 (排, 列) 和档位。
+                  画错的面板比没有面板危险,schematic/verified 要一路带到页面上
 servers/linux.py  **纯函数**:Linux 采集命令的拼装和 /proc、df 输出的解析。不碰网络也不碰库
 servers/esxi.py   **纯函数**:ESXi 那套(esxcli / vim-cmd)。和 linux.py 同一个分段协议、
                   解析出同一个扁平 dict —— 所以下游一行都不用分叉
@@ -981,6 +983,44 @@ Sparkline 是**手写 SVG,不用 echarts**:一个大屏上有几十个,
 大屏**一次刷新只打三个接口**(`overview` / `charts` / `devices`)。
 别改成每条线路一个请求 —— 几十条线路 × 每 5 秒会把 gunicorn 打满。
 
+### 端口面板图:画错的面板比没有面板危险
+
+`devices/faceplate.py`(纯函数)+ `components/PortFaceplate.vue`(手写 SVG,
+不引图表库 —— 和 Sparkline 同一条)。
+
+**有人会照着这张图去机房拔线,而拔错的是别人的。**所以四条:
+
+1. **口的数量和名字永远来自设备**,画像(`Profile.faceplate`)里只声明几何。
+   这样一台 C9300 插了扩展模块之后图上就会多出那几个口,不用改代码;
+   反过来,画像里写死"48 个口"而设备只报了 24 个的话,图上会凭空多出
+   24 个不存在的口。
+2. **面板号不是 ifIndex。**`GigabitEthernet1/0/24` 面板上印的是 24,而它的
+   ifIndex 可以是任何数(实测环境里常常是倒序的)。拿 ifIndex 排会排出一个
+   和实物对不上的图,而那个图**看起来完全正常** —— 这是这个功能最危险的
+   失败方式。`PortBank.pattern` 的捕获组抓的就是面板号。
+3. **没有画像就明说是示意图。**认不出的型号仍然画(不画等于这个功能对通用
+   设备完全没用),但返回 `schematic=true` + 一句话,组件里**原样显示在图
+   上方,不许收进折叠**。`verified=False` 的画像(照规格图推的,没上过实机)
+   同样要标。让人自己决定信到什么程度,比给他一个不透明的判断可靠 ——
+   和「未保存配置返回 diff 而不只是一个布尔」同一条。
+4. **没落到面板上的口要列出来**(Vlan / Port-channel / Loopback)。
+   图上少一个口,人会以为那个口不存在。
+
+**`admin_down` 是灰色不是红色。**48 口交换机上一半的口是人为关掉的,
+全画红的话满屏是红,真正"该通没通"(admin up + link down)的那一个就淹在
+里面了 —— 和「仅异常」筛选不算 admin down 是同一条规矩。四档:
+`up` / `down` / `admin_down` / `unknown`。
+
+Catalyst 的固定电口是**两排、列优先、奇数在上**(1 左上、2 左下、3 第二列上)。
+按行优先排会得到一个横竖颠倒的图,所以 `column_major` 在画像里是显式开关。
+行优先要知道一排放几个,`_place()` 因此要 `span`(这一组最大的面板号)——
+`rows=1` 的上行口写成 `index // rows` 会排成竖着的一条(实测踩出来的)。
+
+每个口带的是 **`DeviceInterfaceSerializer` 的全部字段**,和 `/interfaces`
+那张表是同一份:点一个口弹出来的信息必须和表里对得上,否则同一个口在两个
+地方显示不同的速率,而看不出哪个是对的。**图不跟着筛选变** —— "只看异常"
+会让面板上剩下三个孤零零的口,那不是面板。
+
 ### 接口页的「速率成色」不是装饰
 
 `/interfaces` 那一列显示 64 位 / 32 位。**ifHC* 采不到时退回 32 位计数器,
@@ -1062,6 +1102,9 @@ diff、全量替换、阈值判定的全部分支、写库路径、接口返回�
   `esxcli storage filesystem list` 的列名
 - `devices/policies.py` 的 `parse_show_firewall_policy` 和
   `parse_show_firewall_vip`(FortiOS 大版本间 `show` 的缩进和字段名有出入)
+- `devices/profiles.py` 的 `faceplate`。Catalyst 那个面板排布是**照规格图推的,
+  没在实机上核对过**(`verified=False`,页面上标着)。上第一台真机时对着实物
+  数一遍两排的顺序,确认了就把 `verified` 改成 True —— 别在没核对之前改
 - `idrac/redfish.py` 的 `ENDPOINTS`(iDRAC 7/8 上 `$expand` 不支持、
   `System.Embedded.1` 这个 id 在某些机型上不同)和 `idrac/parse.py` 的
   几个 Oem 路径(`Oem.Dell.DellVirtualDisk.RemainingRedundancy` 这类是

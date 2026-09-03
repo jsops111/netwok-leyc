@@ -65,6 +65,12 @@ const routes = [
     meta: { title: '防火墙策略', nav: '防火墙策略' },
   },
   {
+    path: '/mappings',
+    name: 'mappings',
+    component: () => import('@/views/Mappings.vue'),
+    meta: { title: '防火墙映射', nav: '防火墙映射' },
+  },
+  {
     path: '/events',
     name: 'events',
     component: () => import('@/views/Events.vue'),
