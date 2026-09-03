@@ -216,30 +216,30 @@ const exportUrl = computed(() => api.interfaceExportUrl({
 }))
 
 const summaryColumns: DataTableColumns<InterfaceSummaryRow> = [
-  { title: '设备', key: 'device_name', minWidth: 160,
+  { title: '设备', key: 'device_name', sorter: 'default', minWidth: 160,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.device_name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.mgmt_ip} · ${r.model_label}`),
     ]) },
-  { title: '状态', key: 'state', width: 82,
+  { title: '状态', key: 'state', sorter: 'default', width: 82,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '接口数', key: 'total', width: 96, className: 'num',
+  { title: '接口数', key: 'total', sorter: 'default', width: 96, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, [
       h('b', { style: 'font-size:12.5px' }, String(r.total)),
       h('span', { style: 'color:var(--cy-ink-3)' }, ` / up ${r.up}`),
     ]) },
-  { title: '异常', key: 'problem', width: 72, className: 'num',
+  { title: '异常', key: 'problem', sorter: 'default', width: 72, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;font-weight:700;color:${r.problem ? STATE.down : 'var(--cy-ink-3)'}`,
       title: 'admin up 但链路 down',
     }, r.problem ? String(r.problem) : '—') },
-  { title: '错包', key: 'errors', width: 72, className: 'num',
+  { title: '错包', key: 'errors', sorter: 'default', width: 72, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.errors ? STATE.degraded : 'var(--cy-ink-3)'}`,
       title: '本周期新增了错包的接口数',
     }, r.errors ? String(r.errors) : '—') },
-  { title: '速率成色', key: 'counter_32bit', width: 104,
+  { title: '速率成色', key: 'counter_32bit', sorter: 'default', width: 104,
     render: (r) => r.counter_32bit
       ? h(NTag, {
           size: 'tiny', bordered: false,
@@ -248,10 +248,10 @@ const summaryColumns: DataTableColumns<InterfaceSummaryRow> = [
         }, () => `${r.counter_32bit} 口 32 位`)
       : h('span', { style: `font-size:10.5px;color:${STATE.up}` }, '64 位'),
   },
-  { title: '未监控', key: 'unmonitored', width: 76, className: 'num',
+  { title: '未监控', key: 'unmonitored', sorter: 'default', width: 76, className: 'num',
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' },
       r.unmonitored ? String(r.unmonitored) : '—') },
-  { title: '最后采集', key: 'last_collected_at', width: 96,
+  { title: '最后采集', key: 'last_collected_at', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' },
       ago(r.last_collected_at)) },
   { title: '操作', key: 'act', width: 92, fixed: 'right',
@@ -278,26 +278,26 @@ function statusCell(r: InterfaceRow) {
 }
 
 const ifColumns: DataTableColumns<InterfaceRow> = [
-  { title: 'ifIndex', key: 'if_index', width: 74, className: 'num',
+  { title: 'ifIndex', key: 'if_index', sorter: 'default', width: 74, className: 'num',
     render: (r) => h('span', { style: "font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-3)" },
       String(r.if_index)) },
-  { title: '接口', key: 'if_name', minWidth: 168,
+  { title: '接口', key: 'if_name', sorter: 'default', minWidth: 168,
     render: (r) => h('div', [
       h('div', { style: "font-size:12px;color:var(--cy-ink);font-family:'JetBrains Mono',monospace" }, r.if_name),
       r.if_alias
         ? h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, r.if_alias)
         : null,
     ]) },
-  { title: '状态', key: 'oper_up', width: 92, render: statusCell },
-  { title: '协商速率', key: 'speed_bps', width: 92, className: 'num',
+  { title: '状态', key: 'oper_up', sorter: 'default', width: 92, render: statusCell },
+  { title: '协商速率', key: 'speed_bps', sorter: 'default', width: 92, className: 'num',
     render: (r) => h('span', { style: "font-size:11px;font-family:'JetBrains Mono',monospace" },
       r.speed_bps ? bps(r.speed_bps) : '—') },
-  { title: '入向 / 出向', key: 'rate', width: 168,
+  { title: '入向 / 出向', key: 'rate', sorter: 'default', width: 168,
     render: (r) => h('div', { style: "font-size:11px;font-family:'JetBrains Mono',monospace;line-height:1.5" }, [
       h('div', null, `↓ ${bps(r.in_bps)}`),
       h('div', { style: 'color:var(--cy-ink-2)' }, `↑ ${bps(r.out_bps)}`),
     ]) },
-  { title: '利用率', key: 'util', width: 128,
+  { title: '利用率', key: 'util', sorter: 'default', width: 128,
     render: (r) => {
       // 协商速率拿不到就算不出利用率 —— 显示"无速率"而不是 0%
       if (r.util_in_pct === null && r.util_out_pct === null) {
@@ -314,7 +314,7 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
         }, pct(worst, 0)),
       ])
     } },
-  { title: '错包增量', key: 'err', width: 96, className: 'num',
+  { title: '错包增量', key: 'err', sorter: 'default', width: 96, className: 'num',
     render: (r) => {
       const total = (r.in_err_delta ?? 0) + (r.out_err_delta ?? 0)
       // 两个都是 null 说明还没有上一拍可比 —— 不是 0
@@ -326,7 +326,7 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
           + `color:${total ? STATE.degraded : 'var(--cy-ink-3)'};font-weight:${total ? 700 : 400}`,
       }, int(total))
     } },
-  { title: '速率成色', key: 'counter_32bit', width: 92,
+  { title: '速率成色', key: 'counter_32bit', sorter: 'default', width: 92,
     render: (r) => r.counter_32bit
       ? h(NTag, {
           size: 'tiny', bordered: false,
@@ -336,7 +336,7 @@ const ifColumns: DataTableColumns<InterfaceRow> = [
         }, () => '32 位')
       : h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '64 位'),
   },
-  { title: '最后变化', key: 'last_change', width: 96,
+  { title: '最后变化', key: 'last_change', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' },
       r.last_change ? ago(r.last_change) : '—') },
   { title: '纳入监控', key: 'monitored', width: 84, fixed: 'right',

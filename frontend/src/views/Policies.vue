@@ -8,7 +8,9 @@ import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
 import { api, errText } from '@/api'
-import type { PolicyAudit, PolicyRow, PolicySummaryRow, VipSummary } from '@/api'
+import type {
+  AddressResolve, AddressRow, PolicyAudit, PolicyRow, PolicySummaryRow, VipSummary,
+} from '@/api'
 import { useMetaStore } from '@/stores/meta'
 import { ago, bytes, dateTimeOf, int } from '@/composables/useFormat'
 import { STATE } from '@/theme'
@@ -68,6 +70,22 @@ const noLogOnly = ref(false)
 // 这里只要那两个必须让人看见的数(整机映射 / 没有策略引用)
 const vipsLoading = ref(false)
 const vipSummary = ref<VipSummary | null>(null)
+
+/**
+ * 地址对象 / 地址组的**别名查询**。
+ *
+ * 策略表里的源/目的地址是一串**名字**(`内网服务器组`),
+ * **它到底是哪几个网段完全不在策略表里** —— 这个框就是答案。
+ * 地址组会递归展开(组能套组),给一棵树和一张拍平的叶子表。
+ */
+const addrQuery = ref('')
+const addrResult = ref<AddressResolve | null>(null)
+const addrLoading = ref(false)
+const addrList = ref<AddressRow[]>([])
+const addrListLoading = ref(false)
+const addrOpen = ref(false)
+const addrKeyword = ref('')
+const groupOnly = ref(false)
 
 const current = computed(() => summary.value.find((s) => s.device_id === selected.value) || null)
 const totals = computed(() => {
@@ -156,12 +174,62 @@ async function loadVips() {
   }
 }
 
+async function lookupAddress() {
+  const name = addrQuery.value.trim()
+  if (selected.value === null || !name) { addrResult.value = null; return }
+  addrLoading.value = true
+  try {
+    const { data } = await api.resolveAddress(selected.value, name)
+    addrResult.value = data
+  } catch (e) {
+    message.error(errText(e))
+    addrResult.value = null
+  } finally {
+    addrLoading.value = false
+  }
+}
+
+async function loadAddresses() {
+  if (selected.value === null) { addrList.value = []; return }
+  addrListLoading.value = true
+  try {
+    // 地址对象通常几十到几百条,一次取完在前端筛 —— 这一页要的是
+    // "扫一眼全部",分页会让"有哪些组"这个问题要翻好几页
+    const { data } = await api.addresses({
+      device: selected.value, page_size: 1000, ordering: 'name',
+    })
+    addrList.value = data.results
+  } catch (e) {
+    message.error(errText(e))
+  } finally {
+    addrListLoading.value = false
+  }
+}
+
+const shownAddresses = computed(() => {
+  const kw = addrKeyword.value.trim().toLowerCase()
+  return addrList.value.filter((a) => {
+    if (groupOnly.value && !a.is_group) return false
+    if (!kw) return true
+    return [a.name, a.value, a.comment, ...(a.members || [])]
+      .some((t) => (t || '').toLowerCase().includes(kw))
+  })
+})
+
+/** 点策略表里的一个地址名 → 直接查它 */
+function lookupFromPolicy(name: string) {
+  addrQuery.value = name
+  addrOpen.value = true
+  void lookupAddress()
+}
+
 onMounted(async () => {
   await meta.load()
   await loadSummary()
   await loadPolicies()
   await loadAudit()
   await loadVips()
+  await loadAddresses()
 })
 
 // 换设备/换筛选都回到第一页 —— 停在第 7 页看另一台设备是没有意义的
@@ -171,7 +239,10 @@ watch([selected, keyword, actionFilter, enabledFilter, neverHitOnly,
   void loadPolicies()
 })
 // 换设备要重算审计 —— 审计是按设备算的(影子规则要看那台设备的完整顺序)
-watch(selected, () => { void loadAudit(); void loadVips() })
+watch(selected, () => {
+  void loadAudit(); void loadVips(); void loadAddresses()
+  addrResult.value = null
+})
 watch([page, pageSize], () => void loadPolicies())
 
 async function syncNow(deviceId: number) {
@@ -232,37 +303,37 @@ function listCell(values: string[], emptyText = '—') {
 }
 
 const summaryColumns: DataTableColumns<PolicySummaryRow> = [
-  { title: '防火墙', key: 'device_name', minWidth: 150,
+  { title: '防火墙', key: 'device_name', sorter: 'default', minWidth: 150,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.device_name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.mgmt_ip} · VDOM ${r.vdom}`),
     ]) },
-  { title: '状态', key: 'state', width: 82,
+  { title: '状态', key: 'state', sorter: 'default', width: 82,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '策略数', key: 'total', width: 78, className: 'num',
+  { title: '策略数', key: 'total', sorter: 'default', width: 78, className: 'num',
     render: (r) => h('span', { style: 'font-size:12px;font-weight:700' }, int(r.total)) },
-  { title: '允许 / 拒绝', key: 'split', width: 108,
+  { title: '允许 / 拒绝', key: 'split', sorter: 'default', width: 108,
     render: (r) => h('span', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace" }, [
       h('span', { style: `color:${STATE.up}` }, String(r.accept)),
       h('span', { style: 'color:var(--cy-ink-3)' }, ' / '),
       h('span', { style: `color:${STATE.down}` }, String(r.deny)),
     ]) },
-  { title: '已停用', key: 'disabled', width: 74, className: 'num',
+  { title: '已停用', key: 'disabled', sorter: 'default', width: 74, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.disabled ? STATE.degraded : 'var(--cy-ink-3)'}`,
     }, r.disabled ? int(r.disabled) : '—') },
-  { title: '过宽', key: 'wide_open', width: 66, className: 'num',
+  { title: '过宽', key: 'wide_open', sorter: 'default', width: 66, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;font-weight:700;color:${r.wide_open ? STATE.down : 'var(--cy-ink-3)'}`,
       title: 'any-any-any 的放行规则',
     }, r.wide_open ? String(r.wide_open) : '—') },
-  { title: '无日志', key: 'no_log', width: 72, className: 'num',
+  { title: '无日志', key: 'no_log', sorter: 'default', width: 72, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.no_log ? STATE.degraded : 'var(--cy-ink-3)'}`,
       title: '放行但不记日志',
     }, r.no_log ? String(r.no_log) : '—') },
-  { title: '从未命中', key: 'never_hit', width: 96, className: 'num',
+  { title: '从未命中', key: 'never_hit', sorter: 'default', width: 96, className: 'num',
     render: (r) => {
       // **null = 没有命中统计**(SSH 通道)。显示"无统计"而不是 0 ——
       // 0 会被读成"所有规则都在用",而真相是我们不知道
@@ -273,7 +344,7 @@ const summaryColumns: DataTableColumns<PolicySummaryRow> = [
         style: `font-size:11.5px;font-weight:700;color:${r.never_hit ? STATE.degraded : STATE.up}`,
       }, int(r.never_hit))
     } },
-  { title: '同步', key: 'synced_at', minWidth: 150,
+  { title: '同步', key: 'synced_at', sorter: 'default', minWidth: 150,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11px;color:var(--cy-ink-2)' },
         r.synced_at ? ago(r.synced_at) : '从未同步'),
@@ -292,29 +363,57 @@ const summaryColumns: DataTableColumns<PolicySummaryRow> = [
     ]) },
 ]
 
+/**
+ * 地址名那一格。每个名字做成可点的 —— 点一下查它是什么。
+ *
+ * **`all` 单独标出来**:它是"任意",而不是一个还没查的别名。
+ * 混在一堆名字里看不出来,而那恰恰是最该看见的一个。
+ */
+function addrCell(names: string[] | null | undefined) {
+  const list = names || []
+  if (!list.length) {
+    return h('div', { class: 'cell-line dim' }, 'any(没写 = 不限制)')
+  }
+  return h('div', { class: 'cell-line' }, list.map((n, i) => {
+    const any = String(n).toLowerCase() === 'all'
+    return h('button', {
+      key: i,
+      class: ['addr-chip', any ? 'any' : ''],
+      title: any ? '任意地址(0.0.0.0/0)' : `点一下查「${n}」是哪些地址`,
+      onClick: (e: Event) => { e.stopPropagation(); if (!any) lookupFromPolicy(String(n)) },
+    }, String(n))
+  }))
+}
+
 const policyColumns: DataTableColumns<PolicyRow> = [
-  { title: '#', key: 'seq', width: 52, className: 'num',
+  { title: '#', key: 'seq', sorter: 'default', width: 52, className: 'num',
     render: (r) => h('span', {
       style: "font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-3)",
       title: '设备上的先后顺序 —— 防火墙先匹配先生效',
     }, String(r.seq + 1)) },
-  { title: 'ID', key: 'policy_id', width: 58, className: 'num',
+  { title: 'ID', key: 'policy_id', sorter: 'default', width: 58, className: 'num',
     render: (r) => h('span', {
       style: "font-size:11px;font-family:'JetBrains Mono',monospace",
     }, String(r.policy_id)) },
-  { title: '名称', key: 'name', minWidth: 132,
+  { title: '名称', key: 'name', sorter: 'default', minWidth: 132,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11.5px;color:var(--cy-ink)' }, r.name || '(未命名)'),
       r.comments
         ? h('div', { style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.4' }, r.comments)
         : null,
     ]) },
-  { title: '源', key: 'src', minWidth: 130,
-    render: (r) => h('div', [listCell(r.src_intf, 'any'), listCell(r.src_addr, 'any')]) },
-  { title: '目的', key: 'dst', minWidth: 178,
+  { title: '源', key: 'src', minWidth: 148, sorter: (a, b) =>
+      (a.src_addr?.join() || '').localeCompare(b.src_addr?.join() || ''),
+    render: (r) => h('div', [
+      listCell(r.src_intf, 'any'),
+      // 地址名**点一下就能查它是什么** —— 策略表里只有名字,
+      // 而"这条策略放开的到底是哪个网段"是看策略时最常问的一句
+      addrCell(r.src_addr),
+    ]) },
+  { title: '目的', key: 'dst', sorter: 'default', minWidth: 178,
     render: (r) => h('div', [
       listCell(r.dst_intf, 'any'),
-      listCell(r.dst_addr, 'any'),
+      addrCell(r.dst_addr),
       // **映射**。策略的目的地址里只有一个 `web-vip` 这样的名字,它指向内网
       // 哪台机器的哪个端口完全不在策略表里 —— 这一行就是答案。
       // mappings 为 null 是"这次没查映射表",空数组是"目的地址里没有映射",
@@ -337,15 +436,15 @@ const policyColumns: DataTableColumns<PolicyRow> = [
           : null,
       ])),
     ]) },
-  { title: '服务', key: 'service', minWidth: 104,
+  { title: '服务', key: 'service', sorter: 'default', minWidth: 104,
     render: (r) => listCell(r.service, 'ALL') },
-  { title: '动作', key: 'action', width: 76,
+  { title: '动作', key: 'action', sorter: 'default', width: 76,
     render: (r) => h(NTag, {
       size: 'tiny', bordered: false,
       style: `color:${ACTION_COLORS[r.action] || STATE.unknown};`
         + `border:1px solid ${ACTION_COLORS[r.action] || STATE.unknown}`,
     }, () => r.action_label) },
-  { title: 'NAT', key: 'nat', width: 54,
+  { title: 'NAT', key: 'nat', sorter: 'default', width: 54,
     render: (r) => h('span', {
       style: `font-size:11px;color:${r.nat ? 'var(--cy-cyan)' : 'var(--cy-ink-3)'}`,
     }, r.nat ? '开' : '—') },
@@ -383,7 +482,7 @@ const policyColumns: DataTableColumns<PolicyRow> = [
       }
       return h('div', { style: 'display:flex;gap:3px;flex-wrap:wrap' }, tags)
     } },
-  { title: '命中', key: 'hit_count', width: 112, className: 'num',
+  { title: '命中', key: 'hit_count', sorter: 'default', width: 112, className: 'num',
     render: (r) => {
       // 三态。**null 显示「未知」,不显示 0** —— 见文件头第 2 条
       if (r.hit_count === null) {
@@ -399,12 +498,43 @@ const policyColumns: DataTableColumns<PolicyRow> = [
           : null,
       ])
     } },
-  { title: '最后命中', key: 'last_hit_at', width: 96,
+  { title: '最后命中', key: 'last_hit_at', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' },
       r.last_hit_at ? ago(r.last_hit_at) : '—') },
   { title: '', key: 'act', width: 62, fixed: 'right',
     render: (r) => h(NButton, { size: 'tiny', text: true, type: 'primary',
       onClick: () => openDetail(r) }, () => '详情') },
+]
+
+const addrColumns: DataTableColumns<AddressRow> = [
+  { title: '名称', key: 'name', minWidth: 150, sorter: 'default',
+    render: (r) => h('div', [
+      h('button', { class: 'addr-chip', onClick: () => lookupFromPolicy(r.name) }, r.name),
+      r.comment
+        ? h('div', { style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.4' }, r.comment)
+        : null,
+    ]) },
+  { title: '类型', key: 'addr_type', width: 108, sorter: 'default',
+    render: (r) => h(NTag, {
+      size: 'tiny', bordered: false,
+      type: r.is_group ? 'info' : undefined,
+    }, () => r.addr_type_label) },
+  { title: '是什么', key: 'display', minWidth: 200, sorter: 'default',
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink)",
+    }, r.display) },
+  { title: '成员', key: 'member_count', width: 96, className: 'num',
+    // **不是组时是 null 不是 0** —— 0 会被读成"这个组是空的"
+    sorter: (a, b) => (a.member_count ?? -1) - (b.member_count ?? -1),
+    render: (r) => r.member_count === null
+      ? h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, '—')
+      : h('span', {
+          style: "font-size:11.5px;font-family:'JetBrains Mono',monospace",
+          title: (r.members || []).join('、'),
+        }, `${r.member_count} 个`) },
+  { title: '绑定接口', key: 'interface', sorter: 'default', width: 100,
+    render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' },
+      r.interface || '—') },
 ]
 
 const actionOptions = computed(() => [
@@ -611,6 +741,135 @@ const FINDING_COLORS: Record<string, string> = {
       </div>
     </CyberPanel>
 
+    <!-- ============ 地址对象 / 地址组:别名查询 ============ -->
+    <CyberPanel
+      title="地址对象" subtitle="策略里那些名字到底是哪几个网段"
+    >
+      <template #actions>
+        <NButton size="tiny" ghost @click="addrOpen = !addrOpen">
+          {{ addrOpen ? '收起清单' : `展开清单(${addrList.length})` }}
+        </NButton>
+      </template>
+
+      <div class="addr-lead">
+        策略表里的源/目的地址是一串<b>名字</b>(<code>内网服务器组</code>)——
+        <b>它到底是哪几个网段完全不在策略表里</b>。在这儿查,或者直接点上面
+        表格里的地址名。<b>地址组会递归展开</b>(组能套组)。
+      </div>
+
+      <div class="filters">
+        <NInput
+          v-model:value="addrQuery" size="small" clearable
+          placeholder="输入别名,如 内网服务器组" style="width: 260px"
+          @keyup.enter="lookupAddress"
+        />
+        <NButton size="small" type="primary" ghost :loading="addrLoading" @click="lookupAddress">
+          查
+        </NButton>
+        <span class="dim small">
+          共同步到 {{ addrList.length }} 个对象,其中
+          {{ addrList.filter((a) => a.is_group).length }} 个是组
+        </span>
+      </div>
+
+      <!-- ---- 查询结果 ---- -->
+      <div v-if="addrResult" class="addr-res">
+        <!-- 四种 kind 的说法完全不同,尤其是 unknown ——
+             **「没同步到」不等于「不存在」** -->
+        <template v-if="addrResult.result.kind === 'unknown'">
+          <div class="addr-note warn">
+            <b>没有同步到「{{ addrResult.query }}」这个对象。</b>
+            这<b>不等于</b>它在设备上不存在 —— FortiOS 的
+            <code>show</code> 只打印偏离默认值的项,<b>出厂自带的对象
+            (all / none / FABRIC_DEVICE)根本不会出现在输出里</b>。
+            <template v-if="addrResult.method === 'ssh'">
+              这批数据走的是 <b>SSH</b> 通道,拿不到内置对象;
+              配了 API Token 的话 API 通道能拿全。
+            </template>
+            也可能是名字打错了,或者这一批同步的时候它还没建。
+          </div>
+        </template>
+        <template v-else-if="addrResult.result.kind === 'builtin'">
+          <div class="addr-note">
+            <b>{{ addrResult.query }}</b> 是 FortiOS 的<b>内置名</b> ——
+            {{ addrResult.result.value }}。引用它的策略对<b>所有地址</b>开放。
+          </div>
+        </template>
+        <template v-else>
+          <div class="addr-head">
+            <b class="cy-mono">{{ addrResult.result.name }}</b>
+            <NTag size="tiny" :bordered="false">
+              {{ addrResult.result.kind === 'group' ? '地址组' : '地址对象' }}
+            </NTag>
+            <span v-if="addrResult.result.kind === 'address'" class="cy-mono">
+              = {{ addrResult.result.value || '—' }}
+            </span>
+            <span v-else class="dim">
+              展开后 {{ addrResult.result.leaves.length }} 项
+            </span>
+            <span class="dim small">数据走 {{ (addrResult.method || '?').toUpperCase() }} 通道</span>
+          </div>
+
+          <!-- **环要标出来** —— 组 A 含组 B、组 B 含组 A,FortiOS 不拦 -->
+          <div v-if="addrResult.result.cycle" class="addr-note warn">
+            <b>这个组里有循环引用</b>(某个子组又把它自己包了回来)——
+            那一支已经掐掉,下面的清单可能不全。这是设备上要修的配置。
+          </div>
+          <div v-if="addrResult.result.truncated" class="addr-note warn">
+            嵌套层数超过上限,展开被截断了 —— 下面的清单不全。
+          </div>
+
+          <div v-if="addrResult.result.leaves.length" class="addr-leaves">
+            <div v-for="(l, i) in addrResult.result.leaves" :key="i" class="addr-leaf">
+              <span class="cy-mono l-name">{{ l.name }}</span>
+              <span class="cy-mono l-val">{{ l.value || '—' }}</span>
+            </div>
+          </div>
+          <div v-else class="dim small">这个组是空的(没有成员)。</div>
+        </template>
+
+        <!-- 谁在用它。**空数组 = 确实没有策略引用**,可以清理 -->
+        <div class="addr-used">
+          <template v-if="addrResult.used_by.length">
+            <span class="dim">被 {{ addrResult.used_by.length }} 条策略引用:</span>
+            <NTag
+              v-for="u in addrResult.used_by.slice(0, 12)" :key="u.id"
+              size="tiny" :bordered="false"
+              :style="u.enabled ? '' : `color:${STATE.degraded};opacity:.85`"
+              :title="`#${u.seq + 1} ${u.name || '(未命名)'} · 用在${u.where}${u.enabled ? '' : ' · 已停用'}`"
+            >#{{ u.policy_id }} {{ u.where }}{{ u.enabled ? '' : '(停)' }}</NTag>
+          </template>
+          <span v-else class="dim">
+            <b :style="{ color: STATE.degraded }">没有任何策略引用它</b> —— 配了但不生效,可以清理。
+          </span>
+        </div>
+      </div>
+
+      <!-- ---- 全部对象清单 ---- -->
+      <template v-if="addrOpen">
+        <div class="filters" style="margin-top: 12px">
+          <NInput
+            v-model:value="addrKeyword" size="small" clearable
+            placeholder="搜名称 / 地址值 / 备注 / 组成员" style="width: 240px"
+          />
+          <label class="never-toggle">
+            <NSwitch v-model:value="groupOnly" size="small" />
+            <span>只看地址组</span>
+          </label>
+        </div>
+        <NDataTable
+          :columns="addrColumns" :data="shownAddresses" :loading="addrListLoading"
+          size="small" :bordered="false" :single-line="false" :scroll-x="820"
+          :pagination="{ pageSize: 20, showSizePicker: true, pageSizes: [20, 50, 100] }"
+        />
+        <div v-if="!addrList.length && !addrListLoading" class="cy-empty">
+          没有同步到地址对象。<b>这不等于这台防火墙没有配</b> ——
+          SSH 通道的 <code>show firewall address</code> 可能没跑成,
+          API 通道可能权限不够。点上面那台的「立即同步」再看。
+        </div>
+      </template>
+    </CyberPanel>
+
     <!-- 映射(firewall vip)搬到了 /mappings 独立一页 —— 它要被翻、被筛、
          被排序,和策略表挤在一页里两张表互相抢空间。这里只留一个入口 +
          那两个必须让人看见的数(整机映射 / 没有策略引用) -->
@@ -712,6 +971,77 @@ const FINDING_COLORS: Record<string, string> = {
 </template>
 
 <style scoped>
+/* 地址名做成可点的小片 —— 它是"这条策略放开了谁"的入口 */
+.addr-chip {
+  background: none;
+  border: none;
+  padding: 0 2px 0 0;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--cy-cyan);
+  cursor: pointer;
+  text-align: left;
+}
+.addr-chip:hover { text-decoration: underline; }
+/* `all` 单独标出来:它是"任意"而不是一个还没查的别名 */
+.addr-chip.any { color: var(--cy-degraded); cursor: default; }
+.addr-chip.any:hover { text-decoration: none; }
+.cell-line { display: flex; gap: 5px; flex-wrap: wrap; line-height: 1.6; }
+.cell-line.dim { color: var(--cy-ink-3); font-size: 11px; }
+
+.addr-lead {
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--cy-ink-2);
+  padding: 6px 11px;
+  margin-bottom: 10px;
+  border-left: 2px solid var(--cy-line);
+  background: color-mix(in srgb, var(--cy-raised) 50%, transparent);
+}
+.addr-lead code, .addr-note code, .cy-empty code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  color: var(--cy-cyan);
+}
+.addr-res {
+  border: 1px solid var(--cy-line-soft);
+  padding: 9px 12px;
+  margin-top: 10px;
+}
+.addr-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; margin-bottom: 7px;
+}
+.addr-note {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--cy-ink-2);
+  padding: 6px 11px;
+  margin-bottom: 8px;
+  border-left: 2px solid var(--cy-line);
+  background: color-mix(in srgb, var(--cy-raised) 55%, transparent);
+}
+.addr-note.warn {
+  color: var(--cy-degraded);
+  border-left-color: var(--cy-degraded);
+  background: color-mix(in srgb, var(--cy-degraded) 7%, transparent);
+}
+.addr-leaves {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 2px 14px;
+}
+.addr-leaf { display: flex; gap: 10px; font-size: 11.5px; line-height: 1.7; }
+.l-name { color: var(--cy-ink-2); min-width: 108px; }
+.l-val { color: var(--cy-ink); }
+.addr-used {
+  margin-top: 9px;
+  padding-top: 7px;
+  border-top: 1px solid var(--cy-line-soft);
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  font-size: 11px;
+}
+
 /* 映射那一行 —— 缩进 + 箭头,让人一眼看出它是挂在目的地址下面的解释,
    不是又一个并列的地址 */
 .map-line {

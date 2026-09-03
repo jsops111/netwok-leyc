@@ -201,6 +201,11 @@ class Profile:
     #: 不要拿别的命令凑:一份内容不是映射表的"映射"比没有更糟,
     #: 页面上看着有一列目标地址,而它指的不是真正的目标
     vip_cli: str = ""
+    #: `show firewall address` / `show firewall addrgrp` —— 地址对象和地址组。
+    #: 策略里的源/目的地址是一串**名字**,这两条命令回答"那些名字是什么"。
+    #: **空 = 这款型号不同步地址对象**,不要拿别的命令凑
+    address_cli: str = ""
+    addrgrp_cli: str = ""
     # 「启动配置」的命令,用来判断有没有**改了但没保存**的配置
     # (Cisco 的 `show startup-config`)。留空 = 这款型号没有这个概念:
     # FortiOS 改完即存,拿它去比对只会得到一堆假的"未保存"
@@ -435,6 +440,8 @@ PROFILES: dict[str, Profile] = {
         backup_volatile=(r"^\s*#conf_file_ver=",),
         policy_cli="show firewall policy",
         vip_cli="show firewall vip",
+        address_cli="show firewall address",
+        addrgrp_cli="show firewall addrgrp",
         optional={"temp_c", "vpn_tunnels_up"},
         notes=(
             "FortiOS 7.x。**推荐 collect_method=api、fallback=snmp**:"
@@ -479,6 +486,8 @@ PROFILES: dict[str, Profile] = {
         backup_volatile=(r"^\s*#conf_file_ver=",),
         policy_cli="show firewall policy",
         vip_cli="show firewall vip",
+        address_cli="show firewall address",
+        addrgrp_cli="show firewall addrgrp",
         optional={"temp_c", "vpn_tunnels_up", "session_rate"},
         notes="没在册的 FortiGate 型号。",
     ),

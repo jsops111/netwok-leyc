@@ -14,6 +14,7 @@ from netcheck.models import (
     DeviceNeighbor,
     Event,
     FirewallPolicy,
+    FirewallAddress,
     FirewallVip,
     IdracHost,
     IdracSample,
@@ -137,6 +138,13 @@ class FirewallVipAdmin(admin.ModelAdmin):
                     "port_forward", "synced_at")
     list_filter = ("device", "vdom", "vip_type", "port_forward", "method")
     search_fields = ("name", "comment", "ext_ip", "mapped_ip")
+
+
+@admin.register(FirewallAddress)
+class FirewallAddressAdmin(admin.ModelAdmin):
+    list_display = ("device", "vdom", "name", "addr_type", "is_group", "display", "synced_at")
+    list_filter = ("device", "vdom", "addr_type", "is_group", "method")
+    search_fields = ("name", "value", "comment")
 
 
 @admin.register(IdracHost)

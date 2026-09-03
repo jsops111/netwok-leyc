@@ -16,6 +16,7 @@ from netcheck.models import (
     DeviceNeighbor,
     Event,
     FirewallPolicy,
+    FirewallAddress,
     FirewallVip,
     IdracHost,
     Notifier,
@@ -252,6 +253,28 @@ class IdracHostFilter(filters.FilterSet):
             return queryset
         return queryset.filter(events__resolved_at__isnull=True).distinct() if value \
             else queryset.exclude(events__resolved_at__isnull=True)
+
+
+class FirewallAddressFilter(filters.FilterSet):
+    device = filters.NumberFilter(field_name="device_id")
+    keyword = filters.CharFilter(method="filter_keyword", label="名称/地址值/备注")
+    # 「只看地址组」—— 别名查询里最常用的一个筛
+    is_group = filters.BooleanFilter(field_name="is_group")
+
+    class Meta:
+        model = FirewallAddress
+        fields = ["device", "vdom", "addr_type", "is_group", "method"]
+
+    def filter_keyword(self, queryset, name, value):
+        from django.db.models import Q
+
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(value__icontains=value)
+            | Q(comment__icontains=value)
+            # 组的成员名单也要能搜到 —— 「哪个组里有 web-svr」是个真问题
+            | Q(members__icontains=value)
+        )
 
 
 class FirewallVipFilter(filters.FilterSet):

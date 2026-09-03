@@ -40,9 +40,11 @@ from django.db import transaction
 from django.utils import timezone
 
 from netcheck.models import (
+    AddressType,
     Device,
     DeviceKind,
     FirewallPolicy,
+    FirewallAddress,
     FirewallVip,
     PolicyAction,
     Vendor,
@@ -470,6 +472,272 @@ def _vips_from_ssh(device: Device) -> list[dict]:
     return parse_show_firewall_vip(raw)
 
 
+# =========================================================================
+# 地址对象(firewall address / addrgrp)
+# =========================================================================
+#
+# 策略里的源/目的地址是一串**名字**,它到底是哪个网段完全不在策略表里。
+# 这一段把地址对象也拉回来,页面上那个"别名 → 源地址"的查询靠它。
+
+_ADDRESS_TYPES = {
+    "ipmask": AddressType.SUBNET,
+    "iprange": AddressType.RANGE,
+    "fqdn": AddressType.FQDN,
+    "geography": AddressType.GEOGRAPHY,
+    "wildcard": AddressType.WILDCARD,
+    "dynamic": AddressType.DYNAMIC,
+}
+
+
+def normalize_address_type(raw: str) -> str:
+    """认不出的落到 other。**不猜成子网** —— 见 models.AddressType 的说明。"""
+    return _ADDRESS_TYPES.get(str(raw or "").strip().lower(), AddressType.OTHER)
+
+
+def _mask_to_prefix(mask: str) -> int | None:
+    """
+    `255.255.255.0` → 24。
+
+    FortiOS 的 `subnet` 字段给的是**点分掩码**,而人看的是 CIDR。
+    在后端换算是因为前端各换一遍的话,总有一处会把掩码原样显示出来,
+    于是同一个网段在两个地方长得不一样。
+
+    **非连续掩码(255.0.255.0 这种)返回 None** —— 它不是一个合法的前缀长度,
+    硬算出一个数会把一个古怪的通配地址显示成一个正常的网段。
+    """
+
+    try:
+        parts = [int(x) for x in str(mask).split(".")]
+    except ValueError:
+        return None
+    if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+        return None
+    bits = "".join(f"{p:08b}" for p in parts)
+    if "01" in bits:                              # 中间有 0 又有 1 = 非连续
+        return None
+    return bits.count("1")
+
+
+def format_subnet(raw: str) -> str:
+    """
+    `10.0.1.0 255.255.255.0` / `10.0.1.0/24` → `10.0.1.0/24`。
+
+    **`0.0.0.0/0` 要原样保留**,不要美化成 "任意":那是解析层,
+    判断"这条策略是不是过宽"是审计那边的事,两处各干各的。
+    """
+
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parts = text.replace("/", " ").split()
+    if len(parts) == 1:
+        return parts[0]
+    addr, mask = parts[0], parts[1]
+    if mask.isdigit():
+        return f"{addr}/{mask}"
+    prefix = _mask_to_prefix(mask)
+    # 换算不出来时**把原文带出来**,不要丢掉 —— 一个古怪的掩码本身
+    # 就是值得看见的信息
+    return f"{addr}/{prefix}" if prefix is not None else f"{addr} {mask}"
+
+
+def _address_value(item: dict, addr_type: str) -> str:
+    """按类型拼出人话形式的值。"""
+
+    if addr_type == AddressType.RANGE:
+        start = str(item.get("start-ip") or item.get("start_ip") or "")
+        end = str(item.get("end-ip") or item.get("end_ip") or "")
+        return f"{start}-{end}".strip("-")
+    if addr_type == AddressType.FQDN:
+        return str(item.get("fqdn") or "")
+    if addr_type == AddressType.GEOGRAPHY:
+        return str(item.get("country") or "")
+    if addr_type == AddressType.WILDCARD:
+        return format_subnet(item.get("wildcard") or "")
+    if addr_type == AddressType.DYNAMIC:
+        # 动态地址的值是**变的**(SDN 连接器按标签算)。把当前值显示成
+        # 一个固定网段会让人以为自己知道这条策略放开了什么
+        sdn = str(item.get("sdn") or item.get("type") or "")
+        filt = str(item.get("filter") or item.get("sdn-tag") or "")
+        return f"{sdn} {filt}".strip() or "动态(值会变)"
+    return format_subnet(item.get("subnet") or "")
+
+
+def _addresses_from_api(device: Device) -> list[dict]:
+    """API 通道。**拿不到就是空列表**,不让它把策略同步拖失败。"""
+
+    out: list[dict] = []
+    seq = 0
+    for item in fortigate_api.fetch_addresses(device):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        addr_type = normalize_address_type(item.get("type") or "ipmask")
+        out.append({
+            "name": name[:128], "seq": seq, "addr_type": addr_type, "is_group": False,
+            "value": _address_value(item, addr_type)[:255],
+            "members": [],
+            "comment": str(item.get("comment") or "")[:255],
+            "interface": str(item.get("associated-interface") or "")[:64],
+            "uuid": str(item.get("uuid") or "")[:64],
+            "raw": item,
+        })
+        seq += 1
+
+    for item in fortigate_api.fetch_address_groups(device):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name[:128], "seq": seq, "addr_type": AddressType.GROUP, "is_group": True,
+            "value": "", "members": fortigate_api._as_names(item.get("member")),
+            "comment": str(item.get("comment") or "")[:255],
+            "interface": "",
+            "uuid": str(item.get("uuid") or "")[:64],
+            "raw": item,
+        })
+        seq += 1
+    return out
+
+
+def parse_show_firewall_address(text: str, as_group: bool = False) -> list[dict]:
+    """
+    解析 `show firewall address` / `show firewall addrgrp`。
+
+    ⚠ **`show` 只打印偏离默认值的项**,所以:
+
+        没有 `set type ...`  → 类型是默认的 **ipmask**(子网)
+        出厂自带的对象(`all` / `none` / `FABRIC_DEVICE`)**根本不出现**
+
+    第二条是这里最容易被误读的地方:查不到一个名字**不等于**它不存在。
+    调用方要把这个区别带到页面上(见 models.FirewallAddress 的说明)。
+    """
+
+    out: list[dict] = []
+    current: dict | None = None
+    seq = 0
+
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if m := _RE_EDIT_NAME.match(line):
+            name = m.group(1).strip()
+            if not name:
+                continue
+            current = {
+                "name": name[:128], "seq": seq,
+                # 默认值在这里给全,后面只覆盖 show 里出现的项
+                "addr_type": AddressType.GROUP if as_group else AddressType.SUBNET,
+                "is_group": as_group,
+                "value": "", "members": [], "comment": "", "interface": "", "uuid": "",
+                "raw": {"_channel": "ssh"},
+                # 下面几个是拼 value 用的中间值,收尾时删掉
+                "_subnet": "", "_start": "", "_end": "", "_fqdn": "",
+                "_country": "", "_wildcard": "", "_sdn": "", "_filter": "",
+            }
+            seq += 1
+            continue
+
+        if _RE_NEXT.match(line) and current is not None:
+            item = {
+                "subnet": current.pop("_subnet"), "start-ip": current.pop("_start"),
+                "end-ip": current.pop("_end"), "fqdn": current.pop("_fqdn"),
+                "country": current.pop("_country"), "wildcard": current.pop("_wildcard"),
+                "sdn": current.pop("_sdn"), "filter": current.pop("_filter"),
+            }
+            if not current["is_group"]:
+                current["value"] = _address_value(item, current["addr_type"])[:255]
+            out.append(current)
+            current = None
+            continue
+
+        if current is None:
+            continue
+
+        m = _RE_SET.match(line)
+        if not m:
+            continue
+        key, raw_value = m.group(1).lower(), m.group(2).strip()
+        values = _split_values(raw_value)
+        one = values[0] if values else ""
+        current["raw"][key] = raw_value
+
+        if key == "type" and not as_group:
+            current["addr_type"] = normalize_address_type(one)
+        elif key == "subnet":
+            current["_subnet"] = raw_value.strip('"')
+        elif key in ("start-ip", "start_ip"):
+            current["_start"] = one
+        elif key in ("end-ip", "end_ip"):
+            current["_end"] = one
+        elif key == "fqdn":
+            current["_fqdn"] = raw_value.strip('"')
+        elif key == "country":
+            current["_country"] = one.strip('"')
+        elif key == "wildcard":
+            current["_wildcard"] = raw_value.strip('"')
+        elif key == "sdn":
+            current["_sdn"] = one.strip('"')
+        elif key in ("filter", "sdn-tag"):
+            current["_filter"] = raw_value.strip('"')
+        elif key == "member":
+            current["members"] = values
+        elif key == "comment":
+            current["comment"] = raw_value.strip('"')[:255]
+        elif key == "associated-interface":
+            current["interface"] = one.strip('"')[:64]
+        elif key == "uuid":
+            current["uuid"] = one[:64]
+
+    if current is not None:
+        # 半条地址对象(比如缺了 subnet)在页面上是一个"值为空"的别名,
+        # 而那看着像"这个对象没配地址"
+        log.warning("地址对象输出在 edit %s 处结束但没有 next,该条被丢弃(输出被截断?)",
+                    current["name"])
+    return out
+
+
+def _addresses_from_ssh(device: Device) -> list[dict]:
+    """
+    SSH 通道。**失败只记日志、返回空**,不抛 —— 策略已经拿到了,
+    不该因为地址对象没拿到而把整批策略一起丢掉。
+    """
+
+    profile = get_profile(device.model, device.vendor)
+    if not profile.address_cli:
+        return []
+
+    client = ssh_cli._connect(device)
+    out: list[dict] = []
+    try:
+        try:
+            raw = ssh_cli._run_exec(client, profile.address_cli, timeout=180.0)
+            out.extend(parse_show_firewall_address(raw, as_group=False))
+        except ssh_cli.SshError as exc:
+            log.info("设备 %s 地址对象同步失败(%s)", device.name, exc)
+        if profile.addrgrp_cli:
+            try:
+                raw = ssh_cli._run_exec(client, profile.addrgrp_cli, timeout=120.0)
+                out.extend(parse_show_firewall_address(raw, as_group=True))
+            except ssh_cli.SshError as exc:
+                log.info("设备 %s 地址组同步失败(%s)", device.name, exc)
+    finally:
+        client.close()
+
+    # 名字**去重**:同一个名字不可能既是对象又是组(FortiOS 不允许),
+    # 但两条命令的输出万一有重叠,后写的会撞唯一约束
+    seen: set[str] = set()
+    unique = []
+    for row in out:
+        if row["name"] in seen:
+            continue
+        seen.add(row["name"])
+        unique.append(row)
+    return unique
+
+
 def _from_ssh(device: Device) -> list[dict]:
     profile = get_profile(device.model, device.vendor)
     if not profile.policy_cli:
@@ -519,6 +787,7 @@ def sync_policies(device: Device) -> dict:
 
     rows: list[dict] = []
     vips: list[dict] = []
+    addresses: list[dict] = []
     method = ""
     api_error = ""
 
@@ -530,6 +799,7 @@ def sync_policies(device: Device) -> dict:
             # 出现"策略引用了一个不存在的映射"或者反过来,而那看起来像
             # 设备上配错了。**映射拿不到不算失败**,策略照常写
             vips = _vips_from_api(device)
+            addresses = _addresses_from_api(device)
         except PolicyError as exc:
             api_error = str(exc)
             log.info("设备 %s API 策略同步失败(%s),尝试 SSH", device.name, api_error)
@@ -539,6 +809,7 @@ def sync_policies(device: Device) -> dict:
             rows = _from_ssh(device)
             method = "ssh"
             vips = _vips_from_ssh(device)
+            addresses = _addresses_from_ssh(device)
         except PolicyError as exc:
             # 两条都失败时,把 API 的错也带出来 —— 只报 SSH 的错会让人
             # 去修一条自己根本没打算用的通道
@@ -577,6 +848,16 @@ def sync_policies(device: Device) -> dict:
                 for vip in vips
             ], batch_size=500)
 
+        # 地址对象同样全量替换、同一个事务。设备上删掉的对象必须在这边消失
+        # —— 留着一条现实中已经不存在的别名,有人会照着它判断
+        # "这条策略放开的是那个网段",而那个网段现在指向别处
+        FirewallAddress.objects.filter(device=device, vdom=vdom).delete()
+        if addresses:
+            FirewallAddress.objects.bulk_create([
+                FirewallAddress(device=device, vdom=vdom, synced_at=now, method=method, **addr)
+                for addr in addresses
+            ], batch_size=500)
+
     device.policy_count = FirewallPolicy.objects.filter(device=device).count()
     device.last_policy_sync_at = now
     device.last_policy_error = ""
@@ -588,6 +869,8 @@ def sync_policies(device: Device) -> dict:
         "method": method,
         "total": len(rows),
         "vips": len(vips),
+        "addresses": len(addresses),
+        "address_groups": sum(1 for a in addresses if a.get("is_group")),
         # 整机映射的条数单独报 —— 它是这批数据里暴露面最大的那种,
         # 而在列表里它和一条只映射 443 的规则长得几乎一样
         "vips_whole_host": sum(1 for v in vips if not v.get("port_forward")),

@@ -31,6 +31,7 @@ from rest_framework.response import Response
 from core.pagination import SampleCursorPagination
 from netcheck import scheduler
 from netcheck import duplicate as duplicate_mod
+from netcheck.devices import addresses as addresses_mod
 from netcheck.filters import (
     DeviceBackupFilter,
     DeviceFilter,
@@ -38,6 +39,7 @@ from netcheck.filters import (
     DeviceNeighborFilter,
     EventFilter,
     FirewallPolicyFilter,
+    FirewallAddressFilter,
     FirewallVipFilter,
     IdracHostFilter,
     NotifierFilter,
@@ -45,6 +47,7 @@ from netcheck.filters import (
     ServerFilter,
 )
 from netcheck.models import (
+    AddressType,
     BackupStatus,
     CollectMethod,
     Device,
@@ -57,6 +60,7 @@ from netcheck.models import (
     Event,
     EventKind,
     FirewallPolicy,
+    FirewallAddress,
     FirewallVip,
     HwState,
     IdracHost,
@@ -93,6 +97,7 @@ from netcheck.serializers import (
     EventSerializer,
     FirewallPolicyDetailSerializer,
     FirewallPolicySerializer,
+    FirewallAddressSerializer,
     FirewallVipSerializer,
     IdracHostSerializer,
     IdracSampleSerializer,
@@ -1325,6 +1330,109 @@ class IdracHostViewSet(DuplicateMixin, viewsets.ModelViewSet):
         })
 
 
+class FirewallAddressViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    防火墙**地址对象 / 地址组**只读快照。和策略同一次同步拿回来。
+
+    这一页回答的是策略表回答不了的另一半:策略里的源/目的地址是一串
+    **名字**(`内网服务器组`),**它到底是哪几个网段完全不在策略表里**。
+    """
+
+    serializer_class = FirewallAddressSerializer
+    filterset_class = FirewallAddressFilter
+    search_fields = ["name", "value", "comment"]
+    ordering_fields = ["name", "addr_type", "is_group", "value", "synced_at"]
+
+    def get_queryset(self):
+        return FirewallAddress.objects.select_related("device")
+
+    @action(detail=False, methods=["get"])
+    def resolve(self, request):
+        """
+        **别名查询。**`?device=1&name=内网服务器组` → 它到底是什么。
+
+        地址组会**递归展开**(组能套组),返回一棵树 + 一张拍平的叶子表。
+        人问"这个别名是哪些地址",要的就是那张拍平的表。
+
+        三件在返回里说清楚的事:
+
+        - **查不到 ≠ 不存在。**FortiOS 的 `show` 只打印偏离默认值的项,
+          出厂自带的对象(`all` / `none`)根本不出现 —— 走 SSH 通道同步的
+          设备上查它们必然查不到。所以 `kind` 是 `unknown` 而不是报错,
+          页面上说的是"没同步到这个对象"。
+        - **`all` 是「任意」,不是「查不到」**(内置名,含义确定)。
+          把它显示成"没同步到"会让人以为数据缺了一块,而实际上那条策略
+          是对所有地址开放的 —— 那恰恰是最该看见的。
+        - **环要标出来。**组 A 包含组 B、组 B 包含组 A 这种配置 FortiOS
+          不拦,而递归展开会转到超时。这里掐掉那一支并标 `cycle`。
+        """
+
+        device_id = request.query_params.get("device")
+        name = (request.query_params.get("name") or "").strip()
+        if not device_id or not name:
+            return Response(
+                {"detail": "要同时给 device 和 name"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        rows = list(FirewallAddress.objects.filter(device_id=device_id))
+        index = addresses_mod.build_index(rows)
+        tree = addresses_mod.resolve(name, index)
+
+        policies = list(
+            FirewallPolicy.objects.filter(device_id=device_id).only(
+                "id", "policy_id", "seq", "name", "src_addr", "dst_addr",
+                "enabled", "action",
+            )
+        )
+        return Response({
+            "device": int(device_id),
+            "query": name,
+            # 这批数据是哪条通道来的 —— API 能拿到内置对象,SSH 拿不到。
+            # 同一个别名在两条通道下查出来的结果不一样,这一点要能看见
+            "method": rows[0].method if rows else "",
+            "synced_at": rows[0].synced_at if rows else None,
+            "total_objects": len(rows),
+            "result": tree,
+            "used_by": addresses_mod.used_by_policies(name, policies),
+        })
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """按设备一行:同步了多少对象、多少组、走的哪条通道。"""
+
+        devices = list(
+            Device.objects.filter(
+                kind=DeviceKind.FIREWALL, enabled=True, policy_sync_enabled=True
+            ).order_by("order", "id")
+        )
+        counts: dict = {}
+        for row in FirewallAddress.objects.filter(device__in=devices).only(
+            "device_id", "is_group", "method", "synced_at"
+        ):
+            slot = counts.setdefault(row.device_id, {
+                "total": 0, "groups": 0, "method": row.method, "synced_at": row.synced_at,
+            })
+            slot["total"] += 1
+            if row.is_group:
+                slot["groups"] += 1
+
+        return Response({"devices": [
+            {
+                "device_id": d.pk, "device_name": d.name, "mgmt_ip": d.mgmt_ip,
+                "vdom": d.api_vdom or "root", "state": d.state,
+                **counts.get(d.pk, {"total": 0, "groups": 0, "method": "", "synced_at": None}),
+                # **0 个对象不等于"这台没有地址对象"** —— SSH 的 show 可能
+                # 没跑成、API 可能权限不够。页面上说的是"没同步到"
+                "note": (
+                    "" if counts.get(d.pk)
+                    else "没有同步到地址对象 —— 不等于这台没有配"
+                ),
+            }
+            for d in devices
+        ]})
+
+
 class FirewallVipViewSet(viewsets.ReadOnlyModelViewSet):
     """
     防火墙**映射**(FortiOS 的 firewall vip)只读快照。写入只有一条路:
@@ -2288,6 +2396,10 @@ def dashboard_charts(request):
                     "id": t.pk, "name": t.name, "host": t.host,
                     "protocol": t.protocol, "port": t.port,
                     "state": t.state, "interval": t.interval_seconds,
+                    # 优先级(order)。**数字小的排在前面** —— 列表、大屏、
+                    # 下拉都按它排(模型的 ordering = ["order", "id"])。
+                    # 大屏上要能看见它,否则"为什么这条线在最上面"没法回答
+                    "order": t.order,
                     "last_rtt": t.last_rtt_ms, "last_loss": t.last_loss_pct,
                     "last_jitter": t.last_jitter_ms, "last_error": t.last_error,
                     "availability": t.availability,
@@ -2376,6 +2488,7 @@ def dashboard_devices(request):
             "mgmt_ip": device.mgmt_ip, "site": device.site,
             "os_version": device.os_version, "serial": device.serial,
             "state": device.state, "method": device.last_method_used or device.collect_method,
+            "order": device.order,
             "last_collected_at": device.last_collected_at,
             "last_error": device.last_error,
             "open_events": device.open_events,
@@ -2450,6 +2563,7 @@ def dashboard_servers(request):
             "os_name": server.os_name, "kernel": server.kernel,
             "cpu_cores": server.cpu_cores, "mem_total_bytes": server.mem_total_bytes,
             "state": server.state,
+            "order": server.order,
             "interval": server.interval_seconds,
             "last_collected_at": server.last_collected_at,
             "last_error": server.last_error,
@@ -2514,6 +2628,7 @@ def meta_choices(request):
         "backup_status": pack(BackupStatus),
         "policy_action": pack(PolicyAction),
         "vip_type": pack(VipType),
+        "address_type": pack(AddressType),
         # 顶部统计的顺序,前端照这个渲染
         "top_kinds": [
             {"value": k, "label": EventKind(k).label} for k in TOP_KINDS

@@ -205,15 +205,15 @@ function diffClass(line: string): string {
 }
 
 const deviceColumns: DataTableColumns<DeviceRow> = [
-  { title: '设备', key: 'name', minWidth: 150,
+  { title: '设备', key: 'name', sorter: 'default', minWidth: 150,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.mgmt_ip} · ${r.model_label || r.model}`),
     ]) },
-  { title: '设备状态', key: 'state', width: 84,
+  { title: '设备状态', key: 'state', sorter: 'default', width: 84,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '备份结果', key: 'last_backup_status', width: 148,
+  { title: '备份结果', key: 'last_backup_status', sorter: 'default', width: 148,
     render: (r) => {
       const color = r.last_backup_status === 'ok' ? STATE.up
         : r.last_backup_status === 'failed' ? STATE.down : STATE.unknown
@@ -224,7 +224,7 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
           r.last_backup_at ? ago(r.last_backup_at) : '还没跑过'),
       ])
     } },
-  { title: '配置已保存?', key: 'config_unsaved', width: 128,
+  { title: '配置已保存?', key: 'config_unsaved', sorter: 'default', width: 128,
     render: (r) => {
       // 三态。**null 显示「未检查」,不显示「已保存」** ——
       // 后者是一个我们没验证过的保证
@@ -246,9 +246,9 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
         onClick: () => showUnsaved(r),
       }, () => `未保存 ${r.config_unsaved_lines ?? '?'} 行`)
     } },
-  { title: '间隔', key: 'backup_interval_hours', width: 68, className: 'num',
+  { title: '间隔', key: 'backup_interval_hours', sorter: 'default', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.backup_interval_hours}h`) },
-  { title: '保留', key: 'backup_keep', width: 62, className: 'num',
+  { title: '保留', key: 'backup_keep', sorter: 'default', width: 62, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.backup_keep} 版`) },
   { title: '凭据', key: 'creds', width: 92,
     render: (r) => h('div', { style: 'display:flex;gap:3px;flex-wrap:wrap' }, [
@@ -257,7 +257,7 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
       // 回灌的备份文件,CLI 的 show 输出不是
       r.has_api_token ? h(NTag, { size: 'tiny', bordered: false, type: 'info' }, () => 'API') : null,
     ]) },
-  { title: '最后错误', key: 'last_backup_error', minWidth: 180,
+  { title: '最后错误', key: 'last_backup_error', sorter: 'default', minWidth: 180,
     render: (r) => h('span', {
       style: `font-size:10.5px;color:${r.last_backup_error ? STATE.down : 'var(--cy-ink-3)'};line-height:1.5`,
     }, r.last_backup_error || '—') },
@@ -272,18 +272,18 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
 ]
 
 const versionColumns: DataTableColumns<BackupVersion> = [
-  { title: '首次出现', key: 'ts', width: 152,
+  { title: '首次出现', key: 'ts', sorter: 'default', width: 152,
     render: (r) => h('div', [
       h('div', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace" }, dateTimeOf(r.ts)),
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, ago(r.ts)),
     ]) },
-  { title: '版本', key: 'short_hash', width: 118,
+  { title: '版本', key: 'short_hash', sorter: 'default', width: 118,
     render: (r) => h('div', { style: 'display:flex;gap:5px;align-items:center' }, [
       h('span', { style: "font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cy-cyan)" },
         r.short_hash),
       r.is_first ? h(NTag, { size: 'tiny', bordered: false }, () => '首版') : null,
     ]) },
-  { title: '变更', key: 'change', width: 108,
+  { title: '变更', key: 'change', sorter: 'default', width: 108,
     render: (r) => {
       if (r.is_first) {
         return h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, '基线')
@@ -298,18 +298,18 @@ const versionColumns: DataTableColumns<BackupVersion> = [
         h('span', { style: `color:${STATE.down}` }, `-${r.lines_removed ?? 0}`),
       ])
     } },
-  { title: '最后确认', key: 'last_seen_at', width: 150,
+  { title: '最后确认', key: 'last_seen_at', sorter: 'default', width: 150,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11px;color:var(--cy-ink-2)' }, ago(r.last_seen_at)),
       // seen_count = 这个版本被连续确认了多少次没变。1 次 = 刚出现
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, `确认 ${int(r.seen_count)} 次`),
     ]) },
-  { title: '大小', key: 'size_bytes', width: 118, className: 'num',
+  { title: '大小', key: 'size_bytes', sorter: 'default', width: 118, className: 'num',
     render: (r) => h('div', [
       h('div', { style: "font-size:11px;font-family:'JetBrains Mono',monospace" }, bytes(r.size_bytes)),
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, `${int(r.line_count)} 行`),
     ]) },
-  { title: '通道', key: 'method', width: 62,
+  { title: '通道', key: 'method', sorter: 'default', width: 62,
     render: (r) => h(NTag, { size: 'tiny', bordered: false }, () => r.method.toUpperCase()) },
   { title: '操作', key: 'act', width: 200, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [

@@ -96,15 +96,15 @@ const columns: DataTableColumns<ComplianceRow> = [
         ]),
       ))
     } },
-  { title: '设备', key: 'device_name', minWidth: 170,
+  { title: '设备', key: 'device_name', sorter: 'default', minWidth: 170,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.device_name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.mgmt_ip} · ${r.model_label}`),
     ]) },
-  { title: '厂商', key: 'vendor_label', width: 88,
+  { title: '厂商', key: 'vendor_label', sorter: 'default', width: 88,
     render: (r) => h('span', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.vendor_label) },
-  { title: '结论', key: 'verdict', width: 172,
+  { title: '结论', key: 'verdict', sorter: 'default', width: 172,
     render: (r) => {
       // **没检查 ≠ 合规。**单独一档灰色,不混进"0 条问题"
       if (!r.checked) {
@@ -130,13 +130,13 @@ const columns: DataTableColumns<ComplianceRow> = [
           : null,
       ])
     } },
-  { title: '通过 / 规则', key: 'passed', width: 104, className: 'num',
+  { title: '通过 / 规则', key: 'passed', sorter: 'default', width: 104, className: 'num',
     render: (r) => r.checked
       ? h('span', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace" },
           `${r.passed} / ${r.rule_count}`)
       : h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, `— / ${r.rule_count}`),
   },
-  { title: '基于哪份配置', key: 'backup_at', minWidth: 148,
+  { title: '基于哪份配置', key: 'backup_at', sorter: 'default', minWidth: 148,
     render: (r) => r.backup_at
       ? h('div', [
           h('div', { style: 'font-size:11px;color:var(--cy-ink-2)' }, ago(r.backup_at)),

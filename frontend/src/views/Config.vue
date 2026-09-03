@@ -803,11 +803,18 @@ const groupOptions = computed(() =>
 // ---- 表格列 ----
 
 const groupColumns: DataTableColumns<ProbeGroup> = [
-  { title: '名称', key: 'name', minWidth: 140 },
-  { title: '说明', key: 'description', minWidth: 180,
+  { title: '名称', key: 'name', sorter: 'default', minWidth: 140 },
+  { title: '说明', key: 'description', sorter: 'default', minWidth: 180,
     render: (r) => h('span', { style: 'color:var(--cy-ink-2);font-size:12px' }, r.description || '—') },
-  { title: '线路数', key: 'target_count', width: 80, className: 'num' },
-  { title: '排序', key: 'order', width: 62, className: 'num' },
+  { title: '线路数', key: 'target_count', sorter: 'default', width: 80, className: 'num' },
+  { title: '优先级', key: 'order', sorter: 'default', width: 76, className: 'num',
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)",
+      // **数字小的排在前面** —— 这是 order 一直以来的语义(模型的
+      // ordering = ["order", "id"]),做成"优先级"这个说法之后更要写清楚,
+      // 否则一半人会以为数字大的优先
+      title: '数字小的排在前面。列表、大屏、下拉都按它排',
+    }, String(r.order ?? 0)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('group', r) }) },
   { title: '操作', key: 'act', width: 160,
@@ -825,31 +832,39 @@ const groupColumns: DataTableColumns<ProbeGroup> = [
 ]
 
 const probeColumns: DataTableColumns<ProbeTarget> = [
-  { title: '状态', key: 'state', width: 78,
+  { title: '状态', key: 'state', sorter: 'default', width: 78,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '线路', key: 'name', minWidth: 170,
+  { title: '线路', key: 'name', sorter: 'default', minWidth: 170,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         endpoint(r.host, r.protocol, r.port)),
     ]) },
-  { title: '监控类', key: 'group_name', width: 110,
+  { title: '监控类', key: 'group_name', sorter: 'default', width: 110,
     render: (r) => h('span', { style: 'font-size:12px;color:var(--cy-ink-2)' }, r.group_name || '—') },
-  { title: '频率', key: 'interval_seconds', width: 74, className: 'num',
+  { title: '频率', key: 'interval_seconds', sorter: 'default', width: 74, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
-  { title: '延迟', key: 'last_rtt_ms', width: 84, className: 'num',
+  { title: '延迟', key: 'last_rtt_ms', sorter: 'default', width: 84, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, ms(r.last_rtt_ms)) },
-  { title: '丢包', key: 'last_loss_pct', width: 72, className: 'num',
+  { title: '丢包', key: 'last_loss_pct', sorter: 'default', width: 72, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, pct(r.last_loss_pct, 0)) },
-  { title: '可用率', key: 'availability', width: 82, className: 'num',
+  { title: '可用率', key: 'availability', sorter: 'default', width: 82, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.availability >= 99.9 ? STATE.up : r.availability >= 99 ? STATE.degraded : STATE.down}`,
     }, r.total_checks ? pct(r.availability, 2) : '—') },
-  { title: '阈值', key: 'thresholds', width: 156,
+  { title: '阈值', key: 'thresholds', sorter: 'default', width: 156,
     render: (r) => h('span', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
       `${r.latency_warn_ms}/${r.latency_crit_ms}ms · ${r.loss_warn_pct}/${r.loss_crit_pct}% · ${r.jitter_warn_ms}/${r.jitter_crit_ms}ms`) },
-  { title: '最后检测', key: 'last_checked_at', width: 96,
+  { title: '最后检测', key: 'last_checked_at', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_checked_at)) },
+  { title: '优先级', key: 'order', sorter: 'default', width: 76, className: 'num',
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)",
+      // **数字小的排在前面** —— 这是 order 一直以来的语义(模型的
+      // ordering = ["order", "id"]),做成"优先级"这个说法之后更要写清楚,
+      // 否则一半人会以为数字大的优先
+      title: '数字小的排在前面。列表、大屏、下拉都按它排',
+    }, String(r.order ?? 0)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('probe', r) }) },
   { title: '操作', key: 'act', width: 214, fixed: 'right',
@@ -867,20 +882,20 @@ const probeColumns: DataTableColumns<ProbeTarget> = [
 ]
 
 const deviceColumns: DataTableColumns<DeviceRow> = [
-  { title: '状态', key: 'state', width: 78,
+  { title: '状态', key: 'state', sorter: 'default', width: 78,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '设备', key: 'name', minWidth: 165,
+  { title: '设备', key: 'name', sorter: 'default', minWidth: 165,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" }, r.mgmt_ip),
     ]) },
-  { title: '型号', key: 'model_label', width: 172,
+  { title: '型号', key: 'model_label', sorter: 'default', width: 172,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.model_label || r.model),
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
         `${r.kind_label || r.kind}${r.os_version ? ' · ' + r.os_version : ''}`),
     ]) },
-  { title: '通道', key: 'collect_method', width: 118,
+  { title: '通道', key: 'collect_method', sorter: 'default', width: 118,
     render: (r) => h('div', { style: 'display:flex;gap:3px;flex-wrap:wrap' }, [
       h(NTag, { size: 'tiny', bordered: false, type: 'info' }, () => r.collect_method.toUpperCase()),
       r.fallback_method
@@ -899,8 +914,8 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
       !r.has_snmp_community && !r.has_ssh_credential && !r.has_api_token
         ? h('span', { style: 'font-size:10.5px;color:var(--cy-down)' }, '未配置') : null,
     ]) },
-  { title: '接口', key: 'interface_count', width: 66, className: 'num' },
-  { title: '备份 / 策略', key: 'extras', width: 138,
+  { title: '接口', key: 'interface_count', sorter: 'default', width: 66, className: 'num' },
+  { title: '备份 / 策略', key: 'extras', sorter: 'default', width: 138,
     render: (r) => h('div', { style: 'display:flex;flex-direction:column;gap:2px' }, [
       r.backup_enabled
         ? h('span', {
@@ -919,10 +934,18 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
             : '策略未同步')
         : null,
     ]) },
-  { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
+  { title: '频率', key: 'interval_seconds', sorter: 'default', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
-  { title: '最后采集', key: 'last_collected_at', width: 96,
+  { title: '最后采集', key: 'last_collected_at', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
+  { title: '优先级', key: 'order', sorter: 'default', width: 76, className: 'num',
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)",
+      // **数字小的排在前面** —— 这是 order 一直以来的语义(模型的
+      // ordering = ["order", "id"]),做成"优先级"这个说法之后更要写清楚,
+      // 否则一半人会以为数字大的优先
+      title: '数字小的排在前面。列表、大屏、下拉都按它排',
+    }, String(r.order ?? 0)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('device', r) }) },
   { title: '操作', key: 'act', width: 316, fixed: 'right',
@@ -947,15 +970,15 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
 ]
 
 const serverColumns: DataTableColumns<ServerRow> = [
-  { title: '状态', key: 'state', width: 78,
+  { title: '状态', key: 'state', sorter: 'default', width: 78,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '服务器', key: 'name', minWidth: 168,
+  { title: '服务器', key: 'name', sorter: 'default', minWidth: 168,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.host}:${r.ssh_port} · ${r.ssh_username}`),
     ]) },
-  { title: '系统', key: 'os_name', minWidth: 186,
+  { title: '系统', key: 'os_name', sorter: 'default', minWidth: 186,
     render: (r) => h('div', [
       h('div', { style: 'display:flex;align-items:center;gap:5px' }, [
         // 类型是**人选的**(决定走哪套采集命令),和下面那行采回来的版本号
@@ -975,20 +998,28 @@ const serverColumns: DataTableColumns<ServerRow> = [
       ? h(NTag, { size: 'tiny', bordered: false }, () => (r.uses_key ? '私钥' : '密码'))
       : h('span', { style: `font-size:10.5px;color:${STATE.down}` }, '未配置'),
   },
-  { title: '网卡', key: 'primary_interface', width: 108,
+  { title: '网卡', key: 'primary_interface', sorter: 'default', width: 108,
     render: (r) => h('div', [
       h('div', { style: "font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)" },
         r.primary_interface || r.net_interface || '自动'),
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' }, `共 ${r.interface_count} 块`),
     ]) },
-  { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
+  { title: '频率', key: 'interval_seconds', sorter: 'default', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
-  { title: '阈值', key: 'thresholds', width: 176,
+  { title: '阈值', key: 'thresholds', sorter: 'default', width: 176,
     render: (r) => h('span', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
       `CPU ${r.cpu_warn_pct}/${r.cpu_crit_pct}% · 内存 ${r.mem_warn_pct}/${r.mem_crit_pct}%`
       + ` · 盘 ${r.disk_warn_pct}/${r.disk_crit_pct}% · 载 ${r.load_warn}/${r.load_crit}`) },
-  { title: '最后采集', key: 'last_collected_at', width: 96,
+  { title: '最后采集', key: 'last_collected_at', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
+  { title: '优先级', key: 'order', sorter: 'default', width: 76, className: 'num',
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)",
+      // **数字小的排在前面** —— 这是 order 一直以来的语义(模型的
+      // ordering = ["order", "id"]),做成"优先级"这个说法之后更要写清楚,
+      // 否则一半人会以为数字大的优先
+      title: '数字小的排在前面。列表、大屏、下拉都按它排',
+    }, String(r.order ?? 0)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small',
       onUpdateValue: () => toggleEnabled('server', r) }) },
@@ -1007,9 +1038,9 @@ const serverColumns: DataTableColumns<ServerRow> = [
 ]
 
 const idracColumns: DataTableColumns<IdracRow> = [
-  { title: '状态', key: 'state', width: 78,
+  { title: '状态', key: 'state', sorter: 'default', width: 78,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '带外主机', key: 'name', minWidth: 168,
+  { title: '带外主机', key: 'name', sorter: 'default', minWidth: 168,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
       // **地址后面标明"带外" ** —— 拿服务器自己的 IP 来填是这里最常见的错,
@@ -1017,14 +1048,14 @@ const idracColumns: DataTableColumns<IdracRow> = [
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.host}:${r.port} · ${r.username} · 带外口`),
     ]) },
-  { title: '硬件', key: 'model_name', minWidth: 168,
+  { title: '硬件', key: 'model_name', sorter: 'default', minWidth: 168,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.model_name || '待采集'),
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
         [r.service_tag ? `SN ${r.service_tag}` : '', r.idrac_firmware,
          r.power_state].filter(Boolean).join(' · ') || '—'),
     ]) },
-  { title: '带内', key: 'server_name', width: 118,
+  { title: '带内', key: 'server_name', sorter: 'default', width: 118,
     render: (r) => r.server_name
       ? h('span', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.server_name)
       // **没关联不是问题** —— 只有 iDRAC 没有 SSH 账号的裸金属是常态
@@ -1033,14 +1064,22 @@ const idracColumns: DataTableColumns<IdracRow> = [
     render: (r) => r.has_credential
       ? h(NTag, { size: 'tiny', bordered: false }, () => '已配置')
       : h('span', { style: `font-size:10.5px;color:${STATE.down}` }, '未配置') },
-  { title: '频率', key: 'interval_seconds', width: 68, className: 'num',
+  { title: '频率', key: 'interval_seconds', sorter: 'default', width: 68, className: 'num',
     render: (r) => h('span', { style: 'font-size:11.5px' }, `${r.interval_seconds}s`) },
-  { title: '阈值', key: 'thresholds', width: 190,
+  { title: '阈值', key: 'thresholds', sorter: 'default', width: 190,
     render: (r) => h('span', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
       `温度 ${r.temp_warn_c}/${r.temp_crit_c}℃ · 温差 ${r.temp_delta_warn_c}℃`
       + ` · SSD ${r.ssd_life_warn_pct}% · 日志 ${r.event_window_days}d`) },
-  { title: '最后采集', key: 'last_collected_at', width: 96,
+  { title: '最后采集', key: 'last_collected_at', sorter: 'default', width: 96,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
+  { title: '优先级', key: 'order', sorter: 'default', width: 76, className: 'num',
+    render: (r) => h('span', {
+      style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)",
+      // **数字小的排在前面** —— 这是 order 一直以来的语义(模型的
+      // ordering = ["order", "id"]),做成"优先级"这个说法之后更要写清楚,
+      // 否则一半人会以为数字大的优先
+      title: '数字小的排在前面。列表、大屏、下拉都按它排',
+    }, String(r.order ?? 0)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small',
       onUpdateValue: () => toggleEnabled('idrac', r) }) },
@@ -1058,28 +1097,31 @@ const idracColumns: DataTableColumns<IdracRow> = [
     ]) },
 ]
 
+// **通知渠道没有「优先级」列。**它不是漏了:一个事件会发给**所有**匹配的
+// 渠道,每个渠道独立 try(见 notify/dispatch.py)—— 渠道之间没有先后,
+// 加一列不起作用的数字只会让人以为可以靠它控制发送顺序
 const notifierColumns: DataTableColumns<NotifierRow> = [
-  { title: '渠道', key: 'name', minWidth: 140,
+  { title: '渠道', key: 'name', sorter: 'default', minWidth: 140,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.name),
       h('div', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, r.kind_label || r.kind),
     ]) },
-  { title: '目标', key: 'dest', minWidth: 180,
+  { title: '目标', key: 'dest', sorter: 'default', minWidth: 180,
     render: (r) => h('span', { style: "font-size:11px;color:var(--cy-ink-2);font-family:'JetBrains Mono',monospace;word-break:break-all" },
       r.kind === 'telegram' ? `chat ${r.telegram_chat_id || '?'}` : r.webhook_url || '—') },
-  { title: '推送', key: 'phases', width: 96,
+  { title: '推送', key: 'phases', sorter: 'default', width: 96,
     render: (r) => h('div', { style: 'display:flex;gap:3px' }, [
       r.on_alert ? h(NTag, { size: 'tiny', bordered: false, type: 'error' }, () => '告警') : null,
       r.on_recover ? h(NTag, { size: 'tiny', bordered: false, type: 'success' }, () => '恢复') : null,
     ]) },
-  { title: '过滤', key: 'filters', minWidth: 150,
+  { title: '过滤', key: 'filters', sorter: 'default', minWidth: 150,
     render: (r) => h('div', { style: 'font-size:10.5px;color:var(--cy-ink-3);line-height:1.5' }, [
       h('div', null, `级别 ≥ ${meta.label('severity', r.min_severity)}`),
       r.kinds?.length ? h('div', null, `类型 ${r.kinds.length} 项`) : null,
       r.group_names?.length ? h('div', null, `监控类 ${r.group_names.join('/')}`) : null,
       h('div', null, `静默 ${r.cooldown_seconds}s`),
     ]) },
-  { title: '发送', key: 'stats', width: 104, className: 'num',
+  { title: '发送', key: 'stats', sorter: 'default', width: 104, className: 'num',
     render: (r) => h('div', { style: 'font-size:11px;line-height:1.5' }, [
       h('div', { style: `color:${STATE.up}` }, `成功 ${r.total_sent}`),
       r.total_failed ? h('div', { style: `color:${STATE.down}` }, `失败 ${r.total_failed}`) : null,

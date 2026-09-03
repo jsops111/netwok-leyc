@@ -157,15 +157,15 @@ const deviceOptions = computed(() =>
 )
 
 const summaryColumns: DataTableColumns<NeighborSummaryRow> = [
-  { title: '设备', key: 'device_name', minWidth: 160,
+  { title: '设备', key: 'device_name', sorter: 'default', minWidth: 160,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.device_name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.mgmt_ip} · ${r.model_label}`),
     ]) },
-  { title: '状态', key: 'state', width: 82,
+  { title: '状态', key: 'state', sorter: 'default', width: 82,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '邻居数', key: 'total', width: 118,
+  { title: '邻居数', key: 'total', sorter: 'default', width: 118,
     render: (r) => {
       // **走 API/SSH 通道的设备采不到邻居**(那两张表是 SNMP MIB)。
       // 它的 0 条不等于"这些口没接线" —— 必须说出来
@@ -181,22 +181,22 @@ const summaryColumns: DataTableColumns<NeighborSummaryRow> = [
           `LLDP ${r.lldp} / CDP ${r.cdp}`),
       ])
     } },
-  { title: '受管对端', key: 'managed', width: 82, className: 'num',
+  { title: '受管对端', key: 'managed', sorter: 'default', width: 82, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.managed ? 'var(--cy-cyan)' : 'var(--cy-ink-3)'}`,
       title: '对端也是这个平台在管的设备 —— 这些能画成拓扑',
     }, r.managed ? String(r.managed) : '—') },
-  { title: '口未解析', key: 'unresolved', width: 88, className: 'num',
+  { title: '口未解析', key: 'unresolved', sorter: 'default', width: 88, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.unresolved ? STATE.degraded : 'var(--cy-ink-3)'}`,
       title: 'LLDP 的本地口号没能翻成 ifIndex —— 这些邻居不知道挂在哪个口',
     }, r.unresolved ? String(r.unresolved) : '—') },
-  { title: '曾变化', key: 'changed', width: 78, className: 'num',
+  { title: '曾变化', key: 'changed', sorter: 'default', width: 78, className: 'num',
     render: (r) => h('span', {
       style: `font-size:11.5px;color:${r.changed ? STATE.degraded : 'var(--cy-ink-3)'}`,
       title: '对端换过 —— 通常意味着有人动了线',
     }, r.changed ? String(r.changed) : '—') },
-  { title: '最后采集', key: 'last_collected_at', width: 92,
+  { title: '最后采集', key: 'last_collected_at', sorter: 'default', width: 92,
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' },
       ago(r.last_collected_at)) },
   { title: '操作', key: 'act', width: 168, fixed: 'right',
@@ -210,7 +210,7 @@ const summaryColumns: DataTableColumns<NeighborSummaryRow> = [
 ]
 
 const neighborColumns: DataTableColumns<NeighborRow> = [
-  { title: '本端接口', key: 'local_if_name', minWidth: 168,
+  { title: '本端接口', key: 'local_if_name', sorter: 'default', minWidth: 168,
     render: (r) => h('div', [
       h('div', { style: "font-size:12px;color:var(--cy-ink);font-family:'JetBrains Mono',monospace" },
         r.local_if_name),
@@ -222,10 +222,10 @@ const neighborColumns: DataTableColumns<NeighborRow> = [
             title: 'LLDP 的本地口号没能翻成 ifIndex,也没在接口表里找到同名口 —— 这条邻居不确定挂在哪个口',
           }, '口未解析'),
     ]) },
-  { title: '协议', key: 'protocol', width: 62,
+  { title: '协议', key: 'protocol', sorter: 'default', width: 62,
     render: (r) => h(NTag, { size: 'tiny', bordered: false,
       type: r.protocol === 'lldp' ? 'info' : 'default' }, () => r.protocol.toUpperCase()) },
-  { title: '对端设备', key: 'remote_device', minWidth: 175,
+  { title: '对端设备', key: 'remote_device', sorter: 'default', minWidth: 175,
     render: (r) => h('div', [
       h('div', { style: 'display:flex;gap:5px;align-items:baseline;flex-wrap:wrap' }, [
         h('span', { style: 'font-size:12px;color:var(--cy-ink)' }, r.remote_device || '(未上报名字)'),
@@ -239,17 +239,17 @@ const neighborColumns: DataTableColumns<NeighborRow> = [
             r.remote_mgmt_ip)
         : null,
     ]) },
-  { title: '对端接口', key: 'remote_port', minWidth: 140,
+  { title: '对端接口', key: 'remote_port', sorter: 'default', minWidth: 140,
     render: (r) => h('span', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink-2)" },
       r.remote_port || '—') },
-  { title: '对端平台', key: 'remote_platform', minWidth: 180,
+  { title: '对端平台', key: 'remote_platform', sorter: 'default', minWidth: 180,
     render: (r) => h('span', {
       style: 'font-size:10.5px;color:var(--cy-ink-3);line-height:1.45',
       title: r.remote_platform,
     }, r.remote_platform || '—') },
-  { title: '最后确认', key: 'last_seen', width: 92,
+  { title: '最后确认', key: 'last_seen', sorter: 'default', width: 92,
     render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' }, ago(r.last_seen)) },
-  { title: '变化', key: 'changed_at', width: 92,
+  { title: '变化', key: 'changed_at', sorter: 'default', width: 92,
     render: (r) => r.changed_at
       ? h('span', {
           style: `font-size:10.5px;color:${STATE.degraded}`,
@@ -260,7 +260,7 @@ const neighborColumns: DataTableColumns<NeighborRow> = [
 ]
 
 const linkColumns: DataTableColumns<TopologyLink> = [
-  { title: 'A 端', key: 'a', minWidth: 200,
+  { title: 'A 端', key: 'a', sorter: 'default', minWidth: 200,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12px;color:var(--cy-ink)' }, r.a_device),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
@@ -271,15 +271,15 @@ const linkColumns: DataTableColumns<TopologyLink> = [
       style: `font-size:14px;color:${r.bidirectional ? 'var(--cy-cyan)' : STATE.degraded}`,
       title: r.bidirectional ? '两端都确认了这条链路' : '只有一端确认',
     }, r.bidirectional ? '⇄' : '→') },
-  { title: 'B 端', key: 'b', minWidth: 200,
+  { title: 'B 端', key: 'b', sorter: 'default', minWidth: 200,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12px;color:var(--cy-ink)' }, r.b_device),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         r.b_port),
     ]) },
-  { title: '协议', key: 'protocol', width: 62,
+  { title: '协议', key: 'protocol', sorter: 'default', width: 62,
     render: (r) => h(NTag, { size: 'tiny', bordered: false }, () => r.protocol.toUpperCase()) },
-  { title: '确认', key: 'bidirectional', width: 128,
+  { title: '确认', key: 'bidirectional', sorter: 'default', width: 128,
     render: (r) => r.bidirectional
       ? h('span', { style: `font-size:11px;color:${STATE.up}` }, '双向确认')
       : h('span', {
@@ -288,7 +288,7 @@ const linkColumns: DataTableColumns<TopologyLink> = [
             + '也可能邻居被挂到了错误的本地口上',
         }, `单向(${r.confirmed_by[0]})`),
   },
-  { title: '变化', key: 'changed_at', width: 92,
+  { title: '变化', key: 'changed_at', sorter: 'default', width: 92,
     render: (r) => h('span', {
       style: `font-size:10.5px;color:${r.changed_at ? STATE.degraded : 'var(--cy-ink-3)'}`,
     }, r.changed_at ? ago(r.changed_at) : '未变') },

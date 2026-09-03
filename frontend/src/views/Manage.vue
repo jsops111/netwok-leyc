@@ -351,19 +351,19 @@ const auditOptions = computed(() => {
 })
 
 const auditColumns: DataTableColumns<LoginAuditRow> = [
-  { title: '时间', key: 'created_at', width: 165,
+  { title: '时间', key: 'created_at', sorter: 'default', width: 165,
     render: (r) => h('span', { class: 'cy-mono', style: 'font-size:11px' }, dateTimeOf(r.created_at)) },
-  { title: '用户名', key: 'username', width: 140,
+  { title: '用户名', key: 'username', sorter: 'default', width: 140,
     render: (r) => h('span', { style: 'font-weight:600' }, r.username) },
-  { title: '结果', key: 'result', width: 118,
+  { title: '结果', key: 'result', sorter: 'default', width: 118,
     render: (r) => h('span', {
       style: `color:${AUDIT_COLORS[r.result] || STATE.down};font-size:11.5px;font-weight:600`,
     }, r.result_label) },
-  { title: '两步', key: 'used_2fa', width: 58,
+  { title: '两步', key: 'used_2fa', sorter: 'default', width: 58,
     render: (r) => (r.used_2fa ? h('span', { style: `color:${STATE.up}` }, '✓') : h('span', { style: 'color:var(--cy-ink-3)' }, '—')) },
-  { title: '来源 IP', key: 'ip', width: 130,
+  { title: '来源 IP', key: 'ip', sorter: 'default', width: 130,
     render: (r) => h('span', { class: 'cy-mono', style: 'font-size:11px' }, r.ip || '—') },
-  { title: '说明', key: 'detail', ellipsis: { tooltip: true },
+  { title: '说明', key: 'detail', sorter: 'default', ellipsis: { tooltip: true },
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.detail || r.user_agent || '—') },
 ]
 

@@ -276,6 +276,8 @@ export interface ServerPoint {
 }
 
 export interface ServerCard {
+  /** 优先级(order)。**数字小的排在前面** —— 列表和大屏都按它排 */
+  order: number
   id: number
   name: string
   host: string
@@ -567,6 +569,75 @@ export interface Faceplate {
   /** 页面上要**原样显示**的那句话 —— 画错的面板比没有面板危险 */
   note: string
   counts: { up: number; down: number; admin_down: number; unknown: number; total: number }
+}
+
+// ------------------------------------------------- 防火墙地址对象 / 地址组
+
+export interface AddressRow {
+  id: number
+  device: number
+  device_name: string
+  vdom: string
+  name: string
+  seq: number
+  addr_type: string
+  addr_type_label: string
+  is_group: boolean
+  value: string
+  /** 「这一行是什么」,后端拼好 —— 前端各拼一遍总有一处会把点分掩码原样显示 */
+  display: string
+  members: string[]
+  /** **不是组时是 null,不是 0** —— 0 会被读成"这个组是空的" */
+  member_count: number | null
+  comment: string
+  interface: string
+  uuid: string
+  synced_at: string
+  method: string
+}
+
+/** 展开结果的一个节点。组会递归带 members */
+export interface AddressNode {
+  name: string
+  /** `address` 单个对象 / `group` 地址组 / `builtin` 内置名(all、none)/ `unknown` **没同步到** */
+  kind: 'address' | 'group' | 'builtin' | 'unknown'
+  value: string
+  members: AddressNode[]
+  /** 拍平后的叶子 —— 人问"这个别名是哪些地址",要的就是这张表 */
+  leaves: Array<{ name: string; value: string; addr_type: string }>
+  /** 这一支被环检测掐掉了(组 A 含组 B、组 B 含组 A) */
+  cycle: boolean
+  truncated: boolean
+}
+
+export interface AddressResolve {
+  device: number
+  query: string
+  /** api / ssh —— **API 能拿到内置对象,SSH 拿不到**,同一个别名结果会不一样 */
+  method: string
+  synced_at: string | null
+  total_objects: number
+  result: AddressNode
+  used_by: Array<{
+    id: number; policy_id: number; seq: number; name: string
+    enabled: boolean; action: string
+    /** 引用在「源」还是「目的」 */
+    where: string
+  }>
+}
+
+export interface AddressSummaryRow {
+  device_id: number
+  device_name: string
+  mgmt_ip: string
+  vdom: string
+  state: string
+  total: number
+  groups: number
+  method: string
+  synced_at: string | null
+  /** 0 个对象**不等于**这台没有配 —— 这句话由后端给 */
+  note: string
 }
 
 // ------------------------------------------------- 带外硬件(iDRAC)
@@ -1070,6 +1141,8 @@ export interface ChartGroup {
     port: number | null
     state: string
     interval: number
+    /** 优先级(order)。**数字小的排在前面** —— 这一屏的排序就是按它 */
+    order: number
     last_rtt: number | null
     last_loss: number | null
     last_jitter: number | null
@@ -1101,6 +1174,8 @@ export interface Overview {
 }
 
 export interface DeviceCard {
+  /** 优先级(order)。**数字小的排在前面** —— 列表和大屏都按它排 */
+  order: number
   id: number
   name: string
   kind: string
@@ -1354,6 +1429,16 @@ export const api = {
 
   // 端口面板图 —— 几何来自型号画像,口的名字和状态来自设备
   deviceFaceplate: (id: number) => http.get<Faceplate>(`/devices/${id}/faceplate/`),
+
+  // 防火墙地址对象 / 地址组 —— 和策略同一次同步拿回来
+  addresses: (params?: object) =>
+    http.get<Paged<AddressRow>>('/firewall-addresses/', { params }),
+  addressSummary: () =>
+    http.get<{ devices: AddressSummaryRow[] }>('/firewall-addresses/summary/'),
+  /** 别名查询:名字 → 它到底是哪几个网段(地址组递归展开) */
+  resolveAddress: (deviceId: number, name: string) =>
+    http.get<AddressResolve>('/firewall-addresses/resolve/',
+      { params: { device: deviceId, name } }),
 
   // 带外硬件(iDRAC)
   idracHosts: (params?: object) => http.get<Paged<IdracRow>>('/idrac/', { params }),

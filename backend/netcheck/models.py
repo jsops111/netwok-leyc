@@ -1560,6 +1560,110 @@ class FirewallVip(models.Model):
         return not self.port_forward
 
 
+class AddressType(models.TextChoices):
+    """
+    地址对象的种类。**认不出的落到 OTHER,不猜成子网** —— 把一个
+    "动态地址"(SDN 连接器按标签算出来的)显示成一个固定网段,
+    会让人以为自己知道那条策略放开了什么,而实际范围是变的。
+    """
+
+    SUBNET = "ipmask", "子网"
+    RANGE = "iprange", "地址段"
+    FQDN = "fqdn", "域名"
+    GEOGRAPHY = "geography", "国家/地区"
+    WILDCARD = "wildcard", "通配掩码"
+    DYNAMIC = "dynamic", "动态(SDN/标签)"
+    GROUP = "group", "地址组"
+    OTHER = "other", "其它"
+
+
+class FirewallAddress(models.Model):
+    """
+    一个**地址对象**(FortiOS 的 firewall address / addrgrp),**只读快照**。
+
+    ## 为什么值得单独存一张表
+
+    策略表里的源/目的地址是一串**名字** —— `内网服务器组`、`办公网`。
+    **它到底是哪个网段,完全不在策略表里**。没有这张表,页面上就是那几个
+    中文名,而"这条策略放开了什么"这个问题只有登上设备才答得了。
+
+    这和 `FirewallVip` 是同一类缺口:策略表回答"允不允许",它回答
+    "允许的到底是谁"。
+
+    ## 地址组也在这张表里,不另开一张
+
+    `firewall address` 和 `firewall addrgrp` 在策略里**是一样用的** ——
+    都是往 `srcaddr` 里写一个名字。分两张表的话每次解析都要查两遍,
+    而且"这个名字是对象还是组"这个问题会散到调用方去。所以合成一张,
+    `is_group` 区分,组的成员名单放 `members`。
+
+    ## ⚠ 查不到一个名字 ≠ 这个名字不存在
+
+    FortiOS 的 `show`(相对 `show full-configuration`)**只打印偏离默认值
+    的项**,所以**出厂自带的地址对象根本不会出现在输出里** —— `all`、
+    `none`、`FABRIC_DEVICE` 这些都查不到。API 通道能拿全,SSH 通道拿不到。
+
+    所以解析不出来时页面上要说"**没同步到这个对象**",不能说"这个对象
+    不存在" —— 前者是状态,后者是结论。和「这批数据没有命中统计」同一条。
+    """
+
+    device = models.ForeignKey(
+        Device, on_delete=models.CASCADE, related_name="addresses", verbose_name="设备"
+    )
+    vdom = models.CharField("VDOM", max_length=64, blank=True, default="root")
+    name = models.CharField("名称", max_length=128, help_text="策略的源/目的地址里引用的就是这个名字")
+    seq = models.IntegerField("顺序", default=0)
+
+    addr_type = models.CharField(
+        "类型", max_length=16, choices=AddressType.choices, default=AddressType.SUBNET
+    )
+    is_group = models.BooleanField("是地址组", default=False, db_index=True)
+
+    #: 人话形式的值:`10.0.1.0/24` / `10.0.2.10-10.0.2.20` / `www.a.com` / `CN`。
+    #: **在后端拼好** —— 前端各拼一遍的话,总有一处会把掩码显示成
+    #: `255.255.255.0` 这种和 CIDR 混着走的形状
+    value = models.CharField("地址值", max_length=255, blank=True)
+    #: 组的成员名单(只是名字,展开由 resolve 做)
+    members = models.JSONField("成员", default=list, blank=True)
+
+    comment = models.CharField("备注", max_length=255, blank=True)
+    interface = models.CharField("绑定接口", max_length=64, blank=True)
+    uuid = models.CharField("UUID", max_length=64, blank=True)
+
+    raw = models.JSONField("原始记录", default=dict, blank=True)
+    synced_at = models.DateTimeField("同步时间", db_index=True)
+    method = models.CharField("同步通道", max_length=8, blank=True, help_text="api / ssh")
+
+    class Meta:
+        verbose_name = verbose_name_plural = "防火墙地址对象"
+        ordering = ["device_id", "vdom", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "vdom", "name"], name="uniq_address_per_device_vdom"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["device", "is_group"], name="idx_addr_device_group"),
+            # 别名查询就是按名字找,而且要支持前缀/包含 —— 单独一条索引
+            models.Index(fields=["device", "name"], name="idx_addr_device_name"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} = {self.display}"
+
+    @property
+    def display(self) -> str:
+        """
+        这个对象**是什么**,一行说清。
+
+        地址组给的是"N 个成员"而不是把成员铺开 —— 铺开要递归,而递归
+        是 resolve 那边的事(它带环检测)。这里只回答"这一行是什么"。
+        """
+        if self.is_group:
+            return f"地址组({len(self.members or [])} 个成员)"
+        return self.value or "—"
+
+
 # =========================================================================
 # 带外硬件监控(iDRAC / Redfish)
 # =========================================================================

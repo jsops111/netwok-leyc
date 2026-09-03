@@ -270,7 +270,12 @@ const schedulerWarning = computed(() => {
             <div class="line-l">
               <StateDot :state="line.state" />
               <div class="line-meta">
-                <div class="line-name">{{ line.name }}</div>
+                <div class="line-name">
+                  <!-- 优先级角标。**数字小的排在前面** —— 这一屏的顺序就是
+                       按它排的,标出来才能回答"为什么这条在最上面" -->
+                  <span class="prio" title="优先级(数字小的排在前面)">{{ line.order }}</span>
+                  {{ line.name }}
+                </div>
                 <div class="line-host cy-mono">{{ endpoint(line.host, line.protocol, line.port) }}</div>
               </div>
             </div>
@@ -304,7 +309,7 @@ const schedulerWarning = computed(() => {
     <div class="dev-grid">
       <CyberPanel
         v-for="card in allDevices" :key="card.id"
-        :title="card.name"
+        :title="`${card.order} · ${card.name}`"
         :subtitle="card.model_label"
         :level="card.state === 'down' ? 'critical' : card.state === 'degraded' ? 'warning' : 'normal'"
         :live="false"
@@ -366,6 +371,22 @@ const schedulerWarning = computed(() => {
 </template>
 
 <style scoped>
+/* 优先级角标:小、暗、等宽 —— 它是"为什么这条排在这里"的答案,
+   不是要盯着看的数据。做得显眼会和状态色抢注意力 */
+.prio {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 3px;
+  margin-right: 5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9.5px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--cy-ink-3);
+  border: 1px solid var(--cy-line-soft);
+  vertical-align: middle;
+}
+
 .dash { display: flex; flex-direction: column; gap: 16px; }
 
 /* ---- 顶部 ---- */

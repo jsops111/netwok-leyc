@@ -24,6 +24,7 @@ from netcheck.models import (
     DeviceSample,
     Event,
     FirewallPolicy,
+    FirewallAddress,
     FirewallVip,
     IdracHost,
     IdracSample,
@@ -643,6 +644,35 @@ class FirewallPolicyDetailSerializer(FirewallPolicySerializer):
     class Meta(FirewallPolicySerializer.Meta):
         fields = FirewallPolicySerializer.Meta.fields + ["raw"]
         read_only_fields = fields
+
+
+class FirewallAddressSerializer(serializers.ModelSerializer):
+    """
+    一个地址对象 / 地址组。
+
+    `display` 是**模型属性** —— 「这一行是什么」在后端拼好,前端各拼一遍
+    的话总有一处会把点分掩码原样显示出来,于是同一个网段在两个地方
+    长得不一样。
+    """
+
+    device_name = serializers.CharField(source="device.name", read_only=True)
+    addr_type_label = serializers.CharField(source="get_addr_type_display", read_only=True)
+    display = serializers.CharField(read_only=True)
+    member_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FirewallAddress
+        fields = [
+            "id", "device", "device_name", "vdom", "name", "seq",
+            "addr_type", "addr_type_label", "is_group", "value", "display",
+            "members", "member_count", "comment", "interface", "uuid",
+            "synced_at", "method",
+        ]
+        read_only_fields = fields
+
+    def get_member_count(self, obj) -> int | None:
+        """**不是组的话回 None,不是 0** —— 0 会被读成"这个组是空的"。"""
+        return len(obj.members or []) if obj.is_group else None
 
 
 class IdracHostSerializer(serializers.ModelSerializer):

@@ -424,6 +424,33 @@ def fetch_vips(device: Device) -> list[dict]:
     return results
 
 
+def fetch_addresses(device: Device) -> list[dict]:
+    """
+    地址对象(firewall address)。**取不到返回空列表,不抛。**
+
+    ⚠ 和 SSH 的 `show` 不一样,**API 这边能拿到出厂自带的对象**
+    (`all` / `none` / `FABRIC_DEVICE`)。所以同一台设备走 API 和走 SSH
+    查同一个别名,结果可能一个查得到一个查不到 —— 页面上要说清楚
+    这批数据是哪条通道来的。
+    """
+
+    data = _safe(device, "/cmdb/firewall/address")
+    if not data:
+        return []
+    results = data.get("results")
+    return results if isinstance(results, list) else []
+
+
+def fetch_address_groups(device: Device) -> list[dict]:
+    """地址组(firewall addrgrp)。同上。"""
+
+    data = _safe(device, "/cmdb/firewall/addrgrp")
+    if not data:
+        return []
+    results = data.get("results")
+    return results if isinstance(results, list) else []
+
+
 def fetch_policy_stats(device: Device) -> dict[int, dict]:
     """
     每条策略的命中统计,按 policyid 索引。

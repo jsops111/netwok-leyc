@@ -131,15 +131,15 @@ const typeOptions = computed(() => [
 ])
 
 const deviceColumns: DataTableColumns<PolicySummaryRow> = [
-  { title: '状态', key: 'state', width: 74,
+  { title: '状态', key: 'state', sorter: 'default', width: 74,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '防火墙', key: 'device_name', minWidth: 160,
+  { title: '防火墙', key: 'device_name', sorter: 'default', minWidth: 160,
     render: (r) => h('div', [
       h('div', { style: 'font-size:12.5px;color:var(--cy-ink)' }, r.device_name),
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.mgmt_ip} · ${r.vdom}`),
     ]) },
-  { title: '同步', key: 'synced_at', minWidth: 170,
+  { title: '同步', key: 'synced_at', sorter: 'default', minWidth: 170,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11px;color:var(--cy-ink-2)' },
         r.synced_at ? dateTimeOf(r.synced_at) : '从未同步'),
@@ -153,7 +153,7 @@ const deviceColumns: DataTableColumns<PolicySummaryRow> = [
 ]
 
 const vipColumns: DataTableColumns<VipRow> = [
-  { title: '名称', key: 'name', minWidth: 140,
+  { title: '名称', key: 'name', sorter: 'default', minWidth: 140,
     render: (r) => h('div', [
       h('div', { style: "font-size:11.5px;color:var(--cy-ink);font-family:'JetBrains Mono',monospace" },
         r.name),
@@ -161,7 +161,7 @@ const vipColumns: DataTableColumns<VipRow> = [
         ? h('div', { style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.4' }, r.comment)
         : null,
     ]) },
-  { title: '外面看到的', key: 'ext', minWidth: 190,
+  { title: '外面看到的', key: 'ext', sorter: 'default', minWidth: 190,
     render: (r) => h('div', [
       h('div', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-ink)" },
         // ext_port_text 是后端算好的:端口为空时它说「所有端口」而不是留白
@@ -169,12 +169,12 @@ const vipColumns: DataTableColumns<VipRow> = [
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
         r.ext_intf.length ? `接口 ${r.ext_intf.join(', ')}` : '接口 any'),
     ]) },
-  { title: '进到哪里', key: 'mapped', minWidth: 190,
+  { title: '进到哪里', key: 'mapped', sorter: 'default', minWidth: 190,
     render: (r) => h('div', { style: "font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--cy-cyan)" },
       // 负载均衡型没有 mappedip(后端在 realservers 里,是一组机器)——
       // 后端把那句话拼进了 endpoint_text,这里取箭头右边那半
       r.endpoint_text.split(' → ')[1] || '?') },
-  { title: '类型', key: 'vip_type', width: 104,
+  { title: '类型', key: 'vip_type', sorter: 'default', width: 104,
     render: (r) => h('div', [
       h('div', { style: 'font-size:11px;color:var(--cy-ink-2)' }, r.vip_type_label),
       // **整机映射是这张表里唯一值得标出来的风险**:它把那台机器的每一个
@@ -188,7 +188,7 @@ const vipColumns: DataTableColumns<VipRow> = [
           }, () => '整机映射')
         : h('span', { style: 'font-size:10px;color:var(--cy-ink-3)' }, '端口映射'),
     ]) },
-  { title: '被哪些策略引用', key: 'used_by', minWidth: 176,
+  { title: '被哪些策略引用', key: 'used_by', sorter: 'default', minWidth: 176,
     render: (r) => {
       // 三态,和「命中计数」同一条规矩:
       //   null  = 这次没查引用关系 → 「未知」
@@ -214,7 +214,7 @@ const vipColumns: DataTableColumns<VipRow> = [
           title: `#${u.seq + 1} ${u.name || '(未命名)'}${u.enabled ? '' : '(已停用)'}`,
         }, () => `#${u.policy_id}${u.enabled ? '' : '(停)'}`)))
     } },
-  { title: '同步', key: 'method', width: 76,
+  { title: '同步', key: 'method', sorter: 'default', width: 76,
     render: (r) => h('span', { style: 'font-size:10.5px;color:var(--cy-ink-3)' },
       (r.method || '—').toUpperCase()) },
 ]
