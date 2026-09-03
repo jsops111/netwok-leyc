@@ -141,9 +141,120 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
 function openEdit(kind: EntityKind, row?: Record<string, any>) {
   editing.value = kind
   formErrors.value = {}
+  copyNote.value = ''
   // 凭据字段后端是 write_only,不会回传 —— 编辑时留空表示"不修改",
   // 这一点在 hint 里写给用户看
   form.value = row ? { ...DEFAULTS[kind], ...row } : { ...DEFAULTS[kind] }
+  modal.value = true
+}
+
+// ---- 复制 ----
+//
+// 「复制」打开的是**预填好的新建表单**,不是直接建一条。理由:名字、地址
+// 这些带唯一约束的字段必须先改,直接建只会撞约束 —— 而且人复制一台设备
+// 十有八九是要改其中一两项(隔壁机柜那台、下一个网段那台)。
+
+/**
+ * **所有类型都要剥掉的字段。**分三类,每一类漏掉的后果不一样:
+ *
+ * 1. `id` —— 留着的话 `isNew` 是 false,点「创建」实际是**改了源那一条**。
+ *    这是最危险的一个:表单标题会写"编辑",但人以为自己在复制。
+ * 2. 运行时状态(state / last_* / consecutive_* / total_*)—— 留着的话
+ *    新建那条在页面上一开始就顶着**源那条的状态和最后错误**,
+ *    看着像它已经采过了。
+ * 3. 只读的统计字段 —— 后端本来就会忽略,但留在表单模型里会让
+ *    "这些值也复制过来了"这个误解成立。
+ */
+const COPY_STRIP_COMMON = [
+  'id', 'state', 'state_label',
+  'last_collected_at', 'last_checked_at', 'last_error', 'last_sent_at',
+  'consecutive_fail', 'consecutive_ok', 'total_checks', 'total_fail',
+  'total_sent', 'total_failed',
+  'last_rtt_ms', 'last_loss_pct', 'last_jitter_ms',
+  'has_credential', 'uses_key', 'open_event_count', 'interface_count',
+  'target_count', 'profile_notes',
+]
+
+/**
+ * **首次采集回填的铭牌字段。**这些是从**源那台机器**上采回来的 ——
+ * 型号、序列号、内核版本、CPU 核数、服务编号……
+ *
+ * 复制过去的后果很安静:新建那条在第一次采集之前,页面上显示的是
+ * **另一台机器的硬件信息**。人会照着它去判断"这台是 C9300 还是 C9200L",
+ * 而那是错的。所以一律剥掉,让它显示"待采集"。
+ */
+const COPY_STRIP_INVENTORY = [
+  'os_version', 'serial', 'hostname', 'os_name', 'kernel',
+  'cpu_cores', 'mem_total_bytes',
+  'model_name', 'manufacturer', 'service_tag', 'bios_version',
+  'idrac_firmware', 'system_hostname', 'power_state',
+  'last_backup_at', 'last_backup_status', 'last_backup_error',
+  'config_unsaved', 'config_unsaved_lines', 'config_checked_at',
+  'last_policy_sync_at', 'last_policy_error', 'policy_count',
+  'backup_count',
+]
+
+/**
+ * 凭据。后端是 `write_only`,**列表接口根本不会回传它们** ——
+ * 所以复制出来的那条天生是空凭据。这里显式列出来只为了两件事:
+ * 保证表单里是空串(而不是 undefined),以及**在弹窗里说出来**。
+ *
+ * 不说的后果:人复制一台设备、改个 IP、点创建 —— 然后收到一个
+ * "SNMP v2c 必须填 community" 的报错,而他以为自己什么都没动。
+ */
+const COPY_STRIP_SECRETS = [
+  'snmp_community', 'snmp_v3_auth_key', 'snmp_v3_priv_key',
+  'ssh_password', 'ssh_private_key', 'ssh_enable_password',
+  'ssh_key_passphrase', 'api_token', 'telegram_bot_token', 'password',
+]
+
+/** 弹窗顶部那句"这次复制没带过来什么"。**必须显示** —— 见上面 */
+const copyNote = ref('')
+
+function copyFrom(kind: EntityKind, row: Record<string, any>) {
+  editing.value = kind
+  formErrors.value = {}
+
+  const draft: Record<string, any> = { ...DEFAULTS[kind], ...row }
+  for (const key of [...COPY_STRIP_COMMON, ...COPY_STRIP_INVENTORY]) {
+    delete draft[key]
+  }
+  // 凭据置成**空串而不是删掉** —— 删掉的话 SchemaForm 里那个输入框
+  // 是 undefined,敲一下再清空会变成受控/非受控的来回切换
+  for (const key of COPY_STRIP_SECRETS) {
+    if (key in draft) draft[key] = ''
+  }
+
+  // 名字带唯一约束,原样复制必然撞。加后缀而不是清空:清空的话人得从头
+  // 想一个名字,而"xxx 副本"改一个字就能用
+  if (draft.name) draft.name = `${row.name} 副本`
+
+  form.value = { ...DEFAULTS[kind], ...draft }
+
+  const notes = ['**凭据没有复制**(后端不回传密码/密钥),要重新填一遍。']
+  // 地址的提示**按类型分开写**,因为三者的约束不一样:
+  //   server / idrac —— (地址, 端口) 有唯一约束,不改就建不出来
+  //   device         —— **没有**这条约束(多 VDOM 的 FortiGate 就是同一个
+  //                     管理地址配好几条),所以不改也能建出来,而后果是
+  //                     同一台设备被采两遍。这种"能建出来但不对"的情况
+  //                     才更需要提前说一句
+  //   probe          —— (监控类, 地址, 协议, 端口) 唯一
+  if (kind === 'server' || kind === 'idrac') {
+    notes.push('地址原样带过来了 —— **同一个地址+端口只能加一台**,不改的话建不出来。')
+  }
+  if (kind === 'device') {
+    notes.push(
+      '地址原样带过来了。设备**允许**同地址多条(多 VDOM 就是这么用的),'
+      + '所以不改也能建成功 —— 而那意味着**同一台设备被采两遍**:接口表、事件、'
+      + 'SNMP 负载都翻倍。不是有意为之的话记得改。',
+    )
+  }
+  if (kind === 'probe') {
+    notes.push('同一个监控类下,地址+协议+端口不能重复 —— 不改的话建不出来。')
+  }
+  notes.push('型号/序列号/内核这些是采回来的,没有复制(它们属于源那台机器)。')
+  copyNote.value = notes.join('')
+
   modal.value = true
 }
 
@@ -181,6 +292,7 @@ async function save() {
     }
     message.success(isNew.value ? '已创建,下一拍开始采集' : '已保存')
     modal.value = false
+    copyNote.value = ''
     await loadAll()
   } catch (e) {
     // 字段级错误标到对应输入框上,不只弹一句话 —— 四十个字段的表单里
@@ -743,8 +855,9 @@ const groupColumns: DataTableColumns<ProbeGroup> = [
   { title: '排序', key: 'order', width: 62, className: 'num' },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('group', r) }) },
-  { title: '操作', key: 'act', width: 118,
+  { title: '操作', key: 'act', width: 160,
     render: (r) => h(NSpace, { size: 4 }, () => [
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('group', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('group', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('group', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -783,10 +896,11 @@ const probeColumns: DataTableColumns<ProbeTarget> = [
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_checked_at)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('probe', r) }) },
-  { title: '操作', key: 'act', width: 172, fixed: 'right',
+  { title: '操作', key: 'act', width: 214, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testProbe(r) }, () => '测试'),
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('probe', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('probe', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('probe', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -854,7 +968,7 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
     render: (r) => h('span', { style: 'font-size:11px;color:var(--cy-ink-3)' }, ago(r.last_collected_at)) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('device', r) }) },
-  { title: '操作', key: 'act', width: 274, fixed: 'right',
+  { title: '操作', key: 'act', width: 316, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testDevice(r) }, () => '测主通道'),
@@ -865,6 +979,7 @@ const deviceColumns: DataTableColumns<DeviceRow> = [
         ? h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
             onClick: () => testBackup(r) }, () => '测备份')
         : null,
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('device', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('device', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('device', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -919,10 +1034,11 @@ const serverColumns: DataTableColumns<ServerRow> = [
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small',
       onUpdateValue: () => toggleEnabled('server', r) }) },
-  { title: '操作', key: 'act', width: 172, fixed: 'right',
+  { title: '操作', key: 'act', width: 214, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testServer(r) }, () => '测试'),
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('server', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('server', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('server', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -969,10 +1085,11 @@ const idracColumns: DataTableColumns<IdracRow> = [
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small',
       onUpdateValue: () => toggleEnabled('idrac', r) }) },
-  { title: '操作', key: 'act', width: 182, fixed: 'right',
+  { title: '操作', key: 'act', width: 224, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', ghost: true, loading: testing.value === r.id,
         onClick: () => testIdrac(r) }, () => '测试'),
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('idrac', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('idrac', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('idrac', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -1010,10 +1127,11 @@ const notifierColumns: DataTableColumns<NotifierRow> = [
     ]) },
   { title: '启用', key: 'enabled', width: 66,
     render: (r) => h(NSwitch, { value: r.enabled, size: 'small', onUpdateValue: () => toggleEnabled('notifier', r) }) },
-  { title: '操作', key: 'act', width: 158, fixed: 'right',
+  { title: '操作', key: 'act', width: 200, fixed: 'right',
     render: (r) => h(NSpace, { size: 4 }, () => [
       h(NButton, { size: 'tiny', type: 'primary', ghost: true, loading: testing.value === r.id,
         onClick: () => testNotifier(r) }, () => '发测试'),
+      h(NButton, { size: 'tiny', ghost: true, onClick: () => copyFrom('notifier', r) }, () => '复制'),
       h(NButton, { size: 'tiny', ghost: true, onClick: () => openEdit('notifier', r) }, () => '编辑'),
       h(NPopconfirm, { onPositiveClick: () => remove('notifier', r.id) }, {
         trigger: () => h(NButton, { size: 'tiny', text: true, type: 'error' }, () => '删除'),
@@ -1170,9 +1288,15 @@ const profileNote = computed(() => {
     <!-- ============ 编辑弹窗 ============ -->
     <NModal
       v-model:show="modal" preset="card" :bordered="false"
-      :title="`${isNew ? '新建' : '编辑'}${MODAL_TITLES[editing]}`"
+      :title="`${copyNote ? '复制为新的' : isNew ? '新建' : '编辑'}${MODAL_TITLES[editing]}`"
       style="width: min(860px, 94vw)"
     >
+      <!-- **复制没带过来什么,必须说出来。**不说的后果:人复制一台设备、
+           改个 IP、点创建,然后收到一个"必须填 community"的报错,
+           而他以为自己什么都没动 -->
+      <div v-if="copyNote" class="copy-note">
+        <b>这是一份副本 —— 有几项没有复制过来:</b>{{ copyNote }}
+      </div>
       <div v-if="profileNote" class="profile-note">
         <b>型号采集特点:</b>{{ profileNote }}
       </div>
@@ -1186,7 +1310,7 @@ const profileNote = computed(() => {
       />
       <template #footer>
         <NSpace justify="end">
-          <NButton size="small" @click="modal = false">取消</NButton>
+          <NButton size="small" @click="modal = false; copyNote = ''">取消</NButton>
           <NButton size="small" type="primary" :loading="saving" @click="save">
             {{ isNew ? '创建' : '保存' }}
           </NButton>
@@ -1220,6 +1344,16 @@ const profileNote = computed(() => {
 
 <style scoped>
 .cfg :deep(.n-tabs-nav) { margin-bottom: 12px; }
+
+.copy-note {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--cy-degraded);
+  padding: 6px 11px;
+  margin-bottom: 10px;
+  border-left: 2px solid var(--cy-degraded);
+  background: rgba(var(--cy-degraded-rgb), 0.07);
+}
 
 .profile-note {
   padding: 9px 12px;
