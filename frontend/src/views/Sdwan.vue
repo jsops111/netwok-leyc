@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { NButton, NSelect, NSwitch, NTag, NTooltip, useMessage } from 'naive-ui'
+import { computed, h, ref } from 'vue'
+import { NButton, NDataTable, NSelect, NSwitch, NTag, NTooltip, useMessage } from 'naive-ui'
+import type { DataTableColumns } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
-import Sparkline from '@/components/charts/Sparkline.vue'
 import { api } from '@/api'
 import type { SdwanLinkRow } from '@/api'
 import { usePolling } from '@/composables/usePolling'
@@ -81,14 +81,71 @@ function stateColor(state: string): string {
   return STATE.unknown
 }
 
-/** 延迟色。**没有全局阈值** —— 每台设备的门限不一样,所以按那台自己的判 */
-function latencyColor(link: SdwanLinkRow, warn: number | null): string {
+/**
+ * 延迟色。**没有全局阈值** —— 每台设备的门限不一样。
+ * 这里只按"设备自己的判定"上色:未达标或不通就是红的,
+ * 平台自己那条额外门限在告警里体现,不在这一列上色
+ * (两套线在同一个格子里上色,人分不出这个红是谁判的)。
+ */
+function latencyColorOf(link: SdwanLinkRow): string {
   if (link.latency_ms === null) return 'var(--cy-ink-3)'
-  if (link.state === 'dead') return STATE.down
-  if (link.sla_met === false) return STATE.down
-  if (warn && link.latency_ms >= warn) return STATE.degraded
+  if (link.state === 'dead' || link.sla_met === false) return STATE.down
   return 'var(--cy-ink)'
 }
+
+/**
+ * 链路表的列。**顺序和标签跟 FortiGate 自己那张
+ * 「网络 → SD-WAN → 性能 SLA」表对齐** —— 名称 / 检测服务器 / 成员 /
+ * 丢包 / 延迟 / 抖动 / 状态。
+ *
+ * 这不是审美问题:同一条链路在防火墙上叫「检测服务器」、在这儿叫
+ * 「探测目标」,列的顺序还反着,人在两个屏之间来回对的时候必然出错。
+ * **跟着设备的说法走。**
+ */
+const linkColumns: DataTableColumns<SdwanLinkRow> = [
+  { title: '名称', key: 'health_check', sorter: 'default', minWidth: 120,
+    render: (r) => h('span', { class: 'mono' }, r.health_check) },
+  // 「检测服务器」——**这一列是这一页的题眼**:健康检查探的是哪个地址
+  { title: '检测服务器', key: 'server', sorter: 'default', minWidth: 130,
+    render: (r) => h('span', { class: 'mono' }, r.server || '设备没报') },
+  // 「出口」= FortiOS 里的 member。**这一列回答"从哪个口出去"** ——
+  // 一个健康检查同时探所有出口,而 SLA 是按出口判的
+  { title: '出口', key: 'member', sorter: 'default', minWidth: 110,
+    render: (r) => h('span', { class: 'mono strong' }, r.member) },
+  // 丢包在延迟前面 —— FortiGate 就是这个顺序,跟着设备的说法走
+  { title: '丢包', key: 'loss_pct', sorter: 'default', width: 84, className: 'num',
+    render: (r) => h('span', {
+      class: 'mono',
+      style: `color:${(r.loss_pct ?? 0) >= 100 ? STATE.down
+        : (r.loss_pct ?? 0) > 0 ? STATE.degraded : 'var(--cy-ink)'}`,
+    }, pct(r.loss_pct, 2)) },
+  { title: '延迟', key: 'latency_ms', sorter: 'default', width: 88, className: 'num',
+    render: (r) => h('span', { class: 'mono', style: `color:${latencyColorOf(r)}` },
+      ms(r.latency_ms)) },
+  { title: '抖动', key: 'jitter_ms', sorter: 'default', width: 84, className: 'num',
+    render: (r) => h('span', { class: 'mono' }, ms(r.jitter_ms)) },
+  { title: '状态', key: 'state', sorter: 'default', width: 76,
+    render: (r) => h('span', {
+      style: `font-size:11.5px;font-weight:700;color:${stateColor(r.state)}`,
+    }, r.state_label) },
+  // SLA 达标是「性能 SLA」这个功能的**结论列**,所以留着。三态各有说法,
+  // 文案由后端拼(null 说"设备没报",不是"达标")
+  { title: 'SLA', key: 'sla_met', width: 148,
+    sorter: (a, b) => Number(a.sla_met ?? -1) - Number(b.sla_met ?? -1),
+    render: (r) => h(NTooltip, null, {
+      trigger: () => h('span', {
+        style: `font-size:11px;color:${
+          r.sla_met === false ? STATE.down : r.sla_met === true ? STATE.up : STATE.unknown}`,
+      }, r.sla_text),
+      default: () => r.sla_met === null
+        ? '设备没有报这一项 —— 可能没配 SLA 目标,或者这个固件不给。不等于达标'
+        : '这是设备自己的判定:它比我们更清楚它按哪一档选路',
+    }) },
+]
+
+// 会话数、带宽、延迟趋势、状态变化时间**不做成列**。
+// 这一页要回答的是"探 8.8.8.8 走哪个口、那个口好不好",十一列摊开之后
+// 那三个数反而找不到了 —— 它们挂在行的 title 上,鼠标停一下就有。
 
 const VERDICT_TEXT: Record<string, string> = {
   ok: '全部达标',
@@ -188,84 +245,22 @@ const VERDICT_TEXT: Record<string, string> = {
       </div>
       <div v-if="dev.last_error" class="err">{{ dev.last_error }}</div>
 
-      <div class="links">
-        <div
-          v-for="link in dev.links" :key="link.id"
-          class="link" :class="{ bad: isProblem(link) }"
-        >
-          <div class="l-head">
-            <i class="l-dot" :style="{ background: stateColor(link.state) }"></i>
-            <div class="l-name">
-              <div class="l-member">{{ link.member }}</div>
-              <div class="l-check">{{ link.health_check }}</div>
-            </div>
-            <NTag size="tiny" :bordered="false" :style="{ color: stateColor(link.state) }">
-              {{ link.state_label }}
-            </NTag>
-            <!-- 达标三态,文案由后端给 —— null 说"设备没报",不显示成达标 -->
-            <NTooltip>
-              <template #trigger>
-                <NTag
-                  size="tiny" :bordered="false"
-                  :style="{ color: link.sla_met === false ? STATE.down
-                    : link.sla_met === true ? STATE.up : STATE.unknown }"
-                >{{ link.sla_text }}</NTag>
-              </template>
-              {{ link.sla_met === null
-                ? '设备没有报这一项 —— 可能没配 SLA 目标,或者这个固件不给。不等于达标'
-                : '这是设备自己的判定:它比我们更清楚它按哪一档选路' }}
-            </NTooltip>
-          </div>
-
-          <div class="l-nums">
-            <div class="n">
-              <span class="n-k">延迟</span>
-              <b :style="{ color: latencyColor(link, dev.sla_latency_warn_ms) }">
-                {{ ms(link.latency_ms) }}
-              </b>
-            </div>
-            <div class="n">
-              <span class="n-k">抖动</span>
-              <b>{{ ms(link.jitter_ms) }}</b>
-            </div>
-            <div class="n">
-              <span class="n-k">丢包</span>
-              <b :style="{ color: (link.loss_pct ?? 0) > 0 ? STATE.degraded : 'var(--cy-ink)' }">
-                {{ pct(link.loss_pct, 1) }}
-              </b>
-            </div>
-            <div class="n">
-              <span class="n-k">会话</span>
-              <!-- SSH 通道拿不到 → null,显示 — 而不是 0 -->
-              <b>{{ int(link.session_count) }}</b>
-            </div>
-            <div class="n">
-              <span class="n-k">带宽 ↓/↑</span>
-              <b class="sm">{{ bps(link.rx_bps) }} / {{ bps(link.tx_bps) }}</b>
-            </div>
-          </div>
-
-          <!-- 延迟趋势。**手写 SVG 的 Sparkline** —— 一屏几十条链路,
-               每条 init 一个 echarts 会让首屏卡好几秒 -->
-          <Sparkline
-            v-if="link.series?.length"
-            :values="link.series.map((p) => p.latency)"
-            :color="isProblem(link) ? STATE.down : 'var(--cy-cat-1)'"
-            :height="26"
-          />
-          <div v-else class="dim small">这段时间没有采样</div>
-
-          <div class="l-foot">
-            <span class="dim">
-              {{ link.server ? `探测目标 ${link.server}` : '探测目标未报' }}
-              {{ link.protocol ? ` · ${link.protocol}` : '' }}
-            </span>
-            <span v-if="link.last_change" class="dim">
-              状态变化于 {{ ago(link.last_change) }}
-            </span>
-          </div>
-        </div>
-      </div>
+      <!-- **列和 FortiGate 自己那张 Performance SLA 表对齐**:
+           名称 / 检测服务器 / 成员 / 丢包 / 延迟 / 抖动 / 状态 ——
+           同一个东西在两个地方叫两个名字、排两种顺序,人对不上 -->
+      <NDataTable
+        :columns="linkColumns" :data="dev.links" size="small"
+        :bordered="false" :single-line="false" :scroll-x="1000"
+        :row-props="(r: SdwanLinkRow) => ({
+          class: isProblem(r) ? 'bad-row' : '',
+          title: [
+            `协议 ${r.protocol || '未报'}`,
+            `会话 ${int(r.session_count)}`,
+            `带宽 ↓${bps(r.rx_bps)} / ↑${bps(r.tx_bps)}`,
+            r.last_change ? `状态变化于 ${ago(r.last_change)}` : '',
+          ].filter(Boolean).join('  ·  '),
+        })"
+      />
 
       <!-- 这台的未恢复告警 -->
       <div v-if="dev.alerts.length" class="alerts">
@@ -356,50 +351,16 @@ const VERDICT_TEXT: Record<string, string> = {
   color: var(--cy-cyan);
 }
 
-.links {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 10px;
-}
-.link {
-  border: 1px solid var(--cy-line-soft);
-  border-left: 3px solid var(--cy-line);
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  background: color-mix(in srgb, var(--cy-raised) 40%, transparent);
-}
-.link.bad { border-left-color: var(--cy-down); }
-
-.l-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
-.l-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-.l-name { flex: 1; min-width: 0; }
-.l-member {
-  font-size: 12.5px;
-  color: var(--cy-ink);
+:deep(.mono) {
+  font-size: 12px;
   font-family: 'JetBrains Mono', monospace;
+  color: var(--cy-ink-2);
 }
-.l-check { font-size: 10px; color: var(--cy-ink-3); }
+:deep(.mono.strong) { color: var(--cy-ink); font-weight: 700; }
+/* 有问题的行整行淡红 —— 一屏几十条链路时,靠某一格的颜色找不过来 */
+:deep(.bad-row td) { background: color-mix(in srgb, var(--cy-down) 7%, transparent) !important; }
 
-.l-nums { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
-.n { display: flex; flex-direction: column; gap: 1px; }
-.n-k { font-size: 9.5px; color: var(--cy-ink-3); }
-.n b {
-  font-size: 13px;
-  font-family: 'JetBrains Mono', monospace;
-  color: var(--cy-ink);
-}
 
-.l-foot {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 10px;
-  border-top: 1px solid var(--cy-line-soft);
-  padding-top: 5px;
-  flex-wrap: wrap;
-}
 
 .alerts { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; }
 .alert {
