@@ -1041,13 +1041,25 @@ class IdracHostViewSet(viewsets.ModelViewSet):
             "hosts": len(hosts), "ok": 0, "warn": 0, "crit": 0,
             "unknown": 0, "pending": 0, "down": 0,
             "disk_total": 0, "disk_bad": 0, "disk_unknown": 0, "ssd_worn": 0,
-            "psu_total": 0, "psu_bad": 0,
+            # SMART 预警**单独一栏**:盘还在跑、Health 还是绿的,但它快坏了。
+            # 并进 disk_bad 会让"要现在换"和"该排计划换"混成一个数
+            "disk_smart": 0,
+            "psu_total": 0, "psu_bad": 0, "psu_redundancy_lost": 0,
+            # 告警条数(不是台数)。大屏的横幅和结论条要的是这两个
+            "alert_crit": 0, "alert_warn": 0,
             "memory_total": 0, "memory_bad": 0,
             "fan_total": 0, "fan_bad": 0,
             "vdisk_total": 0, "vdisk_bad": 0,
             "power_watts": 0.0, "sel_recent_critical": 0,
         }
         temps: list[tuple[float, str]] = []
+        # 四张大卡要画的**分布**(不是时间序列)。在后端算是因为逐块盘、
+        # 逐个探头的明细只在 sample.extra 里,而大屏的 payload 不带那些 ——
+        # 带上的话几十台机器一次刷新就是几 MB
+        dist_temps: list[float] = []
+        dist_deltas: list[int] = []
+        dist_lives: list[float] = []
+        dist_fans: list[int] = []
 
         for host in hosts:
             sample = latest_by_host.get(host.pk)
@@ -1073,6 +1085,12 @@ class IdracHostViewSet(viewsets.ModelViewSet):
             # 后者去机房换件。合成一栏会让人先跑错方向
             totals[level] = totals.get(level, 0) + 1
 
+            for event in events:
+                if event.severity == Severity.CRITICAL:
+                    totals["alert_crit"] += 1
+                else:
+                    totals["alert_warn"] += 1
+
             if sample is not None and sample.reachable:
                 for key in ("disk_total", "disk_bad", "disk_unknown", "psu_total", "psu_bad",
                             "memory_total", "memory_bad", "fan_total", "fan_bad",
@@ -1082,13 +1100,36 @@ class IdracHostViewSet(viewsets.ModelViewSet):
                     totals["power_watts"] += sample.power_watts
                 if sample.max_temp_c is not None:
                     temps.append((sample.max_temp_c, host.name))
+                    dist_temps.append(sample.max_temp_c)
+                if sample.temp_delta_c is not None:
+                    dist_deltas.append(int(round(sample.temp_delta_c)))
+                if sample.fan_max_rpm:
+                    dist_fans.append(sample.fan_max_rpm)
+
                 sel = extra.get("sel") or {}
                 totals["sel_recent_critical"] += sel.get("recent_critical") or 0
+
+                disks = extra.get("disks") or []
+                totals["disk_smart"] += sum(1 for d in disks if d.get("smart_alert"))
                 totals["ssd_worn"] += sum(
-                    1 for d in (extra.get("disks") or [])
+                    1 for d in disks
                     if d.get("life_pct") is not None
                     and d["life_pct"] <= host.ssd_life_warn_pct
                 )
+                # **只有 SSD 进这条分布。**机械盘的 life_pct 是 None
+                # (它没有这个概念),混进来的话曲线会被一堆 0 压平
+                dist_lives.extend(
+                    d["life_pct"] for d in disks if d.get("life_pct") is not None
+                )
+
+                # 冗余丢失:有一路电源没有输入电压。**机器照跑,操作系统里
+                # 一点症状都没有** —— 这正是带外该报而带内报不了的那一类
+                psus = extra.get("psus") or []
+                if any(
+                    p.get("input_voltage") is not None and p["input_voltage"] < 50
+                    for p in psus
+                ) or any(p.get("health") in ("warning", "critical") for p in psus):
+                    totals["psu_redundancy_lost"] += 1
 
             rows.append({
                 "id": host.pk, "name": host.name, "host": host.host,
@@ -1152,6 +1193,15 @@ class IdracHostViewSet(viewsets.ModelViewSet):
             "generated_at": timezone.now(),
             "verdict": verdict,
             "totals": totals,
+            # 四张大卡画的是**分布**,不是趋势 —— 前端那条曲线的 X 轴是
+            # "N 台按高低排好序",所以排序在这里做完
+            "distributions": {
+                "temps": sorted(dist_temps, reverse=True),
+                "deltas": sorted(dist_deltas, reverse=True),
+                # 寿命是**越低越糟**,所以升序 —— 最该看的那块排在最前
+                "lives": sorted(dist_lives),
+                "fans": sorted(dist_fans, reverse=True),
+            },
             "hosts": rows,
             # 全部未恢复告警,按级别排 —— 大屏右侧那一栏
             "alerts": [

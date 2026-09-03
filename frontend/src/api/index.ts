@@ -675,16 +675,31 @@ export interface IdracBoard {
     hosts: number; ok: number; warn: number; crit: number
     unknown: number; pending: number; down: number
     disk_total: number; disk_bad: number; disk_unknown: number; ssd_worn: number
-    psu_total: number; psu_bad: number
+    /** SMART 预警**单独一栏**:盘还在跑、Health 还是绿的,但它快坏了 */
+    disk_smart: number
+    psu_total: number; psu_bad: number; psu_redundancy_lost: number
     memory_total: number; memory_bad: number
     fan_total: number; fan_bad: number
     vdisk_total: number; vdisk_bad: number
     power_watts: number | null
     sel_recent_critical: number
+    /** 告警**条数**(不是台数) */
+    alert_crit: number; alert_warn: number
     temp_max: number | null
     temp_avg: number | null
     /** 最热那台**点名** —— 只给数字的话人还得自己去表里找 */
     temp_max_host: string | null
+  }
+  /**
+   * 四张大卡画的**分布**,不是趋势 —— X 轴是「N 台按高低排好序」。
+   * 排序在后端做完(逐块盘的明细不在大屏 payload 里)。
+   */
+  distributions: {
+    temps: number[]
+    deltas: number[]
+    /** **只有 SSD**。机械盘没有这个概念,升序 —— 最该看的排最前 */
+    lives: number[]
+    fans: number[]
   }
   hosts: IdracBoardHost[]
   alerts: IdracAlert[]

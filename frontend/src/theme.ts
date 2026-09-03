@@ -110,6 +110,21 @@ export const CATEGORICAL = [
   'var(--cy-cat-5)', 'var(--cy-cat-6)', 'var(--cy-cat-7)', 'var(--cy-cat-8)',
 ] as const
 
+/**
+ * 带外大屏(和 ops-ai-cmdb 的监控大屏同一套视觉语言)专用的两个色。
+ *
+ * `alarm` 是**纯正大红**,和 `STATE.down`(偏玫红)刻意不同色:那套屏上
+ * 大红**只给确定的异常**,装饰、身份、排名一律不许用红 ——
+ * 一直都在的红等于没有红。
+ *
+ * `hilite` 是发光大字那个"上亮下暗"渐变的顶端。深色下是白,亮色下压成
+ * 浅灰蓝 —— 白底上"白 → 色"的渐变字上半截会整个消失。
+ */
+export const HUD = {
+  alarm: 'var(--cy-alarm)',
+  hilite: 'var(--cy-hilite)',
+} as const
+
 export const SURFACE = {
   body: 'var(--cy-body)',
   card: 'var(--cy-card)',
@@ -142,7 +157,7 @@ export function resolveColor(value: string): string {
 }
 
 /** 组件内联样式从这里取色,不要到处硬编码。 */
-export const cyber = { NEON, STATE, STATUS, SEVERITY, SURFACE, INK, CATEGORICAL }
+export const cyber = { NEON, STATE, STATUS, SEVERITY, SURFACE, INK, CATEGORICAL, HUD }
 
 const FONTS = {
   fontFamily:
