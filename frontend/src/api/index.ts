@@ -1604,6 +1604,7 @@ export const api = {
     http.get<AclBoard>('/cisco-acl/board/', { params: { device: deviceId } }),
 
   // SD-WAN 性能 SLA —— 防火墙自己从出口探出来的延迟/抖动/丢包
+  /** `hours = 0` → **不返回趋势点**(大屏那几张小卡只要当前值) */
   sdwanBoard: (hours = 6) =>
     http.get<SdwanBoard>('/sdwan/board/', { params: { hours } }),
   sdwanLinks: (params?: object) =>

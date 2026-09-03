@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { NButton, NButtonGroup, NSelect, NTooltip } from 'naive-ui'
+import { NButton, NButtonGroup, NCheckbox, NSelect, NTooltip } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
@@ -81,18 +81,174 @@ function groupLevel(summary: { down: number; degraded: number }) {
   return 'normal' as const
 }
 
-const allDevices = computed<DeviceCard[]>(() => {
+/**
+ * 这一屏显示哪些设备、怎么排 —— **存在浏览器里,不存库**。
+ *
+ * 理由:一块挂在墙上的大屏和一个人在工位上开的页面**要看的东西不一样**,
+ * 而存库是一份**共享**设置 —— 两个人各调各的会互相覆盖,大屏上的东西
+ * 会莫名其妙变掉,还查不出是谁改的。
+ *
+ * 对比:保留期是存库的(见「时序数据」那一节)—— 那是**系统**设置,
+ * 全站只该有一份;而"这块屏显示什么"是**视图**设置,天生该按屏各算各的。
+ *
+ * ⚠ **隐藏 ≠ 停止监控。**被隐藏的设备照样在采、照样开事件、照样推告警 ——
+ * 只是这一屏不画它。要真的停,是配置中心里那个「启用」开关。
+ * 这句话写在选择框里,不写的话一定会有人用隐藏来"关掉"一台设备。
+ */
+const DEVICE_VIEW_KEY = 'netcheck.dashboard.devices'
+
+type DeviceSort = 'order' | 'name' | 'state' | 'collected'
+
+const deviceSort = ref<DeviceSort>('order')
+/** 被隐藏的设备 id。**存"隐藏哪些"而不是"显示哪些"** —— 新加的设备
+ *  默认就该出现在大屏上,存白名单的话它会悄悄不显示 */
+const hiddenDevices = ref<Set<number>>(new Set())
+const pickerOpen = ref(false)
+
+try {
+  const saved = JSON.parse(localStorage.getItem(DEVICE_VIEW_KEY) || '{}')
+  if (Array.isArray(saved.hidden)) hiddenDevices.value = new Set(saved.hidden)
+  if (saved.sort) deviceSort.value = saved.sort
+} catch {
+  // 存坏了就用默认的 —— 一个读不出来的偏好不该让整页打不开
+}
+
+function saveDeviceView() {
+  try {
+    localStorage.setItem(DEVICE_VIEW_KEY, JSON.stringify({
+      hidden: [...hiddenDevices.value], sort: deviceSort.value,
+    }))
+  } catch { /* 隐私模式下写不了,不影响这次会话内的效果 */ }
+}
+
+function toggleDevice(id: number) {
+  if (hiddenDevices.value.has(id)) hiddenDevices.value.delete(id)
+  else hiddenDevices.value.add(id)
+  hiddenDevices.value = new Set(hiddenDevices.value)
+  saveDeviceView()
+}
+function showAllDevices() {
+  hiddenDevices.value = new Set()
+  saveDeviceView()
+}
+watch(deviceSort, saveDeviceView)
+
+/**
+ * SD-WAN SLA 也上大屏,**同一套选择机制**(存浏览器、存"隐藏哪些")。
+ *
+ * 它和上面那些线路测的**不是同一段**:线路是这个平台自己从部署点探的,
+ * SD-WAN 是防火墙自己从它的出口探的 —— 这句话在 `/sdwan` 那一页写在
+ * 最上面,大屏上地方小,所以放在小节标题的副标题里。
+ */
+const SDWAN_VIEW_KEY = 'netcheck.dashboard.sdwan'
+const hiddenSdwan = ref<Set<number>>(new Set())
+const sdwanPickerOpen = ref(false)
+// **hours=0 = 不要趋势点** —— 这几张小卡只显示当前值。默认那 6 小时的
+// 采样点在 50 条链路上是每分钟白传几千个对象;趋势在 /sdwan 那一页看
+const sdwan = usePolling(() => api.sdwanBoard(0).then((r) => r.data), 60_000)
+
+try {
+  const saved = JSON.parse(localStorage.getItem(SDWAN_VIEW_KEY) || '{}')
+  if (Array.isArray(saved.hidden)) hiddenSdwan.value = new Set(saved.hidden)
+} catch { /* 存坏了用默认的 */ }
+
+function saveSdwanView() {
+  try {
+    localStorage.setItem(SDWAN_VIEW_KEY,
+      JSON.stringify({ hidden: [...hiddenSdwan.value] }))
+  } catch { /* 隐私模式 */ }
+}
+function toggleSdwan(id: number) {
+  if (hiddenSdwan.value.has(id)) hiddenSdwan.value.delete(id)
+  else hiddenSdwan.value.add(id)
+  hiddenSdwan.value = new Set(hiddenSdwan.value)
+  saveSdwanView()
+}
+function showAllSdwan() {
+  hiddenSdwan.value = new Set()
+  saveSdwanView()
+}
+
+/** 全部链路(拉平,不分设备)—— 大屏上按链路看,不按设备看 */
+const everySdwanLink = computed(() =>
+  (sdwan.data.value?.devices ?? []).flatMap((d) =>
+    d.links.map((l) => ({ ...l, device_name: d.device_name }))))
+
+const sdwanLinks = computed(() => {
+  const list = everySdwanLink.value.filter((l) => !hiddenSdwan.value.has(l.id))
+  // **有问题的排前面** —— 大屏上这一块通常只有几条,而它存在的意义
+  // 就是"哪条出口现在不行"。同档内按设备名+成员名,顺序才稳定
+  return [...list].sort((a, b) => {
+    const rank = (x: typeof a) => (x.state === 'dead' ? 0 : x.sla_met === false ? 1 : 2)
+    return rank(a) - rank(b)
+      || a.device_name.localeCompare(b.device_name, 'zh-CN')
+      || a.member.localeCompare(b.member)
+  })
+})
+
+/** 和设备那边同一条:**被隐藏的里面有问题的要点名**,不能悄悄消失 */
+const hiddenSdwanSummary = computed(() => {
+  const hidden = everySdwanLink.value.filter((l) => hiddenSdwan.value.has(l.id))
+  return {
+    count: hidden.length,
+    bad: hidden.filter((l) => l.state === 'dead' || l.sla_met === false),
+  }
+})
+
+const SORT_OPTIONS = [
+  { label: '按优先级', value: 'order' },
+  { label: '按名称', value: 'name' },
+  { label: '按状态(有问题的在前)', value: 'state' },
+  { label: '按最后采集', value: 'collected' },
+]
+
+/** 接口按 kind 分三个桶给,拼起来才是完整的一份 */
+const everyDevice = computed<DeviceCard[]>(() => {
   const d = devices.data.value
   if (!d) return []
-  // ⚠ **拼完必须重排。**接口是按 kind 分成三个桶给的(switches /
-  // firewalls / others),**每个桶内**是按优先级排好的 —— 但直接拼起来
-  // 之后整体不是优先级顺序:一台优先级 5 的交换机会排在优先级 1 的
-  // 防火墙前面,因为它在前一个桶里。
-  //
-  // 这一屏是一个网格、不按类型分区,所以顺序就该是**优先级**
-  // (order 小的在前),和配置中心、线路图、下拉一致
+  // ⚠ **拼完必须重排。**每个桶内是按优先级排好的,但直接拼起来之后整体
+  // 不是优先级顺序:一台优先级 5 的交换机会排在优先级 1 的防火墙前面,
+  // 因为它在前一个桶里
   return [...d.switches, ...d.firewalls, ...d.others]
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id - b.id)
+})
+
+/** 状态排序用的权重。**down 最前** —— 这个排法的全部意义就是把坏的顶上来 */
+const STATE_RANK: Record<string, number> = { down: 0, degraded: 1, unknown: 2, up: 3 }
+
+const allDevices = computed<DeviceCard[]>(() => {
+  const list = everyDevice.value.filter((c) => !hiddenDevices.value.has(c.id))
+  const sorted = [...list]
+  if (deviceSort.value === 'name') {
+    sorted.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  } else if (deviceSort.value === 'state') {
+    // 同状态内**仍然按优先级** —— 否则同为 down 的几台每次刷新顺序都在变
+    sorted.sort((a, b) =>
+      (STATE_RANK[a.state] ?? 9) - (STATE_RANK[b.state] ?? 9)
+      || (a.order ?? 0) - (b.order ?? 0) || a.id - b.id)
+  } else if (deviceSort.value === 'collected') {
+    // 没采过的排最后(null 当成最久以前),而不是排最前 —— 它不是"最新的"
+    sorted.sort((a, b) =>
+      new Date(b.last_collected_at || 0).getTime()
+      - new Date(a.last_collected_at || 0).getTime())
+  } else {
+    sorted.sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id - b.id)
+  }
+  return sorted
+})
+
+/**
+ * 被隐藏的设备里有没有**正出问题**的。
+ *
+ * ⚠ 这是这个功能唯一危险的地方:有人把一台设备从大屏上隐藏掉,然后它坏了,
+ * 而大屏上一点痕迹都没有。所以隐藏了多少台要一直写着,**其中有问题的那几台
+ * 要点名**。事件页和告警推送本来就不受这个开关影响,但大屏是最常被盯的
+ * 那一块,不能让它骗人。
+ */
+const hiddenSummary = computed(() => {
+  const hidden = everyDevice.value.filter((c) => hiddenDevices.value.has(c.id))
+  const bad = hidden.filter((c) => c.state === 'down' || c.state === 'degraded'
+    || (c.open_events ?? 0) > 0)
+  return { count: hidden.length, bad }
 })
 
 /** 调度迟到 —— 图上的点变稀是因为这个,不是线路的问题。 */
@@ -307,12 +463,63 @@ const schedulerWarning = computed(() => {
     </CyberPanel>
 
     <!-- ============ 设备 ============ -->
-    <section v-if="allDevices.length" class="charts-head">
+    <section v-if="everyDevice.length" class="charts-head">
       <div class="cy-panel-title">交换机 / 防火墙</div>
+      <div class="charts-actions">
+        <NSelect
+          v-model:value="deviceSort" :options="SORT_OPTIONS" size="small"
+          style="width: 168px"
+        />
+        <NButton size="small" ghost @click="pickerOpen = !pickerOpen">
+          选择设备({{ allDevices.length }}/{{ everyDevice.length }})
+        </NButton>
+      </div>
       <span class="refresh-note" :class="{ stale: devices.isStale(60000) }">
         更新于 {{ ago(devices.lastSuccess.value) }}
       </span>
     </section>
+
+    <!-- 选择框。**隐藏 ≠ 停止监控** —— 这句话必须在这儿,
+         不写的话一定会有人用隐藏来"关掉"一台设备 -->
+    <div v-if="pickerOpen" class="picker">
+      <div class="picker-note">
+        勾掉的设备<b>只是这一屏不画它</b> —— 它照样在采、照样开事件、照样推告警。
+        要真的停,是<b>配置中心</b>里那个「启用」开关。<br>
+        <span class="dim">
+          这个选择<b>只存在这台浏览器里</b>:挂在墙上的大屏和你工位上的页面
+          要看的东西不一样,存到服务器上的话两边会互相覆盖。
+        </span>
+      </div>
+      <div class="picker-grid">
+        <label v-for="c in everyDevice" :key="c.id" class="pick">
+          <NCheckbox
+            :checked="!hiddenDevices.has(c.id)"
+            @update:checked="() => toggleDevice(c.id)"
+          />
+          <StateDot :state="c.state" />
+          <span class="pick-name">{{ c.order }} · {{ c.name }}</span>
+          <span class="dim small">{{ c.model_label }}</span>
+        </label>
+      </div>
+      <div class="picker-foot">
+        <NButton size="tiny" ghost @click="showAllDevices">全部显示</NButton>
+      </div>
+    </div>
+
+    <!-- ⚠ **被隐藏的设备里有正出问题的,必须点名。**有人把一台设备藏掉、
+         然后它坏了,而大屏上一点痕迹都没有 —— 那是这个功能唯一危险的地方 -->
+    <div v-if="hiddenSummary.count" class="hidden-note" :class="{ bad: hiddenSummary.bad.length }">
+      <template v-if="hiddenSummary.bad.length">
+        ⚠ 隐藏了 {{ hiddenSummary.count }} 台,
+        <b>其中 {{ hiddenSummary.bad.length }} 台正有问题</b>:
+        <b>{{ hiddenSummary.bad.map((c) => c.name).join('、') }}</b>
+        —— 它们没有停止监控,只是这一屏没画。
+      </template>
+      <template v-else>
+        隐藏了 {{ hiddenSummary.count }} 台(都正常)。
+      </template>
+      <button class="linkish" @click="showAllDevices">全部显示</button>
+    </div>
 
     <div class="dev-grid">
       <CyberPanel
@@ -375,6 +582,97 @@ const schedulerWarning = computed(() => {
         <div v-if="card.last_error" class="dev-err">{{ card.last_error }}</div>
       </CyberPanel>
     </div>
+
+    <!-- ============ SD-WAN SLA ============ -->
+    <section v-if="everySdwanLink.length" class="charts-head">
+      <div class="cy-panel-title">
+        SD-WAN SLA
+        <!-- **这一块和上面那些线路测的不是同一段** —— 不写的话两个数
+             对不上时人会以为其中一个坏了 -->
+        <span class="sub-note">防火墙自己从出口探的,和上面的线路拨测不是同一段</span>
+      </div>
+      <div class="charts-actions">
+        <NButton size="small" ghost @click="sdwanPickerOpen = !sdwanPickerOpen">
+          选择链路({{ sdwanLinks.length }}/{{ everySdwanLink.length }})
+        </NButton>
+        <RouterLink to="/sdwan" class="more-link">看趋势图 →</RouterLink>
+      </div>
+      <span class="refresh-note" :class="{ stale: sdwan.isStale(120000) }">
+        更新于 {{ ago(sdwan.lastSuccess.value) }}
+      </span>
+    </section>
+
+    <div v-if="sdwanPickerOpen" class="picker">
+      <div class="picker-note">
+        勾掉的链路<b>只是这一屏不画它</b> —— 采集和告警都不受影响。
+        <span class="dim">同样只存在这台浏览器里。</span>
+      </div>
+      <div class="picker-grid">
+        <label v-for="l in everySdwanLink" :key="l.id" class="pick">
+          <NCheckbox
+            :checked="!hiddenSdwan.has(l.id)"
+            @update:checked="() => toggleSdwan(l.id)"
+          />
+          <i class="sd-dot" :style="{ background: l.state === 'alive'
+            ? (l.sla_met === false ? STATE.degraded : STATE.up) : STATE.down }"></i>
+          <span class="pick-name">{{ l.device_name }} · {{ l.member }}</span>
+          <span class="dim small">{{ l.health_check }}</span>
+        </label>
+      </div>
+      <div class="picker-foot">
+        <NButton size="tiny" ghost @click="showAllSdwan">全部显示</NButton>
+      </div>
+    </div>
+
+    <div
+      v-if="hiddenSdwanSummary.count" class="hidden-note"
+      :class="{ bad: hiddenSdwanSummary.bad.length }"
+    >
+      <template v-if="hiddenSdwanSummary.bad.length">
+        ⚠ 隐藏了 {{ hiddenSdwanSummary.count }} 条链路,
+        <b>其中 {{ hiddenSdwanSummary.bad.length }} 条有问题</b>:
+        <b>{{ hiddenSdwanSummary.bad.map((l) => `${l.device_name}/${l.member}`).join('、') }}</b>
+      </template>
+      <template v-else>隐藏了 {{ hiddenSdwanSummary.count }} 条链路(都正常)。</template>
+      <button class="linkish" @click="showAllSdwan">全部显示</button>
+    </div>
+
+    <div v-if="sdwanLinks.length" class="sd-grid">
+      <div
+        v-for="l in sdwanLinks" :key="l.id"
+        class="sd-card"
+        :class="{ dead: l.state === 'dead', warn: l.state !== 'dead' && l.sla_met === false }"
+      >
+        <div class="sd-head">
+          <b class="cy-mono">{{ l.member }}</b>
+          <span class="dim small">{{ l.device_name }}</span>
+        </div>
+        <!-- 探的是哪个地址 —— 这一块最常被问的一句 -->
+        <div class="sd-server cy-mono">
+          {{ (l.protocol || 'ping').toUpperCase() }} {{ l.server || '目标未报' }}
+        </div>
+        <div class="sd-nums">
+          <div class="sd-n">
+            <span>延迟</span>
+            <b class="cy-mono">{{ ms(l.latency_ms) }}</b>
+          </div>
+          <div class="sd-n">
+            <span>抖动</span>
+            <b class="cy-mono">{{ ms(l.jitter_ms) }}</b>
+          </div>
+          <div class="sd-n">
+            <span>丢包</span>
+            <b class="cy-mono">{{ pct(l.loss_pct, 1) }}</b>
+          </div>
+        </div>
+        <div class="sd-foot">
+          <!-- 三态照旧:sla_met 为 null 说"设备没报",不说"达标" -->
+          <span :style="{ color: l.sla_met === false ? STATE.down
+            : l.sla_met === true ? STATE.up : STATE.unknown }">{{ l.sla_text }}</span>
+          <span v-if="l.state === 'dead'" :style="{ color: STATE.down }">不通</span>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -396,6 +694,70 @@ const schedulerWarning = computed(() => {
 }
 
 .dash { display: flex; flex-direction: column; gap: 16px; }
+
+/* ---- 选择框 ---- */
+.picker {
+  border: 1px solid var(--cy-line-soft);
+  background: rgba(var(--cy-raised-rgb), 0.5);
+  padding: 9px 12px;
+}
+.picker-note {
+  font-size: 11.5px; line-height: 1.65; color: var(--cy-ink-2);
+  padding-bottom: 8px; margin-bottom: 8px;
+  border-bottom: 1px solid var(--cy-line-soft);
+}
+.picker-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 3px 14px; max-height: 240px; overflow-y: auto;
+}
+.pick { display: flex; align-items: center; gap: 6px; font-size: 11.5px; cursor: pointer; }
+.pick-name { color: var(--cy-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.picker-foot { margin-top: 8px; }
+.dim { color: var(--cy-ink-3); }
+.small { font-size: 10.5px; }
+
+/* 隐藏提示。**有问题的那一档要红** —— 见模板里的注释 */
+.hidden-note {
+  font-size: 11.5px; line-height: 1.6; color: var(--cy-ink-3);
+  padding: 5px 10px; border-left: 2px solid var(--cy-line-soft);
+}
+.hidden-note.bad {
+  color: var(--cy-degraded);
+  border-left-color: var(--cy-degraded);
+  background: rgba(var(--cy-degraded-rgb), 0.07);
+}
+.linkish {
+  background: none; border: none; padding: 0 0 0 6px;
+  color: var(--cy-cyan); cursor: pointer; font-size: 11.5px; text-decoration: underline;
+}
+.sub-note { font-size: 10.5px; color: var(--cy-ink-3); font-weight: 400; margin-left: 8px; }
+.more-link { font-size: 11px; color: var(--cy-cyan); }
+
+/* ---- SD-WAN 小卡 ---- */
+.sd-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;
+}
+.sd-card {
+  border: 1px solid var(--cy-line-soft);
+  border-left: 3px solid var(--cy-up);
+  background: rgba(var(--cy-raised-rgb), 0.4);
+  padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 5px;
+}
+.sd-card.warn { border-left-color: var(--cy-degraded); }
+.sd-card.dead { border-left-color: var(--cy-down); }
+.sd-head { display: flex; align-items: baseline; gap: 8px; }
+.sd-head b { font-size: 13px; color: var(--cy-ink); }
+.sd-server { font-size: 10.5px; color: var(--cy-cyan); }
+.sd-nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.sd-n { display: flex; flex-direction: column; }
+.sd-n span { font-size: 9.5px; color: var(--cy-ink-3); }
+.sd-n b { font-size: 13px; color: var(--cy-ink); }
+.sd-foot {
+  display: flex; justify-content: space-between; gap: 8px;
+  font-size: 10.5px; border-top: 1px solid var(--cy-line-soft); padding-top: 4px;
+}
+.sd-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 
 /* ---- 顶部 ---- */
 .top-bar {

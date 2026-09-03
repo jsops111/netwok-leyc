@@ -1557,8 +1557,12 @@ class SdwanLinkViewSet(viewsets.ReadOnlyModelViewSet):
         几十条链路上把 gunicorn 打满(和大屏那三个接口同一条规矩)。
         """
 
-        hours = min(int(request.query_params.get("hours", 6) or 6), 168)
-        since = timezone.now() - timezone.timedelta(hours=hours)
+        # **`hours=0` = 不要趋势点。**大屏那几张小卡只显示当前值,不画趋势 ——
+        # 而这个接口默认会为每条链路带上一小时的采样。50 条链路 × 60 个点
+        # 每分钟传一遍是纯浪费,而且大屏本来就该"一次刷新只打几个聚合接口"
+        # (见 CLAUDE.md 的轮询那一节)
+        hours = min(int(request.query_params.get("hours", 6) or 0), 168)
+        since = timezone.now() - timezone.timedelta(hours=max(hours, 0))
 
         links = list(
             self.filter_queryset(self.get_queryset()).order_by(
@@ -1567,7 +1571,7 @@ class SdwanLinkViewSet(viewsets.ReadOnlyModelViewSet):
 
         # 趋势一次查完。**按链路分桶**,不要每条一次查询
         series: dict = {}
-        if links:
+        if links and hours > 0:
             for row in SdwanSample.objects.filter(
                 link__in=links, ts__gte=since
             ).order_by("ts").values("link_id", "ts", "latency_ms", "jitter_ms",
