@@ -246,3 +246,99 @@ def parse_diagnose_sdwan(text: str) -> list[dict]:
             "extra": {"_channel": "ssh"},
         })
     return rows
+
+
+# ---------------------------------------------------------------- 配置
+
+def parse_sdwan_config(payload) -> dict:
+    """
+    `GET /cmdb/system/sdwan` → {健康检查名: 它的配置}。
+
+    monitor 端点只给**实测值**,门限在配置里。没有门限的话页面上
+    "延迟 186ms"这个数没法判断算不算超 —— 人得自己登防火墙翻配置。
+
+    返回每个检查:
+        server      探测的地址(**可以有多个**,FortiOS 允许配一串)
+        protocol    ping / http / tcp-echo / dns …
+        interval    探测间隔(毫秒或秒,按固件给的原样带出来)
+        sla         [{id, latency, jitter, loss}] —— **每一档一条**
+        members     配了哪几个出口
+
+    ⚠ **门限为 0 表示"这一档不看这个指标"**,不是"要求 0ms"。FortiOS 里
+    只配了 latency-threshold 的 SLA,jitter/loss 那两项就是 0 —— 显示成
+    "抖动门限 0ms"会让人以为这条 SLA 要求抖动必须是 0,那是永远达不到的。
+    所以 0 在这里折成 None。
+    """
+
+    results = payload.get("results") if isinstance(payload, dict) else payload
+    if isinstance(results, list):
+        results = results[0] if results else {}
+    if not isinstance(results, dict):
+        return {}
+
+    out: dict = {}
+    for item in results.get("health-check") or results.get("health_check") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+
+        # server 可能是字符串、逗号分隔、或者 [{"address": ...}] 的数组
+        raw_server = item.get("server") or item.get("system-dns") or ""
+        if isinstance(raw_server, list):
+            servers = [
+                str(x.get("address") or x.get("name") or x).strip()
+                for x in raw_server if x
+            ]
+        else:
+            servers = [x.strip() for x in str(raw_server).replace(",", " ").split() if x.strip()]
+
+        slas = []
+        for sla in item.get("sla") or []:
+            if not isinstance(sla, dict):
+                continue
+            slas.append({
+                "id": _int(sla.get("id")),
+                # **0 = 这一档不看这个指标**,折成 None —— 见函数文档
+                "latency": _num(sla.get("latency-threshold") or sla.get("latency_threshold")) or None,
+                "jitter": _num(sla.get("jitter-threshold") or sla.get("jitter_threshold")) or None,
+                "loss": _num(sla.get("packetloss-threshold") or sla.get("packetloss_threshold")) or None,
+            })
+
+        members = []
+        for m in item.get("members") or item.get("member") or []:
+            if isinstance(m, dict):
+                name_ = m.get("interface") or m.get("seq-num") or m.get("name")
+                if name_ not in (None, ""):
+                    members.append(str(name_))
+            elif m not in (None, ""):
+                members.append(str(m))
+
+        out[name] = {
+            "servers": servers,
+            "protocol": str(item.get("protocol") or "").strip(),
+            "interval": _int(item.get("interval")),
+            "sla": slas,
+            "members": members,
+        }
+    return out
+
+
+def strictest_sla(slas: list[dict]) -> dict:
+    """
+    一个检查配了多档 SLA 时,**页面上显示最严的那一档的门限**。
+
+    理由:选路会优先走满足最严那一档的出口,所以"这条线够不够格"这个问题
+    的参照系就是最严的那一档。显示最松的那一档会让一条刚好卡在中间的线
+    看着"很富余"。
+
+    每个指标**各自取最小的非空值** —— 一档可能只配了延迟、另一档只配了丢包,
+    合起来才是完整的要求。
+    """
+
+    def least(key):
+        vals = [s[key] for s in slas if s.get(key) is not None]
+        return min(vals) if vals else None
+
+    return {"latency": least("latency"), "jitter": least("jitter"), "loss": least("loss")}

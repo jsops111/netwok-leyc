@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, h, ref } from 'vue'
-import { NButton, NDataTable, NSelect, NSwitch, NTag, NTooltip, useMessage } from 'naive-ui'
+import {
+  NButton, NButtonGroup, NDataTable, NSelect, NSwitch, NTag, NTooltip, useMessage,
+} from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import CyberPanel from '@/components/cyber/CyberPanel.vue'
 import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
+import SdwanChart from '@/components/charts/SdwanChart.vue'
 import { api } from '@/api'
 import type { SdwanLinkRow } from '@/api'
 import { usePolling } from '@/composables/usePolling'
@@ -75,6 +78,54 @@ function isProblem(link: SdwanLinkRow): boolean {
   return link.state === 'dead' || link.sla_met === false
 }
 
+/**
+ * 这条链路断了多久。
+ *
+ * `last_change` 是**状态变化那一刻**的时间戳(采集器在状态翻转时写的)。
+ * 所以"断了多久"= 现在 - last_change,前提是它现在是 dead。
+ *
+ * ⚠ **`last_change` 为空时说"不知道多久",不说"刚断"** ——
+ * 采集器是在**看到状态变化**时才写这个字段的,而一条从加进来就一直断着
+ * 的链路从没"变化"过,它的 last_change 是空的。显示成"刚断 0 分钟"
+ * 会让人以为刚出的事,从而去查一个错误的时间窗。
+ */
+function downFor(link: SdwanLinkRow): string {
+  if (link.state !== 'dead') return ''
+  if (!link.last_change) return '不知道断了多久(从没观测到状态变化)'
+  const secs = Math.max(0, (Date.now() - new Date(link.last_change).getTime()) / 1000)
+  const d = Math.floor(secs / 86400)
+  const h = Math.floor((secs % 86400) / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  if (d) return `已断 ${d} 天 ${h} 小时`
+  if (h) return `已断 ${h} 小时 ${m} 分`
+  if (m) return `已断 ${m} 分钟`
+  return '刚刚断的(不到 1 分钟)'
+}
+
+/** 按健康检查分组 —— 一个检查一张图,线 = 各个出口 */
+function byCheck(links: SdwanLinkRow[]) {
+  const map = new Map<string, SdwanLinkRow[]>()
+  for (const l of links) {
+    if (!map.has(l.health_check)) map.set(l.health_check, [])
+    map.get(l.health_check)!.push(l)
+  }
+  return [...map.entries()].map(([name, rows]) => ({
+    name,
+    rows,
+    // 检测服务器写在图的标题上 —— **这一页最常被问的就是"探的是哪个地址"**
+    server: rows.find((r) => r.server)?.server || '设备没报',
+    protocol: rows.find((r) => r.protocol)?.protocol || '',
+    down: rows.filter((r) => r.state === 'dead'),
+  }))
+}
+
+const metric = ref<'latency' | 'jitter' | 'loss'>('latency')
+const METRIC_OPTIONS = [
+  { label: '延迟', value: 'latency' },
+  { label: '抖动', value: 'jitter' },
+  { label: '丢包', value: 'loss' },
+]
+
 function stateColor(state: string): string {
   if (state === 'alive') return STATE.up
   if (state === 'dead') return STATE.down
@@ -102,6 +153,18 @@ function latencyColorOf(link: SdwanLinkRow): string {
  * 「探测目标」,列的顺序还反着,人在两个屏之间来回对的时候必然出错。
  * **跟着设备的说法走。**
  */
+/**
+ * 门限那一行小字。
+ *
+ * **`null` 时什么都不显示,不写"门限 0"** —— FortiOS 里门限配 0 的意思是
+ * "这一档不看这个指标",显示成"门限 0ms"会让人以为要求抖动必须是 0,
+ * 那是永远达不到的。后端已经把 0 折成 null 了,这里只负责不无中生有。
+ */
+function thrText(value: number | null, unit: string) {
+  if (value === null || value === undefined) return null
+  return h('div', { style: 'font-size:9.5px;color:var(--cy-ink-3)' }, `门限 ${value}${unit}`)
+}
+
 const linkColumns: DataTableColumns<SdwanLinkRow> = [
   { title: '名称', key: 'health_check', sorter: 'default', minWidth: 120,
     render: (r) => h('span', { class: 'mono' }, r.health_check) },
@@ -113,21 +176,38 @@ const linkColumns: DataTableColumns<SdwanLinkRow> = [
   { title: '出口', key: 'member', sorter: 'default', minWidth: 110,
     render: (r) => h('span', { class: 'mono strong' }, r.member) },
   // 丢包在延迟前面 —— FortiGate 就是这个顺序,跟着设备的说法走
-  { title: '丢包', key: 'loss_pct', sorter: 'default', width: 84, className: 'num',
-    render: (r) => h('span', {
-      class: 'mono',
-      style: `color:${(r.loss_pct ?? 0) >= 100 ? STATE.down
-        : (r.loss_pct ?? 0) > 0 ? STATE.degraded : 'var(--cy-ink)'}`,
-    }, pct(r.loss_pct, 2)) },
-  { title: '延迟', key: 'latency_ms', sorter: 'default', width: 88, className: 'num',
-    render: (r) => h('span', { class: 'mono', style: `color:${latencyColorOf(r)}` },
-      ms(r.latency_ms)) },
-  { title: '抖动', key: 'jitter_ms', sorter: 'default', width: 84, className: 'num',
-    render: (r) => h('span', { class: 'mono' }, ms(r.jitter_ms)) },
-  { title: '状态', key: 'state', sorter: 'default', width: 76,
-    render: (r) => h('span', {
-      style: `font-size:11.5px;font-weight:700;color:${stateColor(r.state)}`,
-    }, r.state_label) },
+  { title: '丢包', key: 'loss_pct', sorter: 'default', width: 100, className: 'num',
+    render: (r) => h('div', [
+      h('div', {
+        class: 'mono',
+        style: `color:${(r.loss_pct ?? 0) >= 100 ? STATE.down
+          : (r.loss_pct ?? 0) > 0 ? STATE.degraded : 'var(--cy-ink)'}`,
+      }, pct(r.loss_pct, 2)),
+      thrText(r.sla_loss_threshold, '%'),
+    ]) },
+  { title: '延迟', key: 'latency_ms', sorter: 'default', width: 104, className: 'num',
+    render: (r) => h('div', [
+      h('div', { class: 'mono', style: `color:${latencyColorOf(r)}` }, ms(r.latency_ms)),
+      // **门限**。一条 186ms 的线算不算超,取决于设备上配的门限是 100 还是
+      // 500 —— 那个数不摆在旁边的话,人得自己去防火墙翻配置
+      thrText(r.sla_latency_threshold, 'ms'),
+    ]) },
+  { title: '抖动', key: 'jitter_ms', sorter: 'default', width: 100, className: 'num',
+    render: (r) => h('div', [
+      h('div', { class: 'mono' }, ms(r.jitter_ms)),
+      thrText(r.sla_jitter_threshold, 'ms'),
+    ]) },
+  { title: '状态', key: 'state', sorter: 'default', width: 150,
+    render: (r) => h('div', [
+      h('div', {
+        style: `font-size:11.5px;font-weight:700;color:${stateColor(r.state)}`,
+      }, r.state_label),
+      // **断了多久** —— "不通"三个字回答不了"要不要现在冲过去",
+      // 而"已断 2 小时 13 分"可以
+      r.state === 'dead'
+        ? h('div', { style: `font-size:10px;color:${STATE.down}` }, downFor(r))
+        : null,
+    ]) },
   // SLA 达标是「性能 SLA」这个功能的**结论列**,所以留着。三态各有说法,
   // 文案由后端拼(null 说"设备没报",不是"达标")
   { title: 'SLA', key: 'sla_met', width: 148,
@@ -188,6 +268,13 @@ const VERDICT_TEXT: Record<string, string> = {
                   :foot="totals?.latency_max_link || '—'" />
       </div>
       <div class="actions">
+        <NButtonGroup size="small">
+          <NButton
+            v-for="opt in METRIC_OPTIONS" :key="opt.value"
+            :type="metric === opt.value ? 'primary' : 'default'"
+            ghost @click="metric = opt.value as 'latency' | 'jitter' | 'loss'"
+          >{{ opt.label }}</NButton>
+        </NButtonGroup>
         <NSelect v-model:value="hours" :options="HOUR_OPTIONS" size="small"
                  style="width: 128px" @update:value="board.refresh" />
         <label class="tgl">
@@ -244,6 +331,28 @@ const VERDICT_TEXT: Record<string, string> = {
         FortiOS 大版本间有出入。配上 API Token 能拿全。
       </div>
       <div v-if="dev.last_error" class="err">{{ dev.last_error }}</div>
+
+      <!-- ============ 图:一个健康检查一张 ============ -->
+      <div
+        v-for="ck in byCheck(dev.links)" :key="ck.name"
+        class="chart-box" :class="{ bad: ck.down.length }"
+      >
+        <div class="chart-head">
+          <b>{{ ck.name }}</b>
+          <!-- **探的是哪个地址** —— 这一页最常被问的一句,放在图的标题上 -->
+          <span class="probe">
+            {{ ck.protocol ? ck.protocol.toUpperCase() : 'PING' }}
+            <b class="mono2">{{ ck.server }}</b>
+          </span>
+          <span class="dim">{{ ck.rows.length }} 个出口</span>
+          <!-- **断了多久**,直接写在图上 —— "有一条断了"回答不了
+               "要不要现在冲过去","已断 2 小时 13 分"可以 -->
+          <span v-for="d in ck.down" :key="d.id" class="down-chip">
+            {{ d.member }} {{ downFor(d) }}
+          </span>
+        </div>
+        <SdwanChart :links="ck.rows" :metric="metric" :height="200" />
+      </div>
 
       <!-- **列和 FortiGate 自己那张 Performance SLA 表对齐**:
            名称 / 检测服务器 / 成员 / 丢包 / 延迟 / 抖动 / 状态 ——
@@ -349,6 +458,33 @@ const VERDICT_TEXT: Record<string, string> = {
   font-family: 'JetBrains Mono', monospace;
   font-size: 10.5px;
   color: var(--cy-cyan);
+}
+
+.chart-box {
+  border: 1px solid var(--cy-line-soft);
+  border-left: 3px solid var(--cy-line);
+  padding: 8px 10px 4px;
+  margin-bottom: 10px;
+  background: color-mix(in srgb, var(--cy-raised) 35%, transparent);
+}
+/* 有出口断着的那张图整块标红 —— 一台设备下好几个健康检查时,
+   靠图里那道红竖带找不过来 */
+.chart-box.bad { border-left-color: var(--cy-down); }
+.chart-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  font-size: 12px; color: var(--cy-ink); margin-bottom: 2px;
+}
+.chart-head .probe { font-size: 11px; color: var(--cy-ink-3); }
+.mono2 {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--cy-cyan);
+  font-size: 11.5px;
+}
+.down-chip {
+  font-size: 10.5px;
+  color: var(--cy-down);
+  border: 1px solid var(--cy-down);
+  padding: 0 6px;
 }
 
 :deep(.mono) {

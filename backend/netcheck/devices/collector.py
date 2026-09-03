@@ -539,12 +539,18 @@ def _collect_sdwan(device: Device, now) -> list[dict]:
     from netcheck.models import SdwanLink, SdwanSample, SdwanState
 
     rows: list[dict] = []
+    config: dict = {}
     method = ""
     if device.api_token:
         payload = fortigate_api.fetch_sdwan_health(device)
         if payload is not None:
             rows = sdwan.parse_health_check(payload)
             method = "api"
+        # **配置里才有门限。**monitor 端点只给实测值 —— 没有门限的话
+        # 页面上"延迟 186ms"这个数没法判断算不算超,人得自己登防火墙翻配置
+        cfg = fortigate_api.fetch_sdwan_config(device)
+        if cfg is not None:
+            config = sdwan.parse_sdwan_config(cfg)
     if not rows:
         raw = ssh_cli_sdwan(device)
         if raw:
@@ -578,6 +584,30 @@ def _collect_sdwan(device: Device, now) -> list[dict]:
                       "loss_pct", "sla_met", "sla_targets_met", "sla_targets_total",
                       "tx_bps", "rx_bps", "session_count", "extra"):
             setattr(link, field, row[field])
+
+        # ---- 把配置里的门限和探测目标接上 ----
+        check_cfg = config.get(row["health_check"])
+        if check_cfg:
+            # monitor 端点没给 server 时用配置里的。**配了多个就都显示** ——
+            # FortiOS 允许一个检查探好几个地址,只显示第一个会让人以为
+            # 探的就那一个
+            if not link.server and check_cfg["servers"]:
+                link.server = ", ".join(check_cfg["servers"])[:255]
+            if not link.protocol and check_cfg["protocol"]:
+                link.protocol = check_cfg["protocol"][:16]
+            strict = sdwan.strictest_sla(check_cfg["sla"])
+            link.sla_latency_threshold = strict["latency"]
+            link.sla_jitter_threshold = strict["jitter"]
+            link.sla_loss_threshold = strict["loss"]
+            extra = dict(link.extra or {})
+            # 每一档的门限都留着 —— 页面上鼠标停一下能看到全部几档,
+            # 而列上只显示最严那一档
+            extra["sla_levels"] = check_cfg["sla"]
+            extra["probe_interval"] = check_cfg["interval"]
+            link.extra = extra
+            if link.sla_targets_total is None and check_cfg["sla"]:
+                link.sla_targets_total = len(check_cfg["sla"])
+
         link.synced_at = now
         link.method = method
         link.save()

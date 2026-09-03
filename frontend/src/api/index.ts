@@ -694,6 +694,17 @@ export interface SdwanLinkRow {
   sla_targets_total: number | null
   /** 三态各自的说法,后端拼好 */
   sla_text: string
+  /**
+   * 设备上配的 SLA 门限(**最严的那一档**,多档时每个指标各取最小的非空值)。
+   * 来自 `config system sdwan`,monitor 端点只给实测值不给门限 ——
+   * 没有它的话"延迟 186ms"这个数没法判断算不算超。
+   *
+   * ⚠ `null` = 那一档没配这个指标(FortiOS 里配 0 就是"不看这一项"),
+   * **不是"要求 0"**。
+   */
+  sla_latency_threshold: number | null
+  sla_jitter_threshold: number | null
+  sla_loss_threshold: number | null
   tx_bps: number | null
   rx_bps: number | null
   session_count: number | null

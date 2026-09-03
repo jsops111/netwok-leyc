@@ -478,6 +478,30 @@ def fetch_sdwan_health(device: Device):
     return None
 
 
+def fetch_sdwan_config(device: Device):
+    """
+    SD-WAN 的**配置**(不是实时状态)。
+
+    monitor 端点给的是实测的延迟/抖动/丢包,**不给配置的门限** ——
+    而"延迟 186ms"和"延迟 186ms / 门限 100ms"信息量差很多:前者要人自己
+    去防火墙上翻配置才知道这个数算不算超。
+
+    这里拿的是:每个健康检查探的**服务器**(可以有多个)、探测协议和间隔、
+    以及**每一档 SLA 的门限**(latency-threshold / jitter-threshold /
+    packetloss-threshold)。
+
+    ⚠ 路径在大版本间变过:7.0+ 是 `system/sdwan`,6.4 及更早是
+    `system/virtual-wan-link`。按新到老试 —— 只试一条的话老固件上
+    门限永远是空的,**而且不报错**。
+    """
+
+    for path in ("/cmdb/system/sdwan", "/cmdb/system/virtual-wan-link"):
+        data = _safe(device, path)
+        if data and data.get("results"):
+            return data
+    return None
+
+
 def fetch_services(device: Device) -> list[dict]:
     """
     服务对象(firewall service custom)。**取不到返回空列表,不抛。**
