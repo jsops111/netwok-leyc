@@ -68,7 +68,12 @@
 
 ### 服务器监控
 
-**通过 SSH(22 端口)采集,不用在机器上装任何东西。**只支持 Linux / 类 Unix。
+**通过 SSH(22 端口)采集,不用在机器上装任何东西。**支持 **Linux / 类 Unix**
+和 **VMware ESXi** 两种,加服务器的时候在「系统类型」里选 —— 两者走的采集命令
+完全不同,**选错了指标会全是空的而且不报错**(ESXi 上没有 `/proc/stat`
+也没有 `/proc/meminfo`,但 shell 跑得通,采集器会认为"连上了、命令跑完了")。
+
+#### Linux
 
 | 采什么 | 怎么采 |
 |---|---|
@@ -87,8 +92,31 @@
 负载按每核判是有意的:64 核的机器 load 8 很闲,2 核的 load 8 已经跑不动了,
 用同一个绝对阈值必然错一边。
 
+#### VMware ESXi
+
+ESXi 没有 Linux 那套 `/proc`,走 `esxcli` 和 `vim-cmd`(SSH 要先在
+「主机 → 管理 → 服务」里把 **TSM-SSH** 起来,默认是关的)。
+
+| 采什么 | 怎么采 |
+|---|---|
+| CPU 使用率 | `vim-cmd hostsvc/hostsummary` 的 `overallCpuUsage` ÷ 主频池 |
+| 内存 | 同上的 `overallMemoryUsage` ÷ `memorySize` |
+| 数据存储 | `esxcli storage filesystem list`,按最满的那个判,**bootbank 不计入** |
+| 网络流量 | `esxcli network nic stats get`,主上行口按累计字节自动挑 |
+| 基本信息 | 主机名、ESXi 版本、硬件型号、几路几核几线程、内存总量、运行时长 |
+| 虚拟机 | `esxcli vm process list` —— 运行中 / 已注册各几台,以及都有谁 |
+
+三处和 Linux 不一样,页面上都标了出来:
+
+- **CPU 第一拍就有数**(hostd 自己在算,不用等两拍 jiffies 相减)
+- **没有负载 / iowait / Swap** —— ESXi 不提供,显示成"ESXi 不提供"而不是 `—`,
+  免得看着像采集坏了。负载阈值对 ESXi 主机不生效
+- **bootbank 不算磁盘** —— 那两个引导分区天生就用到八九成,算进来的话
+  每台 ESXi 一加进来就撞穿严重线,而那不是个能行动的告警
+
 页面在 `/servers`:一台一块面板,左边基本信息 + CPU/内存/磁盘/负载四条仪表,
-右边趋势图(流量 / CPU / 内存 / 负载切换),展开看挂载点明细、网卡列表、进程 Top。
+右边趋势图(流量 / CPU / 内存 / 负载切换),展开看挂载点(ESXi 是数据存储)
+明细、网卡列表、进程 Top(ESXi 是虚拟机清单)。
 
 ### 配置定时备份
 

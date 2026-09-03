@@ -207,9 +207,12 @@ devices/profiles  型号差异的唯一去处。加型号/固件/备份命令通
 devices/collector 通道选择、降级、写库、判阈值
 devices/backup    配置备份:取配置、清洗、按内容哈希判"变没变"、算 diff
 devices/policies  防火墙策略同步:API/SSH 两条通道 + 全量替换写库
-servers/linux.py  **纯函数**:采集命令的拼装和 /proc、df 输出的解析。不碰网络也不碰库
+servers/linux.py  **纯函数**:Linux 采集命令的拼装和 /proc、df 输出的解析。不碰网络也不碰库
+servers/esxi.py   **纯函数**:ESXi 那套(esxcli / vim-cmd)。和 linux.py 同一个分段协议、
+                  解析出同一个扁平 dict —— 所以下游一行都不用分叉
 servers/collector SSH 连接、速率与 CPU 差值、阈值判定、写库、开事件。
-                  evaluate_server() 是唯一的**服务器**阈值判定处
+                  evaluate_server() 是唯一的**服务器**阈值判定处;
+                  _collect_raw() 里那个 if 是**唯一**按 os_type 分叉的地方
 ```
 
 **通道降级只在"通道级失败"时触发**(连不上、认证错、超时),不在"某个指标采不到"时
@@ -364,7 +367,60 @@ Postgres 的精确计数要全表扫描 —— 而**这一页恰恰是磁盘告�
 
 `Server` → `ServerSample` / `ServerInterface`。**只走 SSH,不装 agent。**
 
-### 全部读 /proc,不解析 top / free
+### 两套系统由 `os_type` 分开,而且选错了**不会报错**
+
+`ServerOS` 是 `linux` / `esxi`。分叉只有一处 —— `collector._collect_raw()`
+里那个 if,它挑 `servers/linux.py` 还是 `servers/esxi.py`;两个模块解析出来的是
+**同一个扁平 dict**,所以速率、写样本、阈值判定、事件那一整段是共用的。
+多一个分叉就多一个"Linux 改了 ESXi 忘了改"的地方,而那种漏改的表现是
+某一类机器的某个指标悄悄变空。
+
+**这个字段为什么没有"自动探测"**:VMkernel 的 `/proc` 里没有 `stat`、
+`meminfo`、`loadavg`、`net/dev`,但 ESXi Shell 是 busybox ash,`echo` 跑得通。
+于是拿 Linux 那条命令去打一台 ESXi 的结果是:**分段标记全都出现了,
+每一段都是空的,一个错误都没有** —— 采集器认为连上了,页面上这台机器是 UP、
+每个指标是 `—`、`last_error` 也是空的。**实测踩出来的**,而且是这个平台里
+最难查的一类故障:没有任何一处报错。探测失败时的退路仍然是猜,而猜错的
+表现就是上面那种"安静的空",所以让人选一次。
+
+对称地,**`_parse_esxi()` 在一个 esxcli 段都没解析出来时要抛错**,不能像
+Linux 那样"某段空了就留空":ESXi 上全空最可能的原因就是类型选反了
+(拿 Linux 的机器当 ESXi 采),那是配置错误,必须说出来。
+
+ESXi 侧的四个取舍:
+
+- **CPU 不用两拍。**hostd 自己在算,`vim-cmd hostsvc/hostsummary` 的
+  `overallCpuUsage`(MHz)÷ `cpuMhz × numCpuCores` 就是百分比,第一拍就有数。
+  所以 `collect_server()` 里那段 jiffies 相减**必须跳过 ESXi** —— 走进去会把
+  已经算好的 `cpu_pct` 用一个 None 盖掉。代价是两条路径的口径不同
+  (区间平均 vs 瞬时),页面上标出来了。
+- **没有 loadavg 就是没有,不换算。**拿 CPU 使用率折一个"等效负载"出来,
+  那个数会被拿去和「每核阈值」比,而它根本不是同一个东西。`load1/5/15` 留
+  None,`extra.load_absent` 说明原因 —— 否则负载那一栏一直是 `—`,看着像
+  采集坏了(和第 3 条「三种没有数字」同一个道理)。iowait / swap 同理。
+- **bootbank 不计入磁盘。**ESXi 的两个引导分区是 vfat、几百 MB、天生用到
+  八九成。算进来的话**每台 ESXi 一加进来就直接撞穿磁盘严重线**,而那不是
+  一个能行动的告警(没人能"清理" bootbank)。判的是最满的那个**数据存储**,
+  事件消息里的名词也跟着换成「数据存储」—— 告警要用收件人在自己界面上
+  看到的那个词。
+- **主上行口按累计字节挑,不按名字。**ESXi 上没有 `ip route` 那种直接答案
+  (vmk0 落到哪块 vmnic 要翻 vSwitch 的 uplink 配置)。按 vmnic0 挑不行 ——
+  很多机器上 vmnic0 是插着线但不带流量的备口,挑中它的表现是流量图长期
+  是平的而且看不出哪儿错了。按**累计**计数器挑是稳的:一旦某块口领先就不会
+  来回换。ESXi 上也没有"虚拟口"要排除,vmnic 全是物理口。
+
+`esxcli` 的输出一律解析 **plain 的 `Key: Value`,不用 `--formatter=csv`**:
+csv 的列名在 6.x / 7.x / 8.x 之间改过(内存那条从 `Physical Memory` 变成
+`MemorySize`),而 plain 的键名没动。
+
+`storage filesystem list` 那张表**不按列宽切**。第一版按表头下面那排 `----`
+的位置定宽切,实测一格错位就全盘皆错:某列的值比分隔线宽一个字符,后面每列
+都往右挪一格,`2199023255552` 被切成 `219902325555` —— 一个**小十倍但看起来
+完全正常**的容量。改成按空白切:这张表里只有 `Volume Name` 可能带空格
+("datastore 1"),所以"前 N 个 token + 后 M 个 token,中间剩下的是卷名"
+和对齐完全无关。列的**身份**仍然从表头取,不写死顺序。
+
+### 全部读 /proc,不解析 top / free(Linux 那条)
 
 `top` 和 `free` 的输出格式随发行版、版本和 locale 变(`free` 在 procps
 3.3.10 前后列名就不一样;`top` 在中文 locale 下表头是中文的)。
@@ -857,6 +913,12 @@ diff、全量替换、阈值判定的全部分支、写库路径、接口返回�
 - `servers/linux.py` 的 `_SECTIONS`(某个发行版没装 `iproute2`、
   BusyBox 的 `df` 不认 `-x`、`ps` 不支持 `--sort` 之类)——
   某一段取不到只会让那一个指标留空,不会让整次采集失败
+- `servers/esxi.py` 的 `_SECTIONS` 和几个解析器。**ESXi 一台真机都没接过** ——
+  已验证的是解析器(拿构造的真实格式输出逐项跑过:hostsummary 的 vmodl 文本、
+  storage 那张定宽表含带空格的卷名、nic stats 的分块、vm process list)、
+  以及"类型选反了要报错"这条。真机上最可能要动的是 `vim-cmd hostsvc/hostsummary`
+  里那几个字段名(它在 5.5→8.0 之间没变过,但 8.x 之后没验过)和
+  `esxcli storage filesystem list` 的列名
 - `devices/policies.py` 的 `parse_show_firewall_policy`(FortiOS 大版本间
   `show` 的缩进和字段名有出入)
 

@@ -12,6 +12,16 @@ SSH 一条路。连不上就是连不上,不存在"换个通道再试"。
 2. **算不出来的指标留 None,不填 0。**CPU 第一拍必然算不出来
    (没有上一拍的 jiffies),填 0 的意思是"CPU 全空闲",那是假数据。
 3. **失败也写一行样本。**reachable=False 的那些行是服务器可用率的分母。
+
+## 两套系统,一个出口
+
+`os_type` 决定走 `linux.py` 还是 `esxi.py`。两个模块**都只负责"拼命令 +
+解析文本"**,而且解析出来的是**同一个扁平 dict**(cpu_pct / mem_pct /
+disk_pct / _interfaces / ...)—— 所以下面的速率计算、写样本、阈值判定、
+事件那一整段是共用的,分叉只在 `_collect_raw()` 里那一个 if。
+
+分叉点故意只有一个:多一个分叉就多一个"Linux 改了 ESXi 忘了改"的地方,
+而那种漏改在页面上的表现是某一类机器的某个指标悄悄变空。
 """
 
 from __future__ import annotations
@@ -30,11 +40,12 @@ from netcheck.models import (
     LinkState,
     Server,
     ServerInterface,
+    ServerOS,
     ServerSample,
     Severity,
 )
 
-from . import linux
+from . import esxi, linux
 
 log = logging.getLogger("netcheck.server")
 
@@ -152,16 +163,23 @@ def _delta(current, previous):
 
 
 def _collect_raw(server: Server) -> dict:
-    """连上去把该读的都读回来,解析成一个扁平的 dict。"""
+    """
+    连上去把该读的都读回来,解析成一个扁平的 dict。
+
+    **这是唯一按系统类型分叉的地方。**返回的 dict 两条路径完全同构,
+    下游(速率 / 写样本 / 阈值 / 事件)不知道也不需要知道是哪种系统。
+    """
 
     started = time.perf_counter()
     timeout = max(10.0, server.timeout_ms / 1000 * 2)
+    module = esxi if server.os_type == ServerOS.ESXI else linux
     client = _connect(server)
     try:
-        stdout, stderr = _run(client, linux.build_command(server.collect_processes), timeout)
+        stdout, stderr = _run(client, module.build_command(server.collect_processes), timeout)
     finally:
         client.close()
 
+    # 分段协议两边共用,所以切分只有一份实现
     sections = linux.split_sections(stdout)
     if not sections:
         # 一个标记都没解析出来:登录成功但命令没跑起来。最常见的两种原因是
@@ -174,6 +192,18 @@ def _collect_raw(server: Server) -> dict:
     out: dict = {"extra": {}}
     if stderr.strip():
         out["extra"]["stderr"] = stderr.strip()[:400]
+
+    if server.os_type == ServerOS.ESXI:
+        _parse_esxi(server, sections, out)
+    else:
+        _parse_linux(server, sections, out)
+
+    out["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    return out
+
+
+def _parse_linux(server: Server, sections: dict, out: dict) -> None:
+    """Linux:全部来自 /proc,只有磁盘走 df。"""
 
     # ---- 基本信息 ----
     if hostname := sections.get("hostname", "").strip().splitlines():
@@ -218,8 +248,94 @@ def _collect_raw(server: Server) -> dict:
         if processes := linux.parse_ps(sections.get("ps", "")):
             out["extra"]["top_processes"] = processes
 
-    out["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
-    return out
+
+def _parse_esxi(server: Server, sections: dict, out: dict) -> None:
+    """
+    ESXi:全部来自 esxcli / vim-cmd。
+
+    **一个 esxcli 段都没解析出来时要报错**,不能像 Linux 那样"某段空了就
+    留空"。理由是 ESXi 上"全空"最可能的原因是**系统类型选错了**(拿 Linux
+    的机器当 ESXi 采),而那是个配置错误,必须说出来 —— 静默留空的话页面上
+    看到的是一台指标全空、last_error 也空的机器,和这次要修的 bug 一模一样。
+    """
+
+    summary = esxi.parse_hostsummary(sections.get("summary", ""))
+    version = esxi.parse_version(sections.get("version", ""))
+    platform = esxi.parse_platform(sections.get("platform", ""))
+
+    if not summary and not version:
+        detail = (sections.get("summary") or sections.get("version") or "").strip()
+        raise ServerError(
+            "esxcli / vim-cmd 都没有返回内容 —— 这台不是 ESXi?"
+            "(系统类型选成 ESXi 但对面是 Linux 时就是这个表现)"
+            + (f":{detail[:120]}" if detail else "")
+        )
+
+    # ---- 基本信息 ----
+    if hostname := sections.get("hostname", "").strip().splitlines():
+        out["hostname"] = hostname[0].strip()[:128]
+    if kernel := sections.get("kernel", "").strip():
+        out["kernel"] = kernel.splitlines()[0].strip()[:64]
+    if version:
+        out["os_name"] = version[:128]
+    if platform:
+        out["extra"]["hw_platform"] = platform[:120]
+    for key in ("hw_model", "hw_vendor", "maintenance_mode", "cpu_total_mhz",
+                "overall_cpu_mhz", "cpu_threads", "cpu_packages"):
+        if key in summary:
+            out["extra"][key] = summary[key]
+
+    # ---- CPU / 内存。hostsummary 拿不到时退回 esxcli 的规格(只有分母,
+    #      没有使用率)—— 有分母至少「几核 / 多大内存」这两栏是对的 ----
+    out["cpu_pct"] = summary.get("cpu_pct")
+    out["cpu_iowait_pct"] = None                  # ESXi 不提供 iowait
+    out["cpu_cores"] = summary.get("cpu_cores") or esxi.parse_cpu_global(sections.get("cpu", ""))
+    out["mem_total_bytes"] = summary.get("mem_total_bytes") or esxi.parse_memory(
+        sections.get("memory", "")
+    )
+    out["mem_pct"] = summary.get("mem_pct")
+    out["mem_used_bytes"] = summary.get("mem_used_bytes")
+    out["mem_available_bytes"] = summary.get("mem_available_bytes")
+    out["swap_pct"] = None
+    out["uptime_s"] = summary.get("uptime_s")
+
+    # **负载留空**:ESXi 不提供 loadavg。拿 CPU 使用率换算一个"等效负载"
+    # 是编数字 —— 那个数会被拿去和「每核阈值」比,而它根本不是同一个东西
+    out["load1"] = out["load5"] = out["load15"] = None
+    out["extra"]["load_absent"] = "ESXi 不提供 loadavg,负载阈值对这台不生效"
+
+    if out["cpu_pct"] is None and summary:
+        out["extra"]["cpu_pending"] = (
+            "hostsummary 里没有 overallCpuUsage 或 cpuMhz,算不出使用率 —— "
+            "hostd 没起来?试 `/etc/init.d/hostd status`"
+        )
+
+    # ---- 数据存储。字段和 df 对齐,所以判定那段是共用的 ----
+    mounts = esxi.parse_storage(sections.get("storage", ""))
+    if mounts:
+        worst = max(mounts, key=lambda m: m["pct"] or 0)
+        out["disk_pct"] = worst["pct"]
+        out["extra"]["disk_worst"] = worst["mount"]
+        out["extra"]["mounts"] = [
+            {k: m[k] for k in ("mount", "fs", "total_bytes", "used_bytes", "pct")}
+            for m in sorted(mounts, key=lambda m: m["pct"] or 0, reverse=True)[:12]
+        ]
+
+    # ---- 网卡 ----
+    nic_list = esxi.parse_nic_list(sections.get("nics", ""))
+    rows = esxi.parse_nic_stats(sections.get("nicstats", ""), nic_list)
+    out["_interfaces"] = rows
+    out["_default_interface"] = esxi.pick_primary(rows)
+
+    # ---- 虚拟机 ----
+    registered = esxi.parse_int(sections.get("vmregistered", ""))
+    if registered is not None:
+        out["extra"]["vm_registered"] = registered
+    if server.collect_processes:
+        vms = esxi.parse_vm_processes(sections.get("vmlist", ""))
+        out["extra"]["vm_running"] = vms["running"]
+        if vms["names"]:
+            out["extra"]["vm_names"] = vms["names"]
 
 
 def _primary_interface_name(server: Server, rows: list[dict], detected: str) -> str:
@@ -355,22 +471,24 @@ def evaluate_server(server: Server, data: dict, reachable: bool, error: str) -> 
     check("mem_pct", EventKind.MEM_HIGH, server.mem_warn_pct, server.mem_crit_pct, "%", "内存使用率")
 
     # 磁盘的消息里要带上是**哪个挂载点** —— "磁盘 91%" 这句话没法直接行动,
-    # "/var 91%" 可以
+    # "/var 91%" 可以。ESXi 上这个名词是「数据存储」而不是「挂载点」:
+    # 告警要用收件人在自己界面上看到的那个词,否则他得先翻译一遍
     disk_pct = data.get("disk_pct")
     if disk_pct is not None:
         mount = data.get("extra", {}).get("disk_worst") or "?"
+        noun = "数据存储" if server.os_type == ServerOS.ESXI else "挂载点"
         if server.disk_crit_pct and disk_pct >= server.disk_crit_pct:
             problems.append({
                 "kind": EventKind.DISK_HIGH, "severity": Severity.CRITICAL,
                 "value": float(disk_pct), "threshold": float(server.disk_crit_pct), "unit": "%",
-                "message": f"挂载点 {mount} 已用 {disk_pct:.1f}%,达到严重线 {server.disk_crit_pct}%",
+                "message": f"{noun} {mount} 已用 {disk_pct:.1f}%,达到严重线 {server.disk_crit_pct}%",
             })
             state = LinkState.DEGRADED
         elif server.disk_warn_pct and disk_pct >= server.disk_warn_pct:
             problems.append({
                 "kind": EventKind.DISK_HIGH, "severity": Severity.WARNING,
                 "value": float(disk_pct), "threshold": float(server.disk_warn_pct), "unit": "%",
-                "message": f"挂载点 {mount} 已用 {disk_pct:.1f}%,超过警告线 {server.disk_warn_pct}%",
+                "message": f"{noun} {mount} 已用 {disk_pct:.1f}%,超过警告线 {server.disk_warn_pct}%",
             })
             state = LinkState.DEGRADED
 
@@ -420,9 +538,12 @@ def collect_server(server: Server) -> ServerSample:
 
     reachable = not error
 
-    # ---- CPU:和上一拍的 jiffies 相减 ----
+    # ---- CPU ----
+    # Linux 要两拍 /proc/stat 的 jiffies 相减;**ESXi 不用** —— hostd 自己
+    # 就在算,`overallCpuUsage` 是个当前值,`_parse_esxi()` 里已经填好了。
+    # 走到这里再减一次的话 ESXi 的 cpu_pct 会被一个 None 覆盖掉
     meta = dict(server.meta or {})
-    if reachable:
+    if reachable and server.os_type != ServerOS.ESXI:
         cpu_pct, iowait_pct = linux.cpu_delta(meta.get("last_cpu_jiffies"), data.get("_cpu_jiffies"))
         data["cpu_pct"] = cpu_pct
         data["cpu_iowait_pct"] = iowait_pct
@@ -513,9 +634,11 @@ def test_connection(server: Server) -> tuple[bool, str]:
 
     **不写库、不开事件** —— 这是"试一下能不能连上",不是一次正式采样。
 
-    返回的摘要里刻意**不含 CPU 使用率**:它要两拍 jiffies 才算得出来,
-    这里只有一拍。硬要在测试里给个数就得在对端 sleep 1 秒,那会让"测试"
-    和"采集"走两条不同的代码路径 —— 而测试的意义正是验证采集那条路径。
+    Linux 那条路径返回的摘要里刻意**不含 CPU 使用率**:它要两拍 jiffies
+    才算得出来,这里只有一拍。硬要在测试里给个数就得在对端 sleep 1 秒,
+    那会让"测试"和"采集"走两条不同的代码路径 —— 而测试的意义正是验证
+    采集那条路径。**ESXi 那条有 CPU**(hostd 给的是当前值,不用相减),
+    所以这句提示按系统类型给,不要写死。
     """
 
     started = time.perf_counter()
@@ -527,16 +650,20 @@ def test_connection(server: Server) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
     elapsed = int((time.perf_counter() - started) * 1000)
+    extra = data.get("extra") or {}
+    is_esxi = server.os_type == ServerOS.ESXI
     parts = [
         data.get("hostname") or server.host,
         data.get("os_name") or "",
-        data.get("kernel") or "",
+        extra.get("hw_platform") if is_esxi else data.get("kernel") or "",
     ]
     head = " · ".join(p for p in parts if p)
 
     detail = [f"{head}({elapsed}ms)"]
     if cores := data.get("cpu_cores"):
         detail.append(f"CPU {cores} 核")
+    if data.get("cpu_pct") is not None:
+        detail.append(f"CPU 使用率 {data['cpu_pct']:.1f}%")
     if total := data.get("mem_total_bytes"):
         detail.append(f"内存 {total / 1024 ** 3:.1f} GiB")
     if data.get("mem_pct") is not None:
@@ -544,10 +671,26 @@ def test_connection(server: Server) -> tuple[bool, str]:
     if data.get("load1") is not None:
         detail.append(f"负载 {data['load1']:.2f}")
     if data.get("disk_pct") is not None:
-        worst = data.get("extra", {}).get("disk_worst", "?")
-        detail.append(f"磁盘最满 {worst} {data['disk_pct']:.1f}%")
+        worst = extra.get("disk_worst", "?")
+        label = "数据存储最满" if is_esxi else "磁盘最满"
+        detail.append(f"{label} {worst} {data['disk_pct']:.1f}%")
+
     interfaces = data.get("_interfaces") or []
     primary = _primary_interface_name(server, interfaces, data.get("_default_interface", ""))
-    detail.append(f"网卡 {len(interfaces)} 块,流量统计走 {primary or '未确定'}")
-    detail.append("CPU 使用率要第二拍才有(靠两次 /proc/stat 相减)")
+    nic_label = "上行口 vmnic" if is_esxi else "网卡"
+    detail.append(f"{nic_label} {len(interfaces)} 块,流量统计走 {primary or '未确定'}")
+
+    if is_esxi:
+        # 这两行是 ESXi 上最容易一眼看出接错了的地方:虚拟机数为 0 说明
+        # 要么这台真的空着,要么 vim-cmd 没权限(非 root 账号常见)
+        vm_bits = []
+        if (registered := extra.get("vm_registered")) is not None:
+            vm_bits.append(f"已注册 {registered}")
+        if (running := extra.get("vm_running")) is not None:
+            vm_bits.append(f"运行中 {running}")
+        if vm_bits:
+            detail.append("虚拟机 " + " / ".join(vm_bits))
+        detail.append("ESXi 没有 loadavg,负载阈值对这台不生效")
+    else:
+        detail.append("CPU 使用率要第二拍才有(靠两次 /proc/stat 相减)")
     return True, " | ".join(detail)

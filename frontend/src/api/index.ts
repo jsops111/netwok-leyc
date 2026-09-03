@@ -220,6 +220,8 @@ export interface ServerRow {
   id: number
   name: string
   host: string
+  /** 'linux' | 'esxi' —— 决定后端走哪一套采集命令,不是展示标签 */
+  os_type: string
   ssh_port: number
   ssh_username: string
   site: string
@@ -356,6 +358,23 @@ export interface ServerDetail {
   error: string
   cpu_pending: string
   notes: string[]
+  /**
+   * ESXi 专有,Linux 主机上是 null。
+   *
+   * ⚠ `vm_registered` / `vm_running` 为 **null 是"没采到",0 才是"这台空着"** ——
+   * 混成 0 会让一台跑着三十台虚拟机、只是 vim-cmd 没权限的宿主显示成空宿主。
+   */
+  esxi: {
+    vm_registered: number | null
+    vm_running: number | null
+    vm_names: string[]
+    hw_platform: string
+    cpu_total_mhz: number | null
+    cpu_used_mhz: number | null
+    cpu_threads: number | null
+    cpu_packages: number | null
+    maintenance_mode: boolean | null
+  } | null
 }
 
 export interface BackupVersion {

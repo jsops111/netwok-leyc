@@ -287,10 +287,14 @@ const totals = computed(() => cards.data.value)
             <!-- 挂载点 -->
             <div class="block">
               <div class="block-head">
-                挂载点
-                <span class="dim">按占用率排,阈值判的是最满的那个</span>
+                {{ detail.esxi ? '数据存储' : '挂载点' }}
+                <span class="dim">
+                  按占用率排,阈值判的是最满的那个{{ detail.esxi ? ';bootbank 不计入' : '' }}
+                </span>
               </div>
-              <div v-if="!detail.mounts.length" class="dim small">没有采到挂载点信息</div>
+              <div v-if="!detail.mounts.length" class="dim small">
+                {{ detail.esxi ? '没有采到数据存储信息' : '没有采到挂载点信息' }}
+              </div>
               <div v-for="m in detail.mounts" :key="m.mount" class="mount">
                 <span class="mount-path cy-mono" :title="m.fs">{{ m.mount }}</span>
                 <span class="mount-bar">
@@ -313,8 +317,12 @@ const totals = computed(() => cards.data.value)
             <!-- 网卡 -->
             <div class="block">
               <div class="block-head">
-                网卡
-                <span class="dim">主网卡才计入流量统计,虚拟口会把同一份流量数几遍</span>
+                {{ detail.esxi ? '物理上行口' : '网卡' }}
+                <span class="dim">
+                  {{ detail.esxi
+                    ? '只有 vmnic 是物理口,vSwitch / vmk 不在流量表里'
+                    : '主网卡才计入流量统计,虚拟口会把同一份流量数几遍' }}
+                </span>
               </div>
               <div v-for="iface in detail.interfaces" :key="iface.id" class="nic">
                 <span class="nic-name cy-mono">{{ iface.if_name }}</span>
@@ -331,34 +339,84 @@ const totals = computed(() => cards.data.value)
 
             <!-- 进程 Top + 其它数字 -->
             <div class="block">
-              <div class="block-head">
-                进程 Top
-                <span class="dim">按 CPU 排</span>
-              </div>
-              <div v-if="!detail.top_processes.length" class="dim small">
-                没有采集进程信息(配置里可以关掉这一项)
-              </div>
-              <div v-for="(proc, i) in detail.top_processes" :key="i" class="proc">
-                <span class="proc-name cy-mono">{{ proc.name }}</span>
-                <span class="proc-num cy-mono">CPU {{ num(proc.cpu, 1, '%') }}</span>
-                <span class="proc-num cy-mono dim">内存 {{ num(proc.mem, 1, '%') }}</span>
-              </div>
+              <!-- ESXi 上没有"进程"这个层级(有 world,但那不是人要看的东西),
+                   换成「这台宿主上正在跑哪些虚拟机」—— 同一个位置,同一个问题:
+                   出事的时候要知道影响到谁 -->
+              <template v-if="detail.esxi">
+                <div class="block-head">
+                  虚拟机
+                  <span class="dim">
+                    <!-- null 和 0 必须分开:前者是没采到(vim-cmd 权限不够最常见),
+                         后者是这台宿主真的空着 -->
+                    {{ detail.esxi.vm_running === null
+                      ? '没采到 —— 账号能跑 esxcli vm process list 吗'
+                      : `运行中 ${detail.esxi.vm_running}${
+                          detail.esxi.vm_registered !== null
+                            ? ` / 已注册 ${detail.esxi.vm_registered}` : ''}` }}
+                  </span>
+                </div>
+                <div v-if="detail.esxi.maintenance_mode" class="note">
+                  这台在**维护模式**里 —— 上面的虚拟机应该已经迁走了,指标偏低是正常的
+                </div>
+                <div v-if="!detail.esxi.vm_names.length" class="dim small">
+                  没有虚拟机清单(配置里可以关掉这一项)
+                </div>
+                <div v-for="(vm, i) in detail.esxi.vm_names" :key="i" class="proc">
+                  <span class="proc-name cy-mono">{{ vm }}</span>
+                </div>
+              </template>
+              <template v-else>
+                <div class="block-head">
+                  进程 Top
+                  <span class="dim">按 CPU 排</span>
+                </div>
+                <div v-if="!detail.top_processes.length" class="dim small">
+                  没有采集进程信息(配置里可以关掉这一项)
+                </div>
+                <div v-for="(proc, i) in detail.top_processes" :key="i" class="proc">
+                  <span class="proc-name cy-mono">{{ proc.name }}</span>
+                  <span class="proc-num cy-mono">CPU {{ num(proc.cpu, 1, '%') }}</span>
+                  <span class="proc-num cy-mono dim">内存 {{ num(proc.mem, 1, '%') }}</span>
+                </div>
+              </template>
 
               <div class="block-head second">系统</div>
               <div class="kv-list">
                 <div class="kv"><span>运行时长</span><b class="cy-mono">{{ uptime(detail.uptime_s) }}</b></div>
-                <div class="kv"><span>负载</span><b class="cy-mono">
-                  {{ num(detail.current.load1, 2) }} / {{ num(detail.current.load5, 2) }} / {{ num(detail.current.load15, 2) }}
-                </b></div>
-                <div class="kv"><span>iowait</span><b class="cy-mono">{{ pct(detail.current.iowait) }}</b></div>
-                <div class="kv">
-                  <span>Swap</span>
-                  <!-- 没开 swap 时后端给 null,显示 — 而不是 0% ——
-                       0% 看着像"swap 很空闲",而事实是这台机器没有 swap -->
-                  <b class="cy-mono">{{ detail.current.swap === null ? '— 未启用' : pct(detail.current.swap) }}</b>
-                </div>
-                <div class="kv"><span>进程数</span><b class="cy-mono">{{ int(detail.current.process_count) }}</b></div>
-                <div class="kv"><span>ESTABLISHED</span><b class="cy-mono">{{ int(detail.current.tcp_established) }}</b></div>
+
+                <!-- 下面这几项 ESXi 全都没有。**写"不适用"而不是 —** ——
+                     一个 — 会让人以为采集坏了,然后去查一个不存在的问题 -->
+                <template v-if="detail.esxi">
+                  <div class="kv"><span>CPU 主频池</span><b class="cy-mono">
+                    {{ detail.esxi.cpu_used_mhz !== null && detail.esxi.cpu_total_mhz
+                      ? `${detail.esxi.cpu_used_mhz} / ${detail.esxi.cpu_total_mhz} MHz` : '—' }}
+                  </b></div>
+                  <div class="kv"><span>物理规格</span><b class="cy-mono">
+                    {{ [detail.esxi.cpu_packages ? `${detail.esxi.cpu_packages} 路` : '',
+                        detail.server.cpu_cores ? `${detail.server.cpu_cores} 核` : '',
+                        detail.esxi.cpu_threads ? `${detail.esxi.cpu_threads} 线程` : '']
+                        .filter(Boolean).join(' / ') || '—' }}
+                  </b></div>
+                  <div class="kv"><span>硬件</span>
+                    <b class="cy-mono">{{ detail.esxi.hw_platform || '—' }}</b>
+                  </div>
+                  <div class="kv"><span>负载</span><b class="cy-mono dim">ESXi 不提供</b></div>
+                  <div class="kv"><span>iowait / Swap</span><b class="cy-mono dim">ESXi 不提供</b></div>
+                </template>
+                <template v-else>
+                  <div class="kv"><span>负载</span><b class="cy-mono">
+                    {{ num(detail.current.load1, 2) }} / {{ num(detail.current.load5, 2) }} / {{ num(detail.current.load15, 2) }}
+                  </b></div>
+                  <div class="kv"><span>iowait</span><b class="cy-mono">{{ pct(detail.current.iowait) }}</b></div>
+                  <div class="kv">
+                    <span>Swap</span>
+                    <!-- 没开 swap 时后端给 null,显示 — 而不是 0% ——
+                         0% 看着像"swap 很空闲",而事实是这台机器没有 swap -->
+                    <b class="cy-mono">{{ detail.current.swap === null ? '— 未启用' : pct(detail.current.swap) }}</b>
+                  </div>
+                  <div class="kv"><span>进程数</span><b class="cy-mono">{{ int(detail.current.process_count) }}</b></div>
+                  <div class="kv"><span>ESTABLISHED</span><b class="cy-mono">{{ int(detail.current.tcp_established) }}</b></div>
+                </template>
               </div>
             </div>
           </div>

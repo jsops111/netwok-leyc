@@ -65,6 +65,7 @@ from netcheck.models import (
     Protocol,
     RollupBucket,
     Server,
+    ServerOS,
     ServerSample,
     Severity,
     SnmpSecLevel,
@@ -801,6 +802,20 @@ class ServerViewSet(viewsets.ModelViewSet):
             "mounts": extra.get("mounts") or [],
             "top_processes": extra.get("top_processes") or [],
             "primary_interface": extra.get("primary_interface") or "",
+            # ESXi 专有。虚拟机数**给不出来时是 null 不是 0** —— 0 台是
+            # "这台宿主空着",null 是"没采到"(vim-cmd 权限不够最常见),
+            # 混成 0 会让人以为一台跑着三十台虚拟机的宿主是空的
+            "esxi": {
+                "vm_registered": extra.get("vm_registered"),
+                "vm_running": extra.get("vm_running"),
+                "vm_names": extra.get("vm_names") or [],
+                "hw_platform": extra.get("hw_platform") or "",
+                "cpu_total_mhz": extra.get("cpu_total_mhz"),
+                "cpu_used_mhz": extra.get("overall_cpu_mhz"),
+                "cpu_threads": extra.get("cpu_threads"),
+                "cpu_packages": extra.get("cpu_packages"),
+                "maintenance_mode": extra.get("maintenance_mode"),
+            } if server.os_type == ServerOS.ESXI else None,
             "interfaces": ServerInterfaceSerializer(server.interfaces.all(), many=True).data,
             "current": {
                 "cpu": latest.cpu_pct if latest else None,
@@ -821,7 +836,13 @@ class ServerViewSet(viewsets.ModelViewSet):
             "error": latest.error if latest else "",
             "cpu_pending": extra.get("cpu_pending", ""),
             "notes": [
-                v for v in (extra.get("interface_error"), extra.get("stderr")) if v
+                v for v in (
+                    extra.get("interface_error"),
+                    # "这台没有 loadavg" 要说出来 —— 否则负载那一栏一直是 —,
+                    # 看着像采集坏了,而它是这个系统本来就不提供
+                    extra.get("load_absent"),
+                    extra.get("stderr"),
+                ) if v
             ],
         })
 
@@ -1867,6 +1888,7 @@ def meta_choices(request):
         "collect_method": pack(CollectMethod),
         "snmp_version": pack(SnmpVersion),
         "snmp_sec_level": pack(SnmpSecLevel),
+        "server_os": pack(ServerOS),
         "notifier_kind": pack(NotifierKind),
         "rollup_bucket": pack(RollupBucket),
         "notify_status": pack(NotifyLog.Status),

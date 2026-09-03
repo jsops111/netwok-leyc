@@ -151,6 +151,24 @@ class SnmpSecLevel(models.TextChoices):
     AUTH_PRIV = "authPriv", "认证并加密"
 
 
+class ServerOS(models.TextChoices):
+    """
+    被监控主机的系统类型 —— **决定走哪一套采集命令**,不是一个展示标签。
+
+    Linux 读 /proc,ESXi 读 esxcli / vim-cmd:两套命令没有一条是通用的。
+    分不开的后果实测过一次:ESXi 的 shell 能跑 `echo`,所以分段标记全都
+    出现了,而 `cat /proc/stat`、`cat /proc/meminfo` 一个都不存在 ——
+    采集器认为"连上了、命令跑了",于是这台机器状态是 UP、每个指标是空的、
+    **last_error 也是空的**。没有任何一个地方会报错。
+
+    所以这个字段没有"自动探测"选项:探测失败时的退路仍然是猜,而猜错的
+    表现就是上面那种"安静的空"。让人选一次,选错了第一次「测试」就会说清楚。
+    """
+
+    LINUX = "linux", "Linux / 类 Unix"
+    ESXI = "esxi", "VMware ESXi"
+
+
 class RollupBucket(models.TextChoices):
     M1 = "1m", "1 分钟"
     M5 = "5m", "5 分钟"
@@ -907,20 +925,41 @@ class Server(BaseModel):
     每台机器做安装、升级、防火墙放行三件事,而 SSH 是这些机器本来就开着的
     唯一入口。代价是采集频率不能太高(每次一个 SSH 握手),所以最小 15 秒。
 
-    **只支持 Linux / 类 Unix。**采集全部读 `/proc` 和 `df`,不解析 `top`
-    的输出 —— `top` 的格式随发行版和 locale 变,而 `/proc` 的格式是内核 ABI,
-    十年没变过。Windows 要走 WinRM,那是另一条通道,这里没有实现。
+    **两套系统,两套命令,由 `os_type` 分开**(见 ServerOS):
 
-    CPU 使用率是**两次采集之间的平均值**(靠 /proc/stat 的 jiffies 差值),
-    不是某一瞬间的值:
+      - Linux:全部读 `/proc` 和 `df`,不解析 `top` 的输出 —— `top` 的格式
+        随发行版和 locale 变,而 `/proc` 的格式是内核 ABI,十年没变过。
+      - ESXi:走 `esxcli` 和 `vim-cmd`。VMkernel 的 `/proc` 里没有 `stat` /
+        `meminfo` / `loadavg` / `net/dev`,一条 Linux 的采集命令在上面
+        **不会报错,只会全是空的**。
+
+    Windows 要走 WinRM,那是另一条通道,这里没有实现。
+
+    Linux 的 CPU 使用率是**两次采集之间的平均值**(靠 /proc/stat 的 jiffies
+    差值),不是某一瞬间的值:
       - 瞬时值要在设备上 sleep 1 秒再读一次,每次采集多挂一秒
       - 而且瞬时值在趋势图上噪声很大,和 load 对不上
     代价是**刚加进来的第一拍没有 CPU 数据**(没有上一次的计数器可减),
     第二拍开始才有。这是有意的,不要填 0 —— 0 是"CPU 空闲"的意思。
+
+    **ESXi 没有这个代价**:hostd 自己就在算,`overallCpuUsage` 是一个当前值,
+    第一拍就有数。两条路径给的是同一个字段,但口径不同(一个是区间平均、
+    一个是瞬时),这一点在页面上标出来了。
     """
 
     name = models.CharField("服务器名称", max_length=128, unique=True)
     host = models.CharField("地址", max_length=255, help_text="IP 或域名")
+    os_type = models.CharField(
+        "系统类型",
+        max_length=12,
+        choices=ServerOS.choices,
+        default=ServerOS.LINUX,
+        db_index=True,
+        help_text=(
+            "决定走哪一套采集命令。选错了指标会**全是空的而且不报错** —— "
+            "ESXi 上没有 /proc/stat 也没有 /proc/meminfo,但 shell 跑得通"
+        ),
+    )
     ssh_port = models.IntegerField(
         "SSH 端口", default=22, validators=[MinValueValidator(1), MaxValueValidator(65535)]
     )
@@ -951,8 +990,9 @@ class Server(BaseModel):
         max_length=32,
         blank=True,
         help_text=(
-            "留空 = 自动取默认路由那块网卡。**不要把所有网卡加起来** —— "
-            "docker0 / veth / br- 这些虚拟口会把同一份流量数两三遍"
+            "留空 = 自动选。**不要把所有网卡加起来** —— docker0 / veth / br- "
+            "这些虚拟口会把同一份流量数两三遍。"
+            "Linux 上自动 = 默认路由那块;ESXi 上填 vmnicN,自动 = 累计收字节最多的那块 Up 上行口"
         ),
     )
 
@@ -968,7 +1008,8 @@ class Server(BaseModel):
     # 负载按**每核**判。绝对值没有可比性:一台 64 核的机器 load 8 很闲,
     # 一台 2 核的 load 8 已经跑不动了 —— 用同一个绝对阈值必然错一边。
     load_warn = models.FloatField(
-        "负载警告线(每核)", default=1.5, help_text="判的是 load1 ÷ 核数。1.0 = 刚好跑满"
+        "负载警告线(每核)", default=1.5,
+        help_text="判的是 load1 ÷ 核数。1.0 = 刚好跑满。**ESXi 没有 loadavg,这两项不生效**",
     )
     load_crit = models.FloatField("负载严重线(每核)", default=3.0)
 
@@ -976,7 +1017,12 @@ class Server(BaseModel):
     recover_threshold = models.IntegerField("连续正常次数关事件", default=2, validators=[MinValueValidator(1)])
 
     collect_processes = models.BooleanField(
-        "采集进程 Top", default=True, help_text="多一条 ps 命令,换来「是谁在吃 CPU」这个答案"
+        "采集进程 / 虚拟机清单",
+        default=True,
+        help_text=(
+            "Linux:多一条 ps,换来「是谁在吃 CPU」。"
+            "ESXi:多一条 `esxcli vm process list`,换来「这台宿主上正在跑哪些虚拟机」"
+        ),
     )
     enabled = models.BooleanField("启用", default=True, db_index=True)
     order = models.IntegerField("排序", default=0)

@@ -105,7 +105,7 @@ const DEFAULTS: Record<EntityKind, Record<string, any>> = {
     policy_sync_enabled: false, policy_sync_interval_minutes: 30,
   },
   server: {
-    name: '', host: '', ssh_port: 22, ssh_username: '', ssh_password: '',
+    name: '', host: '', os_type: 'linux', ssh_port: 22, ssh_username: '', ssh_password: '',
     ssh_private_key: '', ssh_key_passphrase: '', site: '', role: '',
     interval_seconds: 60, timeout_ms: 8000, net_interface: '',
     cpu_warn_pct: 80, cpu_crit_pct: 92, mem_warn_pct: 85, mem_crit_pct: 95,
@@ -497,12 +497,23 @@ const deviceFields: FieldSpec[] = [
   { key: 'order', label: '排序', type: 'number', min: 0 },
 ]
 
+/** ESXi 和 Linux 走两套完全不同的采集命令,表单里的提示也要跟着分 */
+const isEsxi = (m: Record<string, any>) => m.os_type === 'esxi'
+
 const serverFields: FieldSpec[] = [
   { key: 'name', label: '服务器名称', type: 'text', required: true, placeholder: '如:app-node-01' },
   { key: 'host', label: '地址', type: 'text', required: true, placeholder: 'IP 或域名' },
+  { key: 'os_type', label: '系统类型', type: 'select', options: 'server_os', required: true,
+    hint: '**选错了指标会全是空的而且不报错** —— ESXi 上没有 /proc/stat 也没有 '
+      + '/proc/meminfo,但 shell 跑得通,采集器会认为"连上了、命令跑完了"' },
   { key: 'ssh_port', label: 'SSH 端口', type: 'number', min: 1, max: 65535 },
   { key: 'ssh_username', label: 'SSH 用户名', type: 'text', required: true,
+    show: (m) => !isEsxi(m),
     hint: '不需要 root —— 采集只读 /proc 和跑 df / ps' },
+  { key: 'ssh_username', label: 'SSH 用户名', type: 'text', required: true,
+    show: isEsxi,
+    hint: '要能跑 esxcli 和 vim-cmd。**ESXi 默认关着 SSH**,先在 '
+      + '「主机 → 管理 → 服务」里把 TSM-SSH 起来,否则这里报的是连接被拒绝' },
   { key: 'ssh_password', label: 'SSH 密码', type: 'password',
     hint: '密码和私钥填一个即可;编辑时留空表示不修改' },
   { key: 'ssh_private_key', label: 'SSH 私钥', type: 'textarea', rows: 4,
@@ -517,9 +528,16 @@ const serverFields: FieldSpec[] = [
     hint: '每次采集是一次完整的 SSH 握手,最小 15 秒' },
   { key: 'timeout_ms', label: '超时', type: 'number', min: 1000, max: 60000, suffix: '毫秒' },
   { key: 'net_interface', label: '流量统计网卡', type: 'text', full: true,
+    show: (m) => !isEsxi(m),
     placeholder: '留空 = 自动取默认路由那块',
     hint: '**不要指望把所有网卡加起来** —— docker0 / veth / br- 这些虚拟口会把'
       + '同一份流量数两三遍。留空时取默认路由那块(虚拟机宿主机上常常是 br0,那是对的)' },
+  { key: 'net_interface', label: '流量统计上行口', type: 'text', full: true,
+    show: isEsxi,
+    placeholder: '留空 = 自动挑;要指定就填 vmnic0 这种',
+    hint: 'ESXi 上只有 vmnic 是物理上行口(vSwitch / portgroup / vmk 不在流量表里,'
+      + '所以没有 Linux 上那种"同一份流量数几遍"的问题)。留空时自动挑**累计收发'
+      + '字节最多的那块 Up 口** —— 不按 vmnic0 挑,那块在很多机器上是插着线的备口' },
 
   { key: 'cpu_warn_pct', label: 'CPU 警告线', type: 'number', min: 0, max: 100, suffix: '%' },
   { key: 'cpu_crit_pct', label: 'CPU 严重线', type: 'number', min: 0, max: 100, suffix: '%' },
@@ -527,17 +545,27 @@ const serverFields: FieldSpec[] = [
     hint: '按 MemAvailable 算,页缓存不算已用 —— 否则任何一台干活的 Linux 都是 90%+' },
   { key: 'mem_crit_pct', label: '内存严重线', type: 'number', min: 0, max: 100, suffix: '%' },
   { key: 'disk_warn_pct', label: '磁盘警告线', type: 'number', min: 0, max: 100, suffix: '%',
-    hint: '判的是**占用率最高的那个挂载点**,不是根分区' },
+    hint: 'Linux:判**占用率最高的那个挂载点**,不是根分区。'
+      + 'ESXi:判**最满的那个数据存储**(bootbank 不算 —— 它天生就用到八九成,'
+      + '算进来的话每台 ESXi 一加进来就撞穿严重线,而那不是个能行动的告警)' },
   { key: 'disk_crit_pct', label: '磁盘严重线', type: 'number', min: 0, max: 100, suffix: '%' },
+  // ESXi 不提供 loadavg,这两项对它是死的 —— 藏起来而不是显示一个不生效的
+  // 输入框:一个填了不起作用的阈值比没有这个输入框更容易让人误判
   { key: 'load_warn', label: '负载警告线', type: 'number', min: 0, step: 0.1, suffix: '/核',
+    show: (m) => !isEsxi(m),
     hint: '判的是 load1 ÷ 核数。1.0 = 刚好跑满。绝对值没有可比性:'
       + '64 核的机器 load 8 很闲,2 核的 load 8 已经跑不动了' },
-  { key: 'load_crit', label: '负载严重线', type: 'number', min: 0, step: 0.1, suffix: '/核' },
+  { key: 'load_crit', label: '负载严重线', type: 'number', min: 0, step: 0.1, suffix: '/核',
+    show: (m) => !isEsxi(m) },
 
   { key: 'fail_threshold', label: '连续失败开事件', type: 'number', min: 1, suffix: '次' },
   { key: 'recover_threshold', label: '连续正常关事件', type: 'number', min: 1, suffix: '次' },
   { key: 'collect_processes', label: '采集进程 Top', type: 'switch',
+    show: (m) => !isEsxi(m),
     hint: '多一条 ps 命令,换来「是谁在吃 CPU」这个答案' },
+  { key: 'collect_processes', label: '采集虚拟机清单', type: 'switch',
+    show: isEsxi,
+    hint: '多一条 `esxcli vm process list`,换来「这台宿主上正在跑哪些虚拟机」' },
   { key: 'enabled', label: '启用', type: 'switch' },
   { key: 'order', label: '排序', type: 'number', min: 0 },
 ]
@@ -595,7 +623,8 @@ const currentFields = computed(() => {
 function resolveOptions(key: string) {
   if (key === 'protocol' || key === 'device_kind' || key === 'vendor' || key === 'device_model'
       || key === 'collect_method' || key === 'snmp_version' || key === 'snmp_sec_level'
-      || key === 'notifier_kind' || key === 'severity' || key === 'event_kind') {
+      || key === 'notifier_kind' || key === 'severity' || key === 'event_kind'
+      || key === 'server_os') {
     return meta.options(key)
   }
   return []
@@ -755,11 +784,17 @@ const serverColumns: DataTableColumns<ServerRow> = [
       h('div', { style: "font-size:10.5px;color:var(--cy-ink-3);font-family:'JetBrains Mono',monospace" },
         `${r.host}:${r.ssh_port} · ${r.ssh_username}`),
     ]) },
-  { title: '系统', key: 'os_name', minWidth: 168,
+  { title: '系统', key: 'os_name', minWidth: 186,
     render: (r) => h('div', [
-      // 这几项是**首次采集后自动回填**的,新建时是空的 —— 显示"待采集"
-      // 而不是空白,否则看着像采集出了问题
-      h('div', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.os_name || '待采集'),
+      h('div', { style: 'display:flex;align-items:center;gap:5px' }, [
+        // 类型是**人选的**(决定走哪套采集命令),和下面那行采回来的版本号
+        // 不是一回事 —— 两者不一致时(选了 ESXi 却采回 Ubuntu)一眼能看出来
+        h(NTag, { size: 'tiny', bordered: false, type: r.os_type === 'esxi' ? 'warning' : 'default' },
+          () => meta.label('server_os', r.os_type)),
+        // 这几项是**首次采集后自动回填**的,新建时是空的 —— 显示"待采集"
+        // 而不是空白,否则看着像采集出了问题
+        h('span', { style: 'font-size:11.5px;color:var(--cy-ink-2)' }, r.os_name || '待采集'),
+      ]),
       h('div', { style: 'font-size:10px;color:var(--cy-ink-3)' },
         [r.kernel, r.cpu_cores ? `${r.cpu_cores} 核` : '',
          r.mem_total_bytes ? bytes(r.mem_total_bytes) : ''].filter(Boolean).join(' · ') || '—'),
@@ -928,8 +963,9 @@ const profileNote = computed(() => {
           />
           <div v-if="!servers.length && !loading" class="cy-empty">
             还没有服务器。只要一个能登录的 SSH 账号就行,<b>不用在机器上装任何东西</b>
-            —— 采集读的是 <code>/proc</code> 和 <code>df</code>,不解析 top/free 的输出
-            (那些格式随发行版和 locale 变)。<br>
+            —— Linux 读的是 <code>/proc</code> 和 <code>df</code>,不解析 top/free 的输出
+            (那些格式随发行版和 locale 变);<b>ESXi 走 <code>esxcli</code> / <code>vim-cmd</code></b>,
+            加的时候<b>「系统类型」要选对</b> —— 选错了指标会全是空的而且不报错。<br>
             <b>只支持 Linux / 类 Unix。</b>Windows 要走 WinRM,那是另一条通道,这里没有实现。
           </div>
         </CyberPanel>
