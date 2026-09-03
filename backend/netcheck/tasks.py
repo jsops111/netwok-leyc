@@ -46,6 +46,7 @@ from netcheck.models import (
     Server,
     Severity,
 )
+from netcheck.devices import compliance as compliance_mod
 from netcheck.probes import runner
 
 log = logging.getLogger("netcheck.tasks")
@@ -412,6 +413,30 @@ def backup_device_task(self, device_id: int) -> dict:
             if event is not None:
                 send_notification.delay(event.pk, "alert")
 
+        # ---- 配置基线 ----
+        # **跑在这一拍**是有理由的:基线检查是在**备份下来的配置**上跑的,
+        # 刚拿到一份新配置正是该重跑一遍的时候(配置改了,合规结论可能变)。
+        #
+        # 走 process() 而不是瞬时事件:"telnet 一直开着"**有持续状态** ——
+        # 修好之前它一直是个问题,修好之后应该自动恢复。而它必须带 scope,
+        # 否则会把这台设备上正开着的 cpu_high / device_down 一起关掉
+        # (CLAUDE.md 第 8 条)
+        try:
+            compliance_result = compliance_mod.check_device(device)
+            outcome = event_engine.process(
+                event_engine.EventSource.from_device(device),
+                compliance_mod.problems_for_events(compliance_result),
+                scope={EventKind.COMPLIANCE_FAIL},
+            )
+            _queue_event_notifications(outcome)
+            result["compliance"] = {
+                "checked": compliance_result.get("checked"),
+                "critical": compliance_result.get("critical"),
+                "warning": compliance_result.get("warning"),
+            }
+        except Exception as exc:  # noqa: BLE001 —— 基线检查失败不该让备份算失败
+            log.warning("设备 %s 基线检查失败: %s", device.name, exc)
+
         return {"device": device.name, **result}
 
     except Exception as exc:  # noqa: BLE001 —— 备份失败要记录,不能让任务炸掉
@@ -464,6 +489,21 @@ def sync_policies_task(self, device_id: int) -> dict:
     interval = device.policy_sync_interval_minutes * 60
     try:
         result = policies.sync_policies(device)
+
+        # ---- 规则审计 ----
+        # 跑在这一拍:审计是在**刚同步下来的策略表**上跑的。
+        # 同样带 scope —— 不带的话这台防火墙上正开着的 device_down /
+        # cpu_high 会被一起关掉(CLAUDE.md 第 8 条)
+        try:
+            outcome = event_engine.process(
+                event_engine.EventSource.from_device(device),
+                policies.audit_problems(device),
+                scope={EventKind.POLICY_RISK},
+            )
+            _queue_event_notifications(outcome)
+        except Exception as exc:  # noqa: BLE001 —— 审计失败不该让同步算失败
+            log.warning("设备 %s 规则审计失败: %s", device.name, exc)
+
         return {"device": device.name, **result}
     except Exception as exc:  # noqa: BLE001
         error = str(exc) if isinstance(exc, policies.PolicyError) else f"{type(exc).__name__}: {exc}"
@@ -484,6 +524,15 @@ def sync_policies_task(self, device_id: int) -> dict:
 # =========================================================================
 # 通知
 # =========================================================================
+
+
+def _queue_event_notifications(outcome) -> None:
+    """开/升级 → 推告警,恢复 → 推恢复。和采集器里那个是同一份逻辑。"""
+
+    for event in outcome.opened + outcome.escalated:
+        send_notification.delay(event.pk, "alert")
+    for event in outcome.resolved:
+        send_notification.delay(event.pk, "recover")
 
 
 @shared_task(name="netcheck.send_notification", bind=True, max_retries=3, default_retry_delay=60)

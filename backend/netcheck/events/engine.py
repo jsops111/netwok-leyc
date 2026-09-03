@@ -158,20 +158,48 @@ class EventOutcome:
     escalated: list[Event] = field(default_factory=list)
 
 
-def process(source: EventSource, problems: list[dict]) -> EventOutcome:
+def process(source: EventSource, problems: list[dict],
+            scope: set[str] | frozenset[str] | None = None) -> EventOutcome:
     """
     problems 是 evaluate() 给出的当前问题清单,形如
         [{"kind","severity","value","threshold","unit","message"}, ...]
     空列表表示这一拍全好。
+
+    ## `scope`:让"跑在别的拍子上"的检查也能用 process()
+
+    默认(`scope=None`)的语义是**"这一拍观测到了这个来源的全部问题"** ——
+    没出现在 `problems` 里的未恢复事件会被当成已恢复关掉。所以跑在别的
+    拍子上的检查**不能**直接调它:拿一个只含 `compliance_fail` 的 problems
+    去调用,这台设备上正开着的 `cpu_high` / `device_down` 会被一起关掉
+    (CLAUDE.md 第 8 条)。
+
+    给了 `scope` 之后,**只有 kind 落在 scope 里的事件参与开关** ——
+    别的一律不碰。于是配置合规(跑在备份那一拍)、规则审计(跑在策略同步
+    那一拍)也能拿到"自动开 + 自动关"这套语义,而不用退化成瞬时事件。
+
+    **瞬时事件仍然走 `record_point_event()`**:那一类是"发生了就是发生了、
+    没有持续状态"(配置变更、备份失败、邻居变化),它们本来就不该进
+    "未恢复"列表。而"telnet 一直开着"是有持续状态的 —— 修好之前它一直是
+    个问题,修好之后应该自动恢复。两类不要混。
     """
 
     outcome = EventOutcome()
     now = timezone.now()
     active = {p["kind"]: p for p in problems}
+    if scope is not None:
+        # 传进来的 problems 里混进了作用域外的东西,是调用方的 bug ——
+        # 放行的话它会开出一条永远关不掉的事件(下一拍不在 scope 里,
+        # 不会被当成"已恢复")
+        stray = set(active) - set(scope)
+        if stray:
+            log.warning("process(scope=%s) 收到作用域外的 kind %s,已忽略", sorted(scope), sorted(stray))
+            active = {k: v for k, v in active.items() if k in scope}
 
     open_events = {
         e.kind: e
         for e in Event.objects.filter(resolved_at__isnull=True, **source.event_filter())
+        # **只碰 scope 里的** —— 这一行就是"不会误关别人的事件"的全部保证
+        if scope is None or e.kind in scope
     }
 
     key = source.cache_key

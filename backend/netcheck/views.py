@@ -2589,12 +2589,32 @@ def dashboard_charts(request):
     payload = []
 
     for group in groups:
-        targets = list(
+        # **画出来的顺序 = 配置里那个优先级**(order,数字小的在前),
+        # 和配置中心、下拉、大屏上别的地方一致 —— 一台设备在四个页面上
+        # 排四种顺序,人对不上。
+        #
+        # 但**挑哪几条**画不能只看优先级:一张图最多画 max_lines 条,
+        # 纯按优先级截的话,一条优先级排在 20 位、正在断的线会被截掉,
+        # 大屏上完全看不见 —— 那是这一屏最不该发生的事。
+        #
+        # 所以是**先挑后排**:挑的时候有问题的优先进来,进来之后一律按
+        # 优先级排。两件事分开做,各自都对。
+        candidates = list(
             group.targets.filter(enabled=True)
-            # 有问题的排前面:down > degraded > unknown > up
             .annotate(open_events=Count("events", filter=Q(events__resolved_at__isnull=True)))
-            .order_by("-open_events", "order", "id")[:max_lines]
+            .order_by("order", "id")
         )
+        if len(candidates) > max_lines:
+            problem = [
+                t for t in candidates
+                if t.open_events or t.state in (LinkState.DOWN, LinkState.DEGRADED)
+            ]
+            healthy = [t for t in candidates if t not in problem]
+            picked = (problem + healthy)[:max_lines]
+        else:
+            picked = candidates
+        # 挑完之后**按优先级排**,不按"有没有问题"排
+        targets = sorted(picked, key=lambda t: (t.order, t.pk))
         if not targets:
             continue
 

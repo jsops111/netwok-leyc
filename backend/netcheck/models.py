@@ -105,6 +105,11 @@ class EventKind(models.TextChoices):
     # 那三个是**这个平台自己**从部署点探出来的,这三个是**防火墙自己**
     # 从它的出口探出来的 —— 同一条链路两边测出来的数不一样是正常的
     # (路径不同),而两边都测才能分清"是线路坏了"还是"我们到防火墙这段坏了"
+    # 配置类的问题。**它们有持续状态**(telnet 一直开着,修好之前一直是个
+    # 问题),所以走 process() 的开/关流程而不是瞬时事件 —— 只是要带 scope,
+    # 因为它们跑在备份/策略同步那一拍上(见 events/engine.process 的说明)
+    COMPLIANCE_FAIL = "compliance_fail", "配置不合规"
+    POLICY_RISK = "policy_risk", "防火墙规则风险"
     SLA_VIOLATED = "sla_violated", "SD-WAN SLA 未达标"
     SDWAN_DEAD = "sdwan_dead", "SD-WAN 成员失联"
 

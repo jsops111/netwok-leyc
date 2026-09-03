@@ -364,3 +364,56 @@ def check_device(device: Device) -> dict:
         "info": sum(1 for f in findings if f["severity"] == Severity.INFO),
         "passed": len(applicable) - len(findings),
     }
+
+
+# =========================================================================
+# 事件
+# =========================================================================
+
+
+def problems_for_events(result: dict) -> list[dict]:
+    """
+    基线检查结果 → 事件引擎要的 problems。
+
+    **只出一条** `compliance_fail`(级别取最高的那条发现),消息里带上
+    "多少条 + 前几条是什么"。理由:一台设备上不合规的项通常是一批
+    (telnet 开着、community 是 public、日志没外送往往同时出现),
+    每一项开一条事件会在事件表里刷出一屏,而**它们要做的是同一件事** ——
+    登上去改一遍配置。
+
+    **`checked=False` 时返回空列表,不是"没问题"** —— 没检查过的设备不该
+    因为"没有发现"而把一条已经开着的事件关掉。这一条和
+    「认不出的厂商明确说没有规则」是同一个道理。
+    """
+
+    if not result.get("checked"):
+        return []
+
+    findings = result.get("findings") or []
+    if not findings:
+        return []
+
+    from netcheck.models import EventKind, Severity
+
+    crit = [f for f in findings if f.get("severity") == "critical"]
+    warn = [f for f in findings if f.get("severity") == "warning"]
+    # info 级的发现**不开事件** —— 它们是"可以更好",不是"有问题",
+    # 开成事件会让未恢复列表里常年挂着几条没人会去处理的
+    if not crit and not warn:
+        return []
+
+    top = (crit or warn)[:3]
+    names = "、".join(f.get("title") or f.get("id") or "?" for f in top)
+    more = len(crit) + len(warn) - len(top)
+    return [{
+        "kind": EventKind.COMPLIANCE_FAIL,
+        "severity": Severity.CRITICAL if crit else Severity.WARNING,
+        "value": float(len(crit) + len(warn)),
+        "threshold": None,
+        "unit": "项",
+        "message": (
+            f"配置基线有 {len(crit)} 项严重 / {len(warn)} 项警告:{names}"
+            + (f" 等 {more} 项" if more > 0 else "")
+            + "。到「配置合规」页看每条该敲什么命令"
+        ),
+    }]

@@ -1100,3 +1100,62 @@ def sync_policies(device: Device) -> dict:
         "truncated": truncated,
         "degraded_from_api": bool(api_error) and method == "ssh",
     }
+
+
+# =========================================================================
+# 规则审计 → 事件
+# =========================================================================
+
+
+def audit_problems(device: Device) -> list[dict]:
+    """
+    这台防火墙的规则风险 → 事件引擎要的 problems。
+
+    **只出一条** `policy_risk`,消息里带数量和前几条。理由和配置基线一样:
+    一台防火墙上过宽的规则通常是一批,每条开一条事件会在事件表里刷出一屏,
+    而它们要做的是同一件事 —— 打开策略页把那几条收窄。
+
+    判定**复用模型上那两个属性**(`permissive_level` / `logging_off`),
+    不在这儿重写第三遍 —— 那两个属性、`filters.py` 里的 SQL 版本、
+    还有 summary 的计数已经是同一条规则的三份实现了,再加一份必然漂。
+
+    ⚠ **一条策略都没有时返回空列表**,而不是"没有风险":那多半是这台
+    设备的策略还没同步下来,而不是它真的没有规则。
+    """
+
+    from netcheck.models import EventKind, FirewallPolicy, Severity
+
+    policies_qs = list(FirewallPolicy.objects.filter(device=device))
+    if not policies_qs:
+        return []
+
+    wide = [p for p in policies_qs if p.permissive_level == "critical"]
+    narrowish = [p for p in policies_qs if p.permissive_level == "warning"]
+    no_log = [p for p in policies_qs if p.logging_off]
+
+    if not wide and not narrowish and not no_log:
+        return []
+
+    bits = []
+    if wide:
+        bits.append(f"{len(wide)} 条 any-any-any 放行")
+    if narrowish:
+        bits.append(f"{len(narrowish)} 条服务任意")
+    if no_log:
+        bits.append(f"{len(no_log)} 条放行但不记日志")
+
+    # **any-any-any 放行是 critical,其余是 warning。**前者等于这对接口
+    # 之间没有防火墙,而且它会让排在它后面的规则全都匹配不到
+    top = (wide or narrowish or no_log)[:3]
+    names = "、".join(f"#{p.policy_id}{('(' + p.name + ')') if p.name else ''}" for p in top)
+    return [{
+        "kind": EventKind.POLICY_RISK,
+        "severity": Severity.CRITICAL if wide else Severity.WARNING,
+        "value": float(len(wide) + len(narrowish) + len(no_log)),
+        "threshold": None,
+        "unit": "条",
+        "message": (
+            "防火墙规则风险:" + "、".join(bits) + f"。例如 {names}"
+            + "。到「防火墙策略」页的规则审计看全部"
+        ),
+    }]
