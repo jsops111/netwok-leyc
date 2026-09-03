@@ -7,6 +7,7 @@ import StatTile from '@/components/cyber/StatTile.vue'
 import StateDot from '@/components/cyber/StateDot.vue'
 import MeterBar from '@/components/cyber/MeterBar.vue'
 import GroupChart from '@/components/charts/GroupChart.vue'
+import SdwanChart from '@/components/charts/SdwanChart.vue'
 import DeviceTrend from '@/components/charts/DeviceTrend.vue'
 import Sparkline from '@/components/charts/Sparkline.vue'
 import { api } from '@/api'
@@ -141,11 +142,27 @@ watch(deviceSort, saveDeviceView)
  * 最上面,大屏上地方小,所以放在小节标题的副标题里。
  */
 const SDWAN_VIEW_KEY = 'netcheck.dashboard.sdwan'
+/** 图上画哪个指标。**跨度跟着线路图走,指标各自选** —— 延迟和丢包的
+ *  量纲不同(ms / %),堆一张图上读不出东西(和 GroupChart 同一条) */
+const sdwanMetric = ref<'latency' | 'jitter' | 'loss'>('latency')
+const SDWAN_METRIC_OPTIONS = [
+  { label: '延迟', value: 'latency' },
+  { label: '抖动', value: 'jitter' },
+  { label: '丢包', value: 'loss' },
+]
 const hiddenSdwan = ref<Set<number>>(new Set())
 const sdwanPickerOpen = ref(false)
-// **hours=0 = 不要趋势点** —— 这几张小卡只显示当前值。默认那 6 小时的
-// 采样点在 50 条链路上是每分钟白传几千个对象;趋势在 /sdwan 那一页看
-const sdwan = usePolling(() => api.sdwanBoard(0).then((r) => r.data), 60_000)
+/**
+ * **跟着大屏那个时间跨度走**(和线路图同一个选择器)—— 一屏上两块图
+ * 显示的是不同的时间窗,人对着看会得出错的结论。
+ *
+ * 向上取整到小时:接口的参数是小时,而跨度选择器最小是 10 分钟。
+ * 取整到 1 小时比取 0 小时安全 —— 后者会让图完全空掉。
+ */
+const sdwanHours = computed(() => Math.max(1, Math.ceil(chartMinutes.value / 60)))
+const sdwan = usePolling(
+  () => api.sdwanBoard(sdwanHours.value).then((r) => r.data), 60_000)
+watch(sdwanHours, () => void sdwan.refresh())
 
 try {
   const saved = JSON.parse(localStorage.getItem(SDWAN_VIEW_KEY) || '{}')
@@ -185,6 +202,54 @@ const sdwanLinks = computed(() => {
       || a.member.localeCompare(b.member)
   })
 })
+
+/**
+ * 按**健康检查**分组 —— 一个检查一张图,线 = 各个出口。
+ *
+ * 和线路那边「一个监控类一张大图」是同一个结构:同一个检查下的几个出口
+ * 探的是**同一个目标**,画在一张图上才能直接比"哪个出口更快"。
+ * 拆成一条链路一张图的话,那个比较要靠人在两张图之间眼睛来回扫。
+ */
+const sdwanBlocks = computed(() => {
+  const map = new Map<string, typeof sdwanLinks.value>()
+  for (const l of sdwanLinks.value) {
+    const key = `${l.device_name}||${l.health_check}`
+    if (!map.has(key)) map.set(key, [])
+    map.get(key)!.push(l)
+  }
+  return [...map.entries()].map(([key, rows]) => {
+    const [device, check] = key.split("||")
+    return {
+      key, device, check, rows,
+      // 探的是哪个地址 —— 放在图的标题上,这一块最常被问的一句
+      server: rows.find((r) => r.server)?.server || "目标未报",
+      protocol: rows.find((r) => r.protocol)?.protocol || "ping",
+      down: rows.filter((r) => r.state === "dead"),
+      bad: rows.filter((r) => r.sla_met === false && r.state !== "dead"),
+    }
+  })
+  // **有问题的检查排前面** —— 大屏上要先看见坏的那张图
+  .sort((a, b) =>
+    (b.down.length ? 2 : b.bad.length ? 1 : 0) - (a.down.length ? 2 : a.bad.length ? 1 : 0)
+    || a.key.localeCompare(b.key, "zh-CN"))
+})
+
+/**
+ * 这条链路断了多久。`last_change` 为空时说"不知道多久"而不是"刚断" ——
+ * 采集器是在**看到状态变化**时才写那个字段的,一条从加进来就一直断着的
+ * 链路从没"变化"过。显示成"刚断"会让人去查一个错误的时间窗。
+ */
+function downFor(link: { state: string; last_change: string | null }): string {
+  if (link.state !== 'dead') return ''
+  if (!link.last_change) return '不知道断了多久'
+  const secs = Math.max(0, (Date.now() - new Date(link.last_change).getTime()) / 1000)
+  const d = Math.floor(secs / 86400)
+  const h = Math.floor((secs % 86400) / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  if (d) return `已断 ${d}天${h}小时`
+  if (h) return `已断 ${h}小时${m}分`
+  return m ? `已断 ${m} 分钟` : '刚刚断的'
+}
 
 /** 和设备那边同一条:**被隐藏的里面有问题的要点名**,不能悄悄消失 */
 const hiddenSdwanSummary = computed(() => {
@@ -592,10 +657,17 @@ const schedulerWarning = computed(() => {
         <span class="sub-note">防火墙自己从出口探的,和上面的线路拨测不是同一段</span>
       </div>
       <div class="charts-actions">
+        <NButtonGroup size="small">
+          <NButton
+            v-for="opt in SDWAN_METRIC_OPTIONS" :key="opt.value"
+            :type="sdwanMetric === opt.value ? 'primary' : 'default'"
+            ghost @click="sdwanMetric = opt.value as 'latency' | 'jitter' | 'loss'"
+          >{{ opt.label }}</NButton>
+        </NButtonGroup>
         <NButton size="small" ghost @click="sdwanPickerOpen = !sdwanPickerOpen">
           选择链路({{ sdwanLinks.length }}/{{ everySdwanLink.length }})
         </NButton>
-        <RouterLink to="/sdwan" class="more-link">看趋势图 →</RouterLink>
+        <RouterLink to="/sdwan" class="more-link">明细 →</RouterLink>
       </div>
       <span class="refresh-note" :class="{ stale: sdwan.isStale(120000) }">
         更新于 {{ ago(sdwan.lastSuccess.value) }}
@@ -637,42 +709,56 @@ const schedulerWarning = computed(() => {
       <button class="linkish" @click="showAllSdwan">全部显示</button>
     </div>
 
-    <div v-if="sdwanLinks.length" class="sd-grid">
-      <div
-        v-for="l in sdwanLinks" :key="l.id"
-        class="sd-card"
-        :class="{ dead: l.state === 'dead', warn: l.state !== 'dead' && l.sla_met === false }"
-      >
-        <div class="sd-head">
-          <b class="cy-mono">{{ l.member }}</b>
-          <span class="dim small">{{ l.device_name }}</span>
-        </div>
-        <!-- 探的是哪个地址 —— 这一块最常被问的一句 -->
-        <div class="sd-server cy-mono">
-          {{ (l.protocol || 'ping').toUpperCase() }} {{ l.server || '目标未报' }}
-        </div>
-        <div class="sd-nums">
-          <div class="sd-n">
-            <span>延迟</span>
-            <b class="cy-mono">{{ ms(l.latency_ms) }}</b>
+    <CyberPanel
+      v-for="blk in sdwanBlocks" :key="blk.key"
+      :title="blk.check"
+      :subtitle="`${blk.device} · ${blk.protocol.toUpperCase()} ${blk.server} · ${blk.rows.length} 个出口`"
+      :level="blk.down.length ? 'critical' : blk.bad.length ? 'warning' : 'normal'"
+      :live="!sdwan.paused.value"
+    >
+      <template #actions>
+        <!-- **断了多久**直接写在标题栏上 —— "有一条断了"回答不了
+             "要不要现在冲过去","已断 2小时13分"可以 -->
+        <span v-for="d in blk.down" :key="d.id" class="sd-down">
+          {{ d.member }} {{ downFor(d) }}
+        </span>
+        <span v-if="!blk.down.length && blk.bad.length" class="sd-warn">
+          {{ blk.bad.map((x) => x.member).join('、') }} SLA 未达标
+        </span>
+      </template>
+
+      <div class="sd-body">
+        <!-- 左:每个出口一行当前读数 -->
+        <div class="sd-list">
+          <div
+            v-for="l in blk.rows" :key="l.id"
+            class="sd-row" :class="{ bad: l.state === 'dead' || l.sla_met === false }"
+          >
+            <i class="sd-dot" :style="{ background: l.state === 'dead' ? STATE.down
+              : l.sla_met === false ? STATE.degraded : STATE.up }"></i>
+            <span class="sd-member cy-mono">{{ l.member }}</span>
+            <span class="sd-vals cy-mono">
+              {{ ms(l.latency_ms) }}
+              <span class="dim">/</span> {{ ms(l.jitter_ms) }}
+              <span class="dim">/</span> {{ pct(l.loss_pct, 1) }}
+            </span>
+            <!-- 三态照旧:sla_met 为 null 说"设备没报",不说"达标" -->
+            <span
+              class="sd-sla"
+              :style="{ color: l.sla_met === false ? STATE.down
+                : l.sla_met === true ? STATE.up : STATE.unknown }"
+            >{{ l.sla_text }}</span>
           </div>
-          <div class="sd-n">
-            <span>抖动</span>
-            <b class="cy-mono">{{ ms(l.jitter_ms) }}</b>
-          </div>
-          <div class="sd-n">
-            <span>丢包</span>
-            <b class="cy-mono">{{ pct(l.loss_pct, 1) }}</b>
-          </div>
+          <div class="sd-legend dim">延迟 / 抖动 / 丢包</div>
         </div>
-        <div class="sd-foot">
-          <!-- 三态照旧:sla_met 为 null 说"设备没报",不说"达标" -->
-          <span :style="{ color: l.sla_met === false ? STATE.down
-            : l.sla_met === true ? STATE.up : STATE.unknown }">{{ l.sla_text }}</span>
-          <span v-if="l.state === 'dead'" :style="{ color: STATE.down }">不通</span>
+
+        <!-- 右:曲线。**和线路大图同一套规矩** —— 断线画红竖带、
+             时间不连续处断开、SLA 门限画虚线 -->
+        <div class="sd-chart">
+          <SdwanChart :links="blk.rows" :metric="sdwanMetric" :height="176" />
         </div>
       </div>
-    </div>
+    </CyberPanel>
   </div>
 </template>
 
@@ -733,31 +819,35 @@ const schedulerWarning = computed(() => {
 .sub-note { font-size: 10.5px; color: var(--cy-ink-3); font-weight: 400; margin-left: 8px; }
 .more-link { font-size: 11px; color: var(--cy-cyan); }
 
-/* ---- SD-WAN 小卡 ---- */
-.sd-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;
+/* ---- SD-WAN:左边读数、右边曲线,和线路那一段同构 ---- */
+.sd-body { display: grid; grid-template-columns: minmax(240px, 340px) 1fr; gap: 14px; }
+@media (max-width: 900px) {
+  .sd-body { grid-template-columns: 1fr; }
 }
-.sd-card {
-  border: 1px solid var(--cy-line-soft);
-  border-left: 3px solid var(--cy-up);
-  background: rgba(var(--cy-raised-rgb), 0.4);
-  padding: 8px 10px;
-  display: flex; flex-direction: column; gap: 5px;
+.sd-list { display: flex; flex-direction: column; gap: 2px; }
+.sd-row {
+  display: grid;
+  grid-template-columns: 10px minmax(58px, auto) 1fr auto;
+  align-items: center; gap: 8px;
+  font-size: 11.5px; padding: 3px 6px;
+  border-left: 2px solid transparent;
 }
-.sd-card.warn { border-left-color: var(--cy-degraded); }
-.sd-card.dead { border-left-color: var(--cy-down); }
-.sd-head { display: flex; align-items: baseline; gap: 8px; }
-.sd-head b { font-size: 13px; color: var(--cy-ink); }
-.sd-server { font-size: 10.5px; color: var(--cy-cyan); }
-.sd-nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
-.sd-n { display: flex; flex-direction: column; }
-.sd-n span { font-size: 9.5px; color: var(--cy-ink-3); }
-.sd-n b { font-size: 13px; color: var(--cy-ink); }
-.sd-foot {
-  display: flex; justify-content: space-between; gap: 8px;
-  font-size: 10.5px; border-top: 1px solid var(--cy-line-soft); padding-top: 4px;
+/* 有问题的那一行标出来 —— 一个检查下四五个出口,靠某个数字的颜色扫不过来 */
+.sd-row.bad {
+  border-left-color: var(--cy-down);
+  background: rgba(var(--cy-down-rgb), 0.06);
 }
 .sd-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.sd-member { color: var(--cy-ink); font-size: 12px; }
+.sd-vals { color: var(--cy-ink-2); }
+.sd-sla { font-size: 10.5px; white-space: nowrap; }
+.sd-legend { font-size: 9.5px; padding: 3px 6px 0 26px; }
+.sd-chart { min-width: 0; }
+.sd-down {
+  font-size: 10.5px; color: var(--cy-down);
+  border: 1px solid var(--cy-down); padding: 0 6px;
+}
+.sd-warn { font-size: 10.5px; color: var(--cy-degraded); }
 
 /* ---- 顶部 ---- */
 .top-bar {

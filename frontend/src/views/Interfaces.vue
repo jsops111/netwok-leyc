@@ -224,10 +224,24 @@ const summaryColumns: DataTableColumns<InterfaceSummaryRow> = [
     ]) },
   { title: '状态', key: 'state', sorter: 'default', width: 82,
     render: (r) => h(StateDot, { state: r.state, label: true }) },
-  { title: '接口数', key: 'total', sorter: 'default', width: 96, className: 'num',
-    render: (r) => h('span', { style: 'font-size:11.5px' }, [
-      h('b', { style: 'font-size:12.5px' }, String(r.total)),
-      h('span', { style: 'color:var(--cy-ink-3)' }, ` / up ${r.up}`),
+  // **几个数要加得起来**:total = 通 + 人为关闭 + 该通没通 + 未采到。
+  // 原来只显示 `48 / up 28`,人一减发现少了 20 个口、不知道去哪了 ——
+  // 那 20 个是人为关掉的,而这个数原来在页面上根本不存在
+  { title: '接口数', key: 'total', sorter: 'default', width: 132, className: 'num',
+    render: (r) => h('div', [
+      h('div', { style: 'font-size:12.5px;font-weight:700' }, String(r.total)),
+      h('div', {
+        style: 'font-size:10px;color:var(--cy-ink-3);line-height:1.5',
+        title: `通 ${r.up} + 人为关闭 ${r.admin_down ?? 0}`
+          + ` + 该通没通 ${r.problem} + 未采到 ${r.unknown ?? 0} = ${r.total}`,
+      }, [
+        h('span', { style: `color:${STATE.up}` }, `${r.up} 通`),
+        ' · ',
+        // 人为关闭是**灰的不是红的** —— 48 口交换机上一半的口是关着的,
+        // 标红会让真正断掉的那个淹在里面
+        h('span', null, `${r.admin_down ?? 0} 关`),
+        ...(r.unknown ? [' · ', h('span', null, `${r.unknown} 未采到`)] : []),
+      ]),
     ]) },
   { title: '异常', key: 'problem', sorter: 'default', width: 72, className: 'num',
     render: (r) => h('span', {

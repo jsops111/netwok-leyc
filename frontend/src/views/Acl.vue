@@ -275,10 +275,32 @@ const ruleColumns: DataTableColumns<PolicyRow> = [
 
     <div v-if="board && !shownDevices.length" class="cy-empty">
       <template v-if="problemOnly || keyword">没有匹配的 ACL。</template>
+      <template v-else-if="board?.devices_not_enabled.length">
+        <!-- **把名字点出来** —— 泛泛说"到配置中心打开"人不知道该开哪一台 -->
+        你有 <b>{{ board.devices_not_enabled.length }} 台 Cisco 设备</b>
+        还没打开访问控制同步:
+        <ul class="todo">
+          <li v-for="d in board.devices_not_enabled" :key="d.device_id">
+            <b>{{ d.device_name }}</b>
+            <span class="dim">({{ d.model_label }})</span>
+            <span v-if="!d.has_ssh" :style="{ color: STATE.degraded }">
+              —— 而且<b>还没填 SSH 凭据</b>,Cisco 只能走 SSH,不填开了也跑不起来
+            </span>
+          </li>
+        </ul>
+        到<b>配置中心 → 网络设备 → 编辑</b>,打开<b>「同步访问控制(策略 / ACL)」</b>,
+        保存后点<b>「立即同步」</b>。<br>
+        <span class="dim">
+          一次会拉四样:<code>show ip access-lists</code>(规则)、
+          <code>access-group</code>(绑在哪个接口)、
+          <code>ip nat inside source static</code>(映射,在「防火墙映射」页看)、
+          <code>object-group</code>(主机组,在策略页的「对象查询」里查)。
+        </span>
+      </template>
       <template v-else>
         还没有同步到 Cisco 的 ACL。到<b>配置中心 → 网络设备</b>,给交换机
-        (<b>核心交换机的 kind 是「交换机」不是「防火墙」,现在也能开了</b>)
-        打开<b>「同步防火墙策略」</b>并填上 <b>SSH 凭据</b> ——
+        (<b>核心交换机的类型是「交换机」不是「防火墙」,现在也能开了</b>)
+        打开<b>「同步访问控制」</b>并填上 <b>SSH 凭据</b> ——
         Cisco 只能走 SSH,IOS 没有等价的只读 REST 接口。<br>
         <span class="dim">
           同步会一次拉四样:<code>show ip access-lists</code>(规则)、
@@ -292,6 +314,7 @@ const ruleColumns: DataTableColumns<PolicyRow> = [
 </template>
 
 <style scoped>
+.todo { margin: 6px 0; padding-left: 20px; line-height: 1.9; }
 .acl { display: flex; flex-direction: column; gap: 14px; }
 
 .lead {

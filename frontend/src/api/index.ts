@@ -708,6 +708,16 @@ export interface AclBoard {
   }>
   /** 开了同步但一条 ACL 都没拿到的 Cisco 设备 —— **"没同步到"不是"没有 ACL"** */
   devices_without_data: Array<{ device_id: number; device_name: string; last_error: string }>
+  /**
+   * **开关根本没开的 Cisco 设备。**这是这一页空着时最常见的原因 ——
+   * 泛泛说一句"到配置中心打开"人不知道该去开哪一台,所以把名字点出来。
+   */
+  devices_not_enabled: Array<{
+    device_id: number; device_name: string; model_label: string
+    kind: string
+    /** Cisco 同步只能走 SSH,缺凭据的话开了也跑不起来 */
+    has_ssh: boolean
+  }>
 }
 
 // ------------------------------------------------- SD-WAN 性能 SLA
@@ -1085,6 +1095,14 @@ export interface InterfaceRow {
 }
 
 export interface InterfaceSummaryRow {
+  /**
+   * **几个数要加得起来**:`total = up + admin_down + problem + unknown`。
+   * 原来只有 total 和 up,人一减发现少了一批口、不知道去哪了 ——
+   * 那些是人为关掉的(48 口交换机上一半是关着的很正常)。
+   */
+  admin_down: number
+  /** 状态没采到。**单独一档**,不并进通也不并进不通 */
+  unknown: number
   device_id: number
   device_name: string
   mgmt_ip: string

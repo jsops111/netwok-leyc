@@ -798,7 +798,16 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
             .annotate(
                 total=Count("id"),
                 up=Count("id", filter=Q(oper_up=True)),
+                # **「该通没通」** —— admin up 但链路 down。这才是要看的那一类
                 problem=Count("id", filter=Q(admin_up=True, oper_up=False)),
+                # **人为关掉的。**48 口交换机上一半的口是关着的,而原来这个数
+                # 根本不在返回里 —— 页面上只有 total 和 up,人一减发现少了
+                # 二十个口、不知道去哪了。**几个数必须能加得起来**:
+                #   total = up + admin_down + problem + unknown
+                admin_down=Count("id", filter=Q(admin_up=False)),
+                # 状态没采到的。**单独一档,不并进任何一边** ——
+                # 「没读到」和「它是通的」是两个结论
+                unknown=Count("id", filter=Q(admin_up__isnull=True) | Q(oper_up__isnull=True)),
                 errors=Count("id", filter=Q(in_err_delta__gt=0) | Q(out_err_delta__gt=0)),
                 unmonitored=Count("id", filter=Q(monitored=False)),
             )
@@ -821,6 +830,8 @@ class DeviceInterfaceViewSet(viewsets.ReadOnlyModelViewSet):
                 "collect_interfaces": device.collect_interfaces,
                 "last_collected_at": device.last_collected_at,
                 "total": row.get("total", 0), "up": row.get("up", 0),
+                "admin_down": row.get("admin_down", 0),
+                "unknown": row.get("unknown", 0),
                 "problem": row.get("problem", 0), "errors": row.get("errors", 0),
                 "unmonitored": row.get("unmonitored", 0),
                 "counter_32bit": legacy.get(device.pk, 0),
@@ -1771,14 +1782,28 @@ class CiscoAclViewSet(viewsets.ReadOnlyModelViewSet):
                 "wide_open": sum(1 for r in rows if r.permissive_level == "critical"),
                 "no_log": sum(1 for r in rows if r.logging_off),
             },
-            # 开了策略同步的 Cisco 设备里,一条 ACL 都没同步到的那些。
-            # **"没同步到"不是"这台没有 ACL"**
+            # 开了同步但一条 ACL 都没拿到的那些。**"没同步到"不是"没有 ACL"**
             "devices_without_data": [
                 {"device_id": d.pk, "device_name": d.name,
                  "last_error": d.last_policy_error}
                 for d in Device.objects.filter(
                     enabled=True, policy_sync_enabled=True, vendor=Vendor.CISCO)
                 if d.pk not in by_device
+            ],
+            # **开关根本没开的那些。**这是页面空着时最常见的原因,而原来
+            # 的空状态只给一句泛泛的"到配置中心打开" —— 人不知道该去开哪一台。
+            # 把名字点出来,一眼就知道差什么
+            "devices_not_enabled": [
+                {"device_id": d.pk, "device_name": d.name,
+                 "model_label": d.get_model_display(),
+                 "kind": d.kind,
+                 # SSH 凭据是 Cisco 同步的硬前提(IOS 没有只读 REST)——
+                 # 缺了的话即使开了开关也跑不起来,提前说出来
+                 "has_ssh": bool(d.ssh_username
+                                 and (d.ssh_password or d.ssh_private_key))}
+                for d in Device.objects.filter(
+                    enabled=True, vendor=Vendor.CISCO, policy_sync_enabled=False
+                ).order_by("order", "id")
             ],
         })
 
